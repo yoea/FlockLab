@@ -69,6 +69,18 @@
     50% { box-shadow: 0 0 22px rgba(99, 230, 255, 0.28); }
   }
 
+  #dimBtn {
+    position: fixed; left: 22px; top: 92px; z-index: 6;
+    cursor: pointer; user-select: none;
+    padding: 8px 14px; font-size: 12px; letter-spacing: 0.04em;
+    color: var(--ink); border-radius: 999px;
+    border: 1px solid rgba(167, 139, 250, 0.45);
+    background: rgba(11, 26, 43, 0.78);
+    transition: transform .18s ease, border-color .25s ease, background .25s ease;
+  }
+  #dimBtn:hover { transform: translateY(-1px); }
+  #dimBtn.mode2d { border-color: rgba(120, 255, 190, 0.42); background: rgba(12, 34, 32, 0.82); }
+
   #hud {
     position: fixed; left: 22px; bottom: 22px; z-index: 5;
     padding: 14px 17px; min-width: 252px; pointer-events: none;
@@ -151,6 +163,7 @@
 
   /* 触控屏：放大所有可点区域，面板限高可滚动，避免挡住群体 */
   body.touch #audioBtn { min-height: 44px; padding: 12px 24px; }
+  body.touch #dimBtn { min-height: 40px; padding: 10px 18px; }
   body.touch #startBtn { min-height: 48px; padding: 14px 34px; }
   body.touch #hud, body.touch #hint, body.touch #brand { pointer-events: none; }
   body.touch .lil-gui {
@@ -173,6 +186,7 @@
 
   @media (max-width: 720px) {
     #brand { left: 12px; top: 12px; }
+    #dimBtn { left: 12px; top: 82px; }
     #hud { left: 12px; bottom: 12px; min-width: 0; }
     #hint { display: none; }
     #audioBtn { top: auto; bottom: 18px; left: auto; right: 12px; transform: none; }
@@ -186,8 +200,10 @@
 
   <div id="brand" class="glass">
     <h1>FLOCKLAB</h1>
-    <p>DIRECTIONAL AGENTS · GPU RENDER · PHYSICAL SONIFICATION</p>
+    <p id="brandSub">二维平面 · 方向个体 · GPU 渲染</p>
   </div>
+
+  <div id="dimBtn" class="mode2d" title="切换二维平面 / 三维空间视图">▦ 当前：二维平面</div>
 
   <div id="audioBtn" title="浏览器要求用户手势才能播放声音">🔇 点击开启声音</div>
 
@@ -201,13 +217,14 @@
     <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
   </div>
 
-  <div id="hint" class="glass">箭头朝向即运动方向 · 拖拽旋转 · 滚轮缩放 · 右上角实时调参</div>
+  <div id="hint" class="glass">箭头朝向即运动方向 · 拖拽平移 · 滚轮缩放 · 点左侧按钮切 3D</div>
 
   <div id="intro">
     <div class="card glass">
       <h2>FLOCKLAB</h2>
-      <p class="sub">涌现行为 · 物理化声音实验</p>
+      <p class="sub">二维平面 · 涌现行为 · 物理化声音实验</p>
       <p>
+        默认<em>二维平面</em>视图（箭头铺满屏幕、左右上下均可活动），点左上角按钮可切到<em>三维空间</em>。<br />
         每个箭头只遵循三条规则：<em>分离</em>、<em>对齐</em>、<em>聚合</em>，箭头朝向就是它的运动方向。<br />
         群体温度 T 由平均动能给出，气压 P = ρT：<em>音高 ∝ √T</em>（理想气体声速关系），<em>音量与滤波亮度由 P 决定</em>。<br />
         P 越阈值触发<em>泛音列上行琶音</em>，碰撞按<em>接近冲量</em>触发打击音，均有冷却保护。<br />
@@ -262,6 +279,7 @@
 
     // ---------------------------------------------------------------- 参数
     const params = {
+      dim2D: true,
       count: 300,
       separation: 2.05,
       alignment: 1.1,
@@ -328,35 +346,49 @@
     let collisionFlash = 0, arpFlash = 0, predFlash = 0, predCatches = 0;
 
     function initBoids(from, to) {
+      const bd2 = params.dim2D ? bounds2D() : null;
       for (let i = from; i < to; i++) {
         const r = 12 * Math.cbrt(Math.random());
         const u = Math.random() * 2 - 1;
         const t = Math.random() * Math.PI * 2;
         const s = Math.sqrt(1 - u * u);
         const k = i * 3;
-        pos[k] = r * s * Math.cos(t);
-        pos[k + 1] = r * s * Math.sin(t);
-        pos[k + 2] = r * u;
+        // 2D 在矩形内铺开；3D 仍用球面采样
+        if (params.dim2D) {
+          pos[k] = (Math.random() * 2 - 1) * bd2.hx * 0.8;
+          pos[k + 1] = (Math.random() * 2 - 1) * bd2.hy * 0.8;
+        } else {
+          pos[k] = r * s * Math.cos(t);
+          pos[k + 1] = r * s * Math.sin(t);
+        }
+        // 2D 模式压平到 XY 平面
+        pos[k + 2] = params.dim2D ? 0 : r * u;
         const vs = 3 + Math.random() * 4;
         vel[k] = (Math.random() * 2 - 1) * vs;
         vel[k + 1] = (Math.random() * 2 - 1) * vs;
-        vel[k + 2] = (Math.random() * 2 - 1) * vs;
+        vel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
       }
     }
     function initPredators(from, to) {
+      const bd2 = params.dim2D ? bounds2D() : null;
       for (let p = from; p < to; p++) {
         const k = p * 3;
         const r = params.boundary * (0.5 + Math.random() * 0.38);
         const u = Math.random() * 2 - 1;
         const t = Math.random() * Math.PI * 2;
         const s = Math.sqrt(1 - u * u);
-        predPos[k] = r * s * Math.cos(t);
-        predPos[k + 1] = r * s * Math.sin(t);
-        predPos[k + 2] = r * u;
+        if (params.dim2D) {
+          predPos[k] = (Math.random() * 2 - 1) * bd2.hx * 0.7;
+          predPos[k + 1] = (Math.random() * 2 - 1) * bd2.hy * 0.7;
+        } else {
+          predPos[k] = r * s * Math.cos(t);
+          predPos[k + 1] = r * s * Math.sin(t);
+        }
+        predPos[k + 2] = params.dim2D ? 0 : r * u;
         const vs = params.predSpeed * 0.7;
         predVel[k] = (Math.random() * 2 - 1) * vs;
         predVel[k + 1] = (Math.random() * 2 - 1) * vs;
-        predVel[k + 2] = (Math.random() * 2 - 1) * vs;
+        predVel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
         predFeedAt[p] = 0;
       }
     }
@@ -392,12 +424,27 @@
     scene.background = new THREE.Color(0x05070f);
     scene.fog = new THREE.FogExp2(0x05070f, 0.0105);
 
-    const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 600);
+    const perspCam = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 600);
+    const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 400);
+    let camera = params.dim2D ? orthoCam : perspCam;
+    // 2D 视图：平移中心 + 缩放
+    const view2D = { x: 0, y: 0, zoom: 1, tZoom: 1 };
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
     renderer.setSize(innerWidth, innerHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     document.getElementById('scene').appendChild(renderer.domElement);
+
+    // 2D 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
+    function updateOrthoFrustum() {
+      const aspect = innerWidth / innerHeight;
+      const halfH = (params.boundary + 2.2) / view2D.zoom;
+      const halfW = halfH * aspect;
+      orthoCam.left = -halfW; orthoCam.right = halfW;
+      orthoCam.top = halfH; orthoCam.bottom = -halfH;
+      orthoCam.updateProjectionMatrix();
+    }
+    updateOrthoFrustum();
 
     const orbit = {
       theta: 0.72, phi: 1.13, radius: 55,
@@ -410,6 +457,31 @@
 
     function resetCamera() {
       orbit.tTheta = 0.72; orbit.tPhi = 1.13; orbit.tRadius = 55;
+      view2D.x = 0; view2D.y = 0; view2D.tZoom = 1; view2D.zoom = 1;
+      updateOrthoFrustum();
+    }
+
+    let dimCtrl = null;   // GUI 开关控制器，创建后赋值
+    function setMode2D(on) {
+      if (params.dim2D === on) {
+        // 首次调用也要刷新 UI
+      }
+      params.dim2D = on;
+      resetBoids();           // 重排个体，使 3D→2D 时 z 归零、2D→3D 时恢复立体分布
+      resetCamera();
+      updateRectFrame();
+      const btn = document.getElementById('dimBtn');
+      btn.classList.toggle('mode2d', on);
+      btn.textContent = on ? '▦ 当前：二维平面' : '◈ 当前：三维空间';
+      document.getElementById('brandSub').textContent = on
+        ? '二维平面 · 方向个体 · GPU 渲染'
+        : '三维空间 · 方向个体 · GPU 渲染';
+      document.getElementById('hint').textContent = on
+        ? (isTouch ? '单指拖拽平移 · 双指捏合缩放 · 双击重置 · 左侧按钮切 3D'
+                   : '箭头朝向即运动方向 · 拖拽平移 · 滚轮缩放 · 左侧按钮切 3D')
+        : (isTouch ? '单指拖拽旋转 · 双指捏合缩放 · 双击重置 · 左侧按钮切 2D'
+                   : '箭头朝向即运动方向 · 拖拽旋转 · 滚轮缩放 · 左侧按钮切 2D');
+      if (dimCtrl) dimCtrl.updateDisplay();
     }
 
     cv.addEventListener('pointerdown', (e) => {
@@ -429,16 +501,32 @@
       const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
       prev.x = e.clientX; prev.y = e.clientY;
       moved += Math.abs(dx) + Math.abs(dy);
-      if (pointers.size === 1) {
-        orbit.tTheta -= dx * 0.005;
-        orbit.tPhi = Math.max(0.18, Math.min(Math.PI - 0.18, orbit.tPhi - dy * 0.005));
-      } else if (pointers.size === 2) {
-        const p = [...pointers.values()];
-        const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
-        if (pinchDist > 0 && d > 0) {
-          orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius * pinchDist / d));
+      if (params.dim2D) {
+        if (pointers.size === 1) {
+          // 2D：拖拽平移视图（屏幕像素 → 世界坐标）
+          const scale = (2 * (params.boundary + 2.2) / view2D.zoom) / innerHeight;
+          view2D.x -= dx * scale;
+          view2D.y += dy * scale;
+        } else if (pointers.size === 2) {
+          const p = [...pointers.values()];
+          const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+          if (pinchDist > 0 && d > 0) {
+            view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * d / pinchDist));
+          }
+          pinchDist = d;
         }
-        pinchDist = d;
+      } else {
+        if (pointers.size === 1) {
+          orbit.tTheta -= dx * 0.005;
+          orbit.tPhi = Math.max(0.18, Math.min(Math.PI - 0.18, orbit.tPhi - dy * 0.005));
+        } else if (pointers.size === 2) {
+          const p = [...pointers.values()];
+          const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+          if (pinchDist > 0 && d > 0) {
+            orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius * pinchDist / d));
+          }
+          pinchDist = d;
+        }
       }
     });
 
@@ -460,7 +548,11 @@
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
     cv.addEventListener('wheel', (e) => {
       e.preventDefault();
-      orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius + e.deltaY * 0.045));
+      if (params.dim2D) {
+        view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * Math.exp(-e.deltaY * 0.0012)));
+      } else {
+        orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius + e.deltaY * 0.045));
+      }
     }, { passive: false });
 
     const starGeo = new THREE.BufferGeometry();
@@ -490,6 +582,26 @@
     );
     cage.scale.setScalar(params.boundary);
     scene.add(cage);
+
+    // 2D 模式的安全边界矩形（贴合屏幕宽高比），3D 下隐藏
+    const rectFrameGeo = new THREE.BufferGeometry();
+    rectFrameGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(4 * 3), 3));
+    const rectFrame = new THREE.LineLoop(rectFrameGeo, new THREE.LineBasicMaterial({
+      color: 0x3b7fb4, transparent: true, opacity: 0.22, depthWrite: false
+    }));
+    rectFrame.frustumCulled = false;
+    scene.add(rectFrame);
+    function bounds2D() {
+      return { hx: params.boundary * (innerWidth / innerHeight), hy: params.boundary };
+    }
+    function updateRectFrame() {
+      const { hx, hy } = bounds2D();
+      const arr = rectFrameGeo.attributes.position.array;
+      const pts = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]];
+      for (let i = 0; i < 4; i++) { arr[i * 3] = pts[i][0]; arr[i * 3 + 1] = pts[i][1]; arr[i * 3 + 2] = 0; }
+      rectFrameGeo.attributes.position.needsUpdate = true;
+    }
+    updateRectFrame();
 
     // ---------------------------------------------------------------- GPU 箭头
     // 一个 quad 实例一个箭头；朝向由顶点着色器在视图空间按速度方向旋转，
@@ -848,6 +960,7 @@
     document.getElementById('audioBtn').addEventListener('click', () => {
       audio.toggle().catch((e) => fail('声音切换失败：' + e.message));
     });
+    document.getElementById('dimBtn').addEventListener('click', () => setMode2D(!params.dim2D));
 
     // ---------------------------------------------------------------- GUI
     const gui = new GUI({ title: 'FlockLab 控制台', width: 300 });
@@ -897,6 +1010,7 @@
     fPred.open();
 
     const fScene = gui.addFolder('场景');
+    dimCtrl = fScene.add(params, 'dim2D').name('二维平面模式').onChange((v) => setMode2D(v));
     fScene.add(params, 'paused').name('暂停模拟');
     fScene.add({ reset: resetBoids }, 'reset').name('重新初始化');
     fScene.add({ view: resetCamera }, 'view').name('重置视角');
@@ -917,6 +1031,9 @@
       const maxSpeed = params.maxSpeed;
       const maxForce = MAX_FORCE;
       const B = params.boundary;
+      const D2 = params.dim2D;
+      const bd = D2 ? bounds2D() : null;       // 2D 矩形半宽/半高
+      const hx = D2 ? bd.hx : 0, hy = D2 ? bd.hy : 0;
       const flowT = time * 0.00022;
       const P = params.predatorOn ? activeP : 0;
       const fleeR = params.fleeRange;
@@ -983,14 +1100,24 @@
             }
           }
 
-          // 软边界：靠近边缘时往回推
-          const dp = Math.hypot(ppx, ppy, ppz);
-          if (dp > B - 2) {
-            const push = (dp - (B - 2)) * 3;
-            ax -= ppx / dp * push; ay -= ppy / dp * push; az -= ppz / dp * push;
+          // 软边界：靠近边缘时往回推（2D 矩形 / 3D 球形）
+          if (D2) {
+            const m = 2;
+            if (ppx > hx - m) ax -= (ppx - (hx - m)) * 3;
+            if (ppx < -hx + m) ax += (-hx + m - ppx) * 3;
+            if (ppy > hy - m) ay -= (ppy - (hy - m)) * 3;
+            if (ppy < -hy + m) ay += (-hy + m - ppy) * 3;
+            az = 0;
+          } else {
+            const dp = Math.hypot(ppx, ppy, ppz);
+            if (dp > B - 2) {
+              const push = (dp - (B - 2)) * 3;
+              ax -= ppx / dp * push; ay -= ppy / dp * push; az -= ppz / dp * push;
+            }
           }
 
           let nvx = pvx + ax * dt, nvy = pvy + ay * dt, nvz = pvz + az * dt;
+          if (D2) nvz = 0;
           let sp = Math.hypot(nvx, nvy, nvz);
           if (sp > predSpeed) { const k = predSpeed / sp; nvx *= k; nvy *= k; nvz *= k; }
           else if (sp < predSpeed * 0.35 && sp > 1e-6) { const k = predSpeed * 0.35 / sp; nvx *= k; nvy *= k; nvz *= k; }
@@ -998,15 +1125,24 @@
           predPos[q] = ppx + nvx * dt;
           predPos[q + 1] = ppy + nvy * dt;
           predPos[q + 2] = ppz + nvz * dt;
-          const nd = Math.hypot(predPos[q], predPos[q + 1], predPos[q + 2]);
-          if (nd > B) {
-            const k = B / nd;
-            predPos[q] *= k; predPos[q + 1] *= k; predPos[q + 2] *= k;
-            const nx = predPos[q] / B, ny = predPos[q + 1] / B, nz = predPos[q + 2] / B;
-            const dot = nvx * nx + nvy * ny + nvz * nz;
-            predVel[q] = (nvx - 2 * dot * nx) * 0.9;
-            predVel[q + 1] = (nvy - 2 * dot * ny) * 0.9;
-            predVel[q + 2] = (nvz - 2 * dot * nz) * 0.9;
+          if (D2) {
+            // 矩形硬边界：逐轴夹紧并弹性反射
+            if (predPos[q] > hx) { predPos[q] = hx; predVel[q] = -Math.abs(nvx) * 0.9; }
+            else if (predPos[q] < -hx) { predPos[q] = -hx; predVel[q] = Math.abs(nvx) * 0.9; }
+            if (predPos[q + 1] > hy) { predPos[q + 1] = hy; predVel[q + 1] = -Math.abs(nvy) * 0.9; }
+            else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; predVel[q + 1] = Math.abs(nvy) * 0.9; }
+            predPos[q + 2] = 0; predVel[q + 2] = 0;
+          } else {
+            const nd = Math.hypot(predPos[q], predPos[q + 1], predPos[q + 2]);
+            if (nd > B) {
+              const k = B / nd;
+              predPos[q] *= k; predPos[q + 1] *= k; predPos[q + 2] *= k;
+              const nx = predPos[q] / B, ny = predPos[q + 1] / B, nz = predPos[q + 2] / B;
+              const dot = nvx * nx + nvy * ny + nvz * nz;
+              predVel[q] = (nvx - 2 * dot * nx) * 0.9;
+              predVel[q + 1] = (nvy - 2 * dot * ny) * 0.9;
+              predVel[q + 2] = (nvz - 2 * dot * nz) * 0.9;
+            }
           }
         }
       }
@@ -1139,16 +1275,26 @@
           fleeing[i] = 0;
         }
 
-        const dist = Math.hypot(px, py, pz);
-        if (dist > B - 3) {
-          const push = (dist - (B - 3)) * 2.2;
-          fx -= px / dist * push; fy -= py / dist * push; fz -= pz / dist * push;
+        // 边界力（2D 矩形 / 3D 球形）
+        if (D2) {
+          const m = 3;
+          if (px > hx - m) fx -= (px - (hx - m)) * 2.2;
+          if (px < -hx + m) fx += (-hx + m - px) * 2.2;
+          if (py > hy - m) fy -= (py - (hy - m)) * 2.2;
+          if (py < -hy + m) fy += (-hy + m - py) * 2.2;
+          fz = 0;
+        } else {
+          const dist = Math.hypot(px, py, pz);
+          if (dist > B - 3) {
+            const push = (dist - (B - 3)) * 2.2;
+            fx -= px / dist * push; fy -= py / dist * push; fz -= pz / dist * push;
+          }
         }
         fx += Math.sin(py * 0.11 + flowT) * params.flow;
         fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
-        fz += Math.sin(px * 0.08 + pz * 0.10 + flowT * 0.6) * params.flow;
+        fz += D2 ? 0 : Math.sin(px * 0.08 + pz * 0.10 + flowT * 0.6) * params.flow;
 
-        acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = fz;
+        acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = D2 ? 0 : fz;
       }
 
       let speedSum = 0, keSum = 0;
@@ -1157,6 +1303,7 @@
         let vx = vel[k] + acc[k] * dt;
         let vy = vel[k + 1] + acc[k + 1] * dt;
         let vz = vel[k + 2] + acc[k + 2] * dt;
+        if (D2) vz = 0;
         let sp = Math.hypot(vx, vy, vz);
         if (sp > maxSpeed) { const q = maxSpeed / sp; vx *= q; vy *= q; vz *= q; sp = maxSpeed; }
         else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; vz *= q; sp = params.minSpeed; }
@@ -1165,15 +1312,24 @@
         keSum += 0.5 * sp * sp;
 
         pos[k] += vx * dt; pos[k + 1] += vy * dt; pos[k + 2] += vz * dt;
-        const d = Math.hypot(pos[k], pos[k + 1], pos[k + 2]);
-        if (d > B) {
-          const nx = pos[k] / d, ny = pos[k + 1] / d, nz = pos[k + 2] / d;
-          pos[k] = nx * B; pos[k + 1] = ny * B; pos[k + 2] = nz * B;
-          const dot = vx * nx + vy * ny + vz * nz;
-          vel[k] = (vx - 2 * dot * nx) * 0.92;
-          vel[k + 1] = (vy - 2 * dot * ny) * 0.92;
-          vel[k + 2] = (vz - 2 * dot * nz) * 0.92;
-          if (dot > 0) boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * dot, 1.2));
+        if (D2) {
+          // 矩形硬边界：逐轴夹紧并弹性反射，z 恒为 0
+          if (pos[k] > hx) { pos[k] = hx; vel[k] = -Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
+          else if (pos[k] < -hx) { pos[k] = -hx; vel[k] = Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
+          if (pos[k + 1] > hy) { pos[k + 1] = hy; vel[k + 1] = -Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
+          else if (pos[k + 1] < -hy) { pos[k + 1] = -hy; vel[k + 1] = Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
+          pos[k + 2] = 0; vel[k + 2] = 0;
+        } else {
+          const d = Math.hypot(pos[k], pos[k + 1], pos[k + 2]);
+          if (d > B) {
+            const nx = pos[k] / d, ny = pos[k + 1] / d, nz = pos[k + 2] / d;
+            pos[k] = nx * B; pos[k + 1] = ny * B; pos[k + 2] = nz * B;
+            const dot = vx * nx + vy * ny + vz * nz;
+            vel[k] = (vx - 2 * dot * nx) * 0.92;
+            vel[k + 1] = (vy - 2 * dot * ny) * 0.92;
+            vel[k + 2] = (vz - 2 * dot * nz) * 0.92;
+            if (dot > 0) boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * dot, 1.2));
+          }
         }
 
         // 捕获：进入 CATCH_DIST 且捕食者已过饱腹冷却 → 冲量发声 + 标记移除
@@ -1240,16 +1396,29 @@
       if (!params.paused) step(dt, now);
       audio.update();
 
-      orbit.theta += (orbit.tTheta - orbit.theta) * 0.08;
-      orbit.phi += (orbit.tPhi - orbit.phi) * 0.08;
-      orbit.radius += (orbit.tRadius - orbit.radius) * 0.08;
-      const sp = Math.sin(orbit.phi);
-      camera.position.set(
-        orbit.radius * sp * Math.sin(orbit.theta),
-        orbit.radius * Math.cos(orbit.phi),
-        orbit.radius * sp * Math.cos(orbit.theta)
-      );
-      camera.lookAt(0, 0, 0);
+      if (params.dim2D) {
+        view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
+        updateOrthoFrustum();
+        camera = orthoCam;
+        camera.position.set(view2D.x, view2D.y, 40);
+        camera.up.set(0, 1, 0);
+        camera.lookAt(view2D.x, view2D.y, 0);
+      } else {
+        orbit.theta += (orbit.tTheta - orbit.theta) * 0.08;
+        orbit.phi += (orbit.tPhi - orbit.phi) * 0.08;
+        orbit.radius += (orbit.tRadius - orbit.radius) * 0.08;
+        const sp = Math.sin(orbit.phi);
+        camera = perspCam;
+        camera.position.set(
+          orbit.radius * sp * Math.sin(orbit.theta),
+          orbit.radius * Math.cos(orbit.phi),
+          orbit.radius * sp * Math.cos(orbit.theta)
+        );
+        camera.up.set(0, 1, 0);
+        camera.lookAt(0, 0, 0);
+      }
+      cage.visible = !params.dim2D;
+      rectFrame.visible = params.dim2D;
       stars.rotation.y += dt * 0.008;
 
       // CPU 只写颜色/尺寸；箭头的朝向与形状全部交给 GPU 着色器。
@@ -1307,15 +1476,35 @@
     }
 
     addEventListener('resize', () => {
-      camera.aspect = innerWidth / innerHeight;
-      camera.updateProjectionMatrix();
+      perspCam.aspect = innerWidth / innerHeight;
+      perspCam.updateProjectionMatrix();
+      updateOrthoFrustum();
+      updateRectFrame();
       renderer.setSize(innerWidth, innerHeight);
     });
 
+    // 初始化为 2D 平面模式（用户反馈 3D 不直观）
+    setMode2D(true);
     requestAnimationFrame(render);
 
     window.FlockLab = {
-      params, resetBoids, setCount, setPredCount,
+      params, resetBoids, setCount, setPredCount, setMode2D,
+      get dim2D() { return params.dim2D; },
+      get maxAbsZ() {
+        let m = 0;
+        for (let i = 0; i < activeCount; i++) m = Math.max(m, Math.abs(pos[i * 3 + 2]));
+        return +m.toFixed(4);
+      },
+      get xyExtent() {
+        let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
+        for (let i = 0; i < activeCount; i++) {
+          const k = i * 3;
+          mnx = Math.min(mnx, pos[k]); mxx = Math.max(mxx, pos[k]);
+          mny = Math.min(mny, pos[k + 1]); mxy = Math.max(mxy, pos[k + 1]);
+        }
+        return { x: [+mnx.toFixed(1), +mxx.toFixed(1)], y: [+mny.toFixed(1), +mxy.toFixed(1)] };
+      },
+      get view() { return { x: view2D.x, y: view2D.y, zoom: view2D.zoom }; },
       get count() { return activeCount; },
       get predatorCount() { return params.predatorOn ? activeP : 0; },
       get predatorPositions() {
