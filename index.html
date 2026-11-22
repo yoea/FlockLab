@@ -12,7 +12,6 @@
     --line: rgba(126, 170, 235, 0.18);
     --glass: rgba(9, 15, 29, 0.66);
     --accent: #63e6ff;
-    --hot: #ff6fae;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -68,12 +67,12 @@
 
   #hud {
     position: fixed; left: 22px; bottom: 22px; z-index: 5;
-    padding: 14px 17px; min-width: 244px; pointer-events: none;
+    padding: 14px 17px; min-width: 252px; pointer-events: none;
     font-variant-numeric: tabular-nums;
   }
   .hud-row {
     display: flex; align-items: center; justify-content: space-between;
-    gap: 18px; font-size: 11px; line-height: 2.05;
+    gap: 18px; font-size: 11px; line-height: 2.0;
   }
   .hud-row .k { color: var(--dim); letter-spacing: 0.08em; }
   .hud-row .v { color: var(--ink); font-weight: 600; }
@@ -106,7 +105,7 @@
     transition: opacity .55s ease, visibility .55s ease;
   }
   #intro.hidden { opacity: 0; visibility: hidden; }
-  #intro .card { max-width: 460px; padding: 34px 38px 30px; text-align: center; }
+  #intro .card { max-width: 500px; padding: 34px 38px 30px; text-align: center; }
   #intro h2 {
     margin: 0 0 10px; font-size: 26px; font-weight: 650; letter-spacing: 0.1em;
     background: linear-gradient(92deg, #8ff3ff, #ff8dc2);
@@ -159,33 +158,34 @@
 
   <div id="brand" class="glass">
     <h1>FLOCKLAB</h1>
-    <p>300 AGENTS · EMERGENT BOIDS · SONIFIED</p>
+    <p>DIRECTIONAL AGENTS · GPU RENDER · PHYSICAL SONIFICATION</p>
   </div>
 
   <div id="audioBtn" title="浏览器要求用户手势才能播放声音">🔇 点击开启声音</div>
 
   <div id="hud" class="glass">
     <div class="hud-row"><span class="k">个体数量</span><span class="v" id="hCount">300</span></div>
-    <div class="hud-row"><span class="k">聚集密度</span><span class="bar"><i id="hDensityBar"></i></span></div>
-    <div class="hud-row"><span class="k">平均速度</span><span class="v" id="hSpeed">0.00</span></div>
-    <div class="hud-row"><span class="k">集体音高</span><span class="v" id="hPitch">— Hz</span></div>
+    <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
+    <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
+    <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
+    <div class="hud-row"><span class="k">集体音高 ∝ √T</span><span class="v" id="hPitch">— Hz</span></div>
     <div class="hud-row"><span class="k">碰撞 / 琶音</span><span class="v"><span class="dot" id="hHit"></span><span class="dot" id="hArp"></span></span></div>
     <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
   </div>
 
-  <div id="hint" class="glass">拖拽旋转 · 滚轮缩放 · 右上角滑块实时调参</div>
+  <div id="hint" class="glass">箭头朝向即运动方向 · 拖拽旋转 · 滚轮缩放 · 右上角实时调参</div>
 
   <div id="intro">
     <div class="card glass">
       <h2>FLOCKLAB</h2>
-      <p class="sub">涌现行为 · 声音化实验</p>
+      <p class="sub">涌现行为 · 物理化声音实验</p>
       <p>
-        300 个发光个体只遵循三条简单规则：<em>分离</em>、<em>对齐</em>、<em>聚合</em>。<br />
-        它们的集体密度会改变音高与音量；<br />
-        密度越过阈值触发<em>上行琶音</em>，近距离碰撞触发<em>短促打击音</em>。
+        每个箭头只遵循三条规则：<em>分离</em>、<em>对齐</em>、<em>聚合</em>，箭头朝向就是它的运动方向。<br />
+        群体温度 T 由平均动能给出，气压 P = ρT：<em>音高 ∝ √T</em>（理想气体声速关系），<em>音量与滤波亮度由 P 决定</em>。<br />
+        P 越阈值触发<em>泛音列上行琶音</em>，碰撞按<em>接近冲量</em>触发打击音，均有冷却保护。
       </p>
       <button id="startBtn">开启声音并进入</button>
-      <div class="foot">声音由 Web Audio API 实时合成 · 带冷却保护</div>
+      <div class="foot">箭头变换在顶点着色器中完成 · 邻域用空间哈希查询</div>
     </div>
   </div>
 
@@ -198,7 +198,7 @@
       el.textContent = msg;
     };
 
-    // 多 CDN 回退：三个库全部来自公共 CDN，业务代码仍只有这一个文件。
+    // 多 CDN 回退：业务代码仍只有这一个文件。
     async function loadModule(urls) {
       let last;
       for (const url of urls) {
@@ -226,6 +226,7 @@
 
     // ---------------------------------------------------------------- 参数
     const params = {
+      count: 300,
       separation: 2.05,
       alignment: 1.1,
       cohesion: 0.7,
@@ -235,25 +236,34 @@
       maxSpeed: 9.0,
       minSpeed: 2.2,
       boundary: 20,
-      densityThreshold: 0.56,
+      arrowSize: 0.42,
+      thermalRef: 5.0,
+      pressureThreshold: 0.20,
+      impulseThreshold: 0.08,
       master: 0.38,
       enabled: false,
       paused: false
     };
+    const MAX_N = 1200;
+    let activeCount = params.count;
 
-    const N = 300;
-    const pos = new Float32Array(N * 3);
-    const vel = new Float32Array(N * 3);
-    const acc = new Float32Array(N * 3);
-    const neighbors = new Uint16Array(N);
+    // 高速缓存：位置/速度数组直接作为 GPU 实例属性，CPU 只更新数值，不再算矩阵。
+    const pos = new Float32Array(MAX_N * 3);
+    const vel = new Float32Array(MAX_N * 3);
+    const acc = new Float32Array(MAX_N * 3);
+    const col = new Float32Array(MAX_N * 3);
+    const siz = new Float32Array(MAX_N);
+    const neighbors = new Uint16Array(MAX_N);
     const COLLIDE_DIST = 0.55;
     const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
     const MAX_FORCE = 14;
 
-    let density = 0, avgSpeed = 0, avgNeighbors = 0, collisionFlash = 0, arpFlash = 0;
+    let density = 0, avgSpeed = 0, avgNeighbors = 0;
+    let temperature = 0, pressure = 0, collisionImpulse = 0;
+    let collisionFlash = 0, arpFlash = 0;
 
-    function resetBoids() {
-      for (let i = 0; i < N; i++) {
+    function initBoids(from, to) {
+      for (let i = from; i < to; i++) {
         const r = 12 * Math.cbrt(Math.random());
         const u = Math.random() * 2 - 1;
         const t = Math.random() * Math.PI * 2;
@@ -268,7 +278,16 @@
         vel[k + 2] = (Math.random() * 2 - 1) * vs;
       }
     }
-    resetBoids();
+    initBoids(0, activeCount);
+    const resetBoids = () => initBoids(0, activeCount);
+    function setCount(v) {
+      const next = Math.max(50, Math.min(MAX_N, Math.round(v)));
+      if (next > activeCount) initBoids(activeCount, next);
+      activeCount = next;
+      params.count = next;
+      arrowGeo.instanceCount = next;
+      document.getElementById('hCount').textContent = next;
+    }
 
     // ---------------------------------------------------------------- 场景
     const scene = new THREE.Scene();
@@ -307,7 +326,6 @@
       orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius + e.deltaY * 0.045));
     }, { passive: false });
 
-    // 星空背景
     const starGeo = new THREE.BufferGeometry();
     const starPos = new Float32Array(900 * 3);
     for (let i = 0; i < 900; i++) {
@@ -326,7 +344,6 @@
     }));
     scene.add(stars);
 
-    // 活动边界（可透视的笼子）
     const cage = new THREE.Mesh(
       new THREE.SphereGeometry(1, 28, 16),
       new THREE.MeshBasicMaterial({
@@ -337,28 +354,91 @@
     cage.scale.setScalar(params.boundary);
     scene.add(cage);
 
-    // 两层 InstancedMesh：实心核 + 柔光晕
-    const sphere = new THREE.SphereGeometry(1, 10, 8);
-    const coreMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff, transparent: true, opacity: 0.98,
-      blending: THREE.AdditiveBlending, depthWrite: false
-    });
-    const haloMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff, transparent: true, opacity: 0.085,
-      blending: THREE.AdditiveBlending, depthWrite: false
-    });
-    const coreMesh = new THREE.InstancedMesh(sphere, coreMat, N);
-    const haloMesh = new THREE.InstancedMesh(sphere, haloMat, N);
-    coreMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    haloMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    coreMesh.frustumCulled = false;
-    haloMesh.frustumCulled = false;
-    scene.add(haloMesh, coreMesh);
+    // ---------------------------------------------------------------- GPU 箭头
+    // 一个 quad 实例一个箭头；朝向由顶点着色器在视图空间按速度方向旋转，
+    // 形状用 SDF 在片元着色器里画成 ">" 形，边缘发光。
+    const arrowGeo = new THREE.InstancedBufferGeometry();
+    arrowGeo.setAttribute('position', new THREE.Float32BufferAttribute([
+      -1, -1, 0,  1, -1, 0,  1, 1, 0,  -1, 1, 0
+    ], 3));
+    arrowGeo.setAttribute('aLocal', new THREE.Float32BufferAttribute([
+      -1, -1,  1, -1,  1, 1,  -1, 1
+    ], 2));
+    arrowGeo.setIndex([0, 1, 2, 0, 2, 3]);
+    const aPos = new THREE.InstancedBufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage);
+    const aVel = new THREE.InstancedBufferAttribute(vel, 3).setUsage(THREE.DynamicDrawUsage);
+    const aCol = new THREE.InstancedBufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage);
+    const aSiz = new THREE.InstancedBufferAttribute(siz, 1).setUsage(THREE.DynamicDrawUsage);
+    arrowGeo.setAttribute('aPosition', aPos);
+    arrowGeo.setAttribute('aVelocity', aVel);
+    arrowGeo.setAttribute('aColor', aCol);
+    arrowGeo.setAttribute('aSize', aSiz);
+    arrowGeo.instanceCount = activeCount;
 
-    const dummy = new THREE.Object3D();
+    const arrowMat = new THREE.ShaderMaterial({
+      uniforms: { uMaxSpeed: { value: params.maxSpeed } },
+      vertexShader: `
+        attribute vec2 aLocal;
+        attribute vec3 aPosition;
+        attribute vec3 aVelocity;
+        attribute vec3 aColor;
+        attribute float aSize;
+        uniform float uMaxSpeed;
+        varying vec2 vLocal;
+        varying vec3 vColor;
+        varying float vSpeed;
+        varying float vFade;
+        void main() {
+          vLocal = aLocal;
+          vColor = aColor;
+          vSpeed = clamp(length(aVelocity) / uMaxSpeed, 0.0, 1.0);
+          vec4 mv = modelViewMatrix * vec4(aPosition, 1.0);
+          vec3 vv = (modelViewMatrix * vec4(aVelocity, 0.0)).xyz;
+          float ang = atan(vv.y, vv.x);
+          float cs = cos(ang), sn = sin(ang);
+          vec2 lp = aLocal * aSize;
+          mv.xy += vec2(lp.x * cs - lp.y * sn, lp.x * sn + lp.y * cs);
+          vFade = 1.0 - smoothstep(45.0, 145.0, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: `
+        varying vec2 vLocal;
+        varying vec3 vColor;
+        varying float vSpeed;
+        varying float vFade;
+        float sdSegment(vec2 p, vec2 a, vec2 b) {
+          vec2 pa = p - a, ba = b - a;
+          float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+          return length(pa - ba * h);
+        }
+        void main() {
+          vec2 p = vLocal;
+          float d = min(
+            sdSegment(p, vec2(0.90, 0.0), vec2(-0.42, 0.86)),
+            sdSegment(p, vec2(0.90, 0.0), vec2(-0.42, -0.86))
+          );
+          float core = 1.0 - smoothstep(0.10, 0.17, d);
+          float halo = exp(-d * 3.6) * 0.34;
+          float a = clamp(core + halo, 0.0, 1.0) * vFade;
+          if (a < 0.004) discard;
+          vec3 c = vColor * (0.85 + 0.70 * vSpeed) * (core + halo * 0.55);
+          gl_FragColor = vec4(c, a);
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+    const arrows = new THREE.Mesh(arrowGeo, arrowMat);
+    arrows.frustumCulled = false;
+    scene.add(arrows);
+
     const tmpColor = new THREE.Color();
 
-    // ---------------------------------------------------------------- 声音
+    // ---------------------------------------------------------------- 声音（物理映射）
     class FlockAudio {
       constructor() {
         this.ctx = null;
@@ -368,6 +448,7 @@
         this.hitCount = 0;
         this.hitWindow = 0;
         this.arpArmed = true;
+        this.f0 = 55;
       }
 
       async enable() {
@@ -414,62 +495,64 @@
         await this.ctx.resume();
         this.enabled = true;
         params.enabled = true;
-        document.getElementById('audioBtn').classList.add('live');
-        document.getElementById('audioBtn').textContent = '🔊 声音已开启';
+        const btn = document.getElementById('audioBtn');
+        btn.classList.add('live');
+        btn.textContent = '🔊 声音已开启';
       }
 
       setMaster(v) {
         if (this.master) this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.04);
       }
 
-      update(d) {
+      update() {
         if (!this.enabled) return;
+        const T = Math.max(0, Math.min(1, temperature));
+        const P = Math.max(0, Math.min(1, pressure));
         const t = this.ctx.currentTime;
-        // 集体密度 → 基频（55Hz 起，跨两个八度）与音色亮度
-        const f = 55 * Math.pow(2, d * 2.15);
-        this.osc1.frequency.setTargetAtTime(f, t, 0.16);
-        this.osc2.frequency.setTargetAtTime(f * 1.006, t, 0.16);
-        this.filter.frequency.setTargetAtTime(280 + d * 1900, t, 0.18);
-        this.droneGain.gain.setTargetAtTime(0.010 + d * 0.055, t, 0.22);
+
+        // 理想气体：声速 c = sqrt(γRT) → 基频 ∝ √T，与密度无关。
+        const f0 = 55 * Math.pow(2, 2.0 * Math.sqrt(T));
+        this.f0 = f0;
+        this.osc1.frequency.setTargetAtTime(f0, t, 0.16);
+        this.osc2.frequency.setTargetAtTime(f0 * 1.006, t, 0.16);
+        // 状态方程 p = ρT → 气压决定响度与滤波亮度。
+        this.droneGain.gain.setTargetAtTime(0.006 + 0.070 * P, t, 0.22);
+        this.filter.frequency.setTargetAtTime(240 + 2400 * P, t, 0.18);
 
         const now = performance.now();
-        if (d > params.densityThreshold && this.arpArmed && now - this.lastArp > 2600) {
-          this.arp(d);
+        if (P > params.pressureThreshold && this.arpArmed && now - this.lastArp > 2800) {
+          this.arp(f0);
           this.lastArp = now;
           this.arpArmed = false;
           arpFlash = 1;
         }
-        if (d < params.densityThreshold - 0.045) this.arpArmed = true;
+        if (P < params.pressureThreshold - 0.005) this.arpArmed = true;
       }
 
-      arp(d) {
+      // 上行琶音 = 泛音列 1,2,3...n：频率整数倍，幅度 1/n（自然衰减的泛音结构）
+      arp(f0) {
         const ctx = this.ctx;
         const t0 = ctx.currentTime + 0.02;
-        const root = 57 + Math.round(d * 7);           // A3 起，密度越高整体越高
-        const scale = [0, 3, 5, 7, 10, 12, 15];        // 小调五声音阶上行
-        for (let k = 0; k < scale.length; k++) {
-          const midi = root + scale[k];
-          const freq = 440 * Math.pow(2, (midi - 69) / 12);
-          const t = t0 + k * 0.072;
+        for (let n = 1; n <= 7; n++) {
+          const t = t0 + (n - 1) * 0.075;
           const osc = ctx.createOscillator();
-          osc.type = k % 2 ? 'sine' : 'triangle';
-          osc.frequency.value = freq;
+          osc.type = n % 2 ? 'sine' : 'triangle';
+          osc.frequency.value = f0 * n;
           const g = ctx.createGain();
-          const peak = 0.085 * (1 - k * 0.07);
+          const peak = 0.10 / n;
           g.gain.setValueAtTime(0.0001, t);
           g.gain.exponentialRampToValueAtTime(peak, t + 0.012);
-          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.30);
-          osc.connect(g);
-          g.connect(this.master);
-          osc.start(t);
-          osc.stop(t + 0.34);
+          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.30 / Math.sqrt(n));
+          osc.connect(g); g.connect(this.master);
+          osc.start(t); osc.stop(t + 0.34);
         }
       }
 
-      hit(intensity) {
+      // 冲量 J 已由碰撞接近速度算出并归一化；Hertz 接触峰值力 ∝ v^1.2，
+      // 这里再用 √J 决定撞击音的音高（刚度主导），全程无随机触发。
+      hit(J) {
         if (!this.enabled) return;
         const now = performance.now();
-        // 双重冷却：单次的 80ms 间隔 + 每秒最多 10 次，防止连锁碰撞爆音
         if (now - this.lastHit < 80) return;
         if (now > this.hitWindow) { this.hitWindow = now + 1000; this.hitCount = 0; }
         if (this.hitCount >= 10) return;
@@ -479,26 +562,29 @@
 
         const ctx = this.ctx;
         const t = ctx.currentTime;
+        const amp = Math.max(0, Math.min(1, J));
+        const f = 420 + 900 * Math.sqrt(amp);
+
         const src = ctx.createBufferSource();
         src.buffer = this.noise;
         const bp = ctx.createBiquadFilter();
         bp.type = 'bandpass';
-        bp.frequency.value = 650 + intensity * 1900;
-        bp.Q.value = 1.1;
+        bp.frequency.value = f;
+        bp.Q.value = 1.4;
         const g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(0.035 + 0.10 * intensity, t + 0.004);
+        g.gain.exponentialRampToValueAtTime(0.035 + 0.11 * amp, t + 0.004);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.085);
         src.connect(bp); bp.connect(g); g.connect(this.master);
         src.start(t); src.stop(t + 0.12);
 
         const o = ctx.createOscillator();
         o.type = 'triangle';
-        o.frequency.setValueAtTime(880 + intensity * 760, t);
-        o.frequency.exponentialRampToValueAtTime(180, t + 0.07);
+        o.frequency.setValueAtTime(f * 1.6, t);
+        o.frequency.exponentialRampToValueAtTime(f * 0.35, t + 0.07);
         const g2 = ctx.createGain();
         g2.gain.setValueAtTime(0.0001, t);
-        g2.gain.exponentialRampToValueAtTime(0.03 + 0.06 * intensity, t + 0.005);
+        g2.gain.exponentialRampToValueAtTime(0.03 + 0.07 * amp, t + 0.005);
         g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.075);
         o.connect(g2); g2.connect(this.master);
         o.start(t); o.stop(t + 0.09);
@@ -507,38 +593,39 @@
     const audio = new FlockAudio();
 
     document.getElementById('startBtn').addEventListener('click', () => {
-      audio.enable().then(() => {
-        const intro = document.getElementById('intro');
-        intro.classList.add('hidden');
-      }).catch((e) => fail('声音开启失败：' + e.message));
+      audio.enable().then(() => document.getElementById('intro').classList.add('hidden'))
+        .catch((e) => fail('声音开启失败：' + e.message));
     });
     document.getElementById('audioBtn').addEventListener('click', () => {
-      if (!audio.enabled) {
-        audio.enable().catch((e) => fail('声音开启失败：' + e.message));
-      } else {
-        document.getElementById('intro').classList.remove('hidden');
-      }
+      if (!audio.enabled) audio.enable().catch((e) => fail('声音开启失败：' + e.message));
+      else document.getElementById('intro').classList.remove('hidden');
     });
 
     // ---------------------------------------------------------------- GUI
-    const gui = new GUI({ title: 'FlockLab 控制台', width: 294 });
+    const gui = new GUI({ title: 'FlockLab 控制台', width: 300 });
     const fRules = gui.addFolder('Boids 三规则');
     fRules.add(params, 'separation', 0, 4, 0.01).name('分离 Separation');
     fRules.add(params, 'alignment', 0, 4, 0.01).name('对齐 Alignment');
     fRules.add(params, 'cohesion', 0, 4, 0.01).name('聚合 Cohesion');
 
     const fMotion = gui.addFolder('感知与运动');
+    fMotion.add(params, 'count', 50, MAX_N, 10).name('元素数量').onChange(setCount);
     fMotion.add(params, 'perception', 1, 14, 0.1).name('感知半径');
     fMotion.add(params, 'separationRange', 0.2, 6, 0.1).name('分离半径');
     fMotion.add(params, 'flow', 0, 4, 0.05).name('流场扰动');
-    fMotion.add(params, 'maxSpeed', 2, 18, 0.1).name('最大速度');
+    fMotion.add(params, 'maxSpeed', 2, 18, 0.1).name('最大速度').onChange((v) => {
+      arrowMat.uniforms.uMaxSpeed.value = v;
+    });
     fMotion.add(params, 'minSpeed', 0.5, 8, 0.1).name('最小速度');
     fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动边界').onChange((v) => cage.scale.setScalar(v));
+    fMotion.add(params, 'arrowSize', 0.18, 0.9, 0.01).name('箭头大小');
     fMotion.close();
 
-    const fSound = gui.addFolder('声音映射');
+    const fSound = gui.addFolder('物理声音映射');
     fSound.add(params, 'master', 0, 1, 0.01).name('总音量').onChange((v) => audio.setMaster(v));
-    fSound.add(params, 'densityThreshold', 0.05, 0.95, 0.01).name('琶音密度阈值');
+    fSound.add(params, 'thermalRef', 2, 10, 0.1).name('热速度参考 v_ref');
+    fSound.add(params, 'pressureThreshold', 0.05, 0.8, 0.01).name('琶音气压阈值');
+    fSound.add(params, 'impulseThreshold', 0.01, 0.6, 0.01).name('碰撞冲量阈值');
     fSound.add({ toggle: () => document.getElementById('audioBtn').click() }, 'toggle').name('开启 / 关闭声音');
     fSound.close();
 
@@ -547,45 +634,76 @@
     fScene.add({ reset: resetBoids }, 'reset').name('重新初始化');
     fScene.close();
 
+    // ---------------------------------------------------------------- 空间哈希
+    const grid = new Map();
+    function keyOf(ix, iy, iz) {
+      return ((ix + 512) * 1024 + (iy + 512)) * 1024 + (iz + 512);
+    }
+
     // ---------------------------------------------------------------- 模拟
     function step(dt, time) {
-      const per2 = params.perception * params.perception;
-      const flowT = time * 0.00022;
+      const n = activeCount;
+      const cell = params.perception;
+      const per2 = cell * cell;
       const sep2 = params.separationRange * params.separationRange;
       const maxSpeed = params.maxSpeed;
       const maxForce = MAX_FORCE;
       const B = params.boundary;
+      const flowT = time * 0.00022;
+
+      grid.clear();
+      for (let i = 0; i < n; i++) {
+        const k = i * 3;
+        const key = keyOf(Math.floor(pos[k] / cell), Math.floor(pos[k + 1] / cell), Math.floor(pos[k + 2] / cell));
+        let bucket = grid.get(key);
+        if (!bucket) { bucket = []; grid.set(key, bucket); }
+        bucket.push(i);
+      }
+
       let sumNeighbors = 0;
       let cx = 0, cy = 0, cz = 0;
-      let collisions = 0, impact = 0;
+      let impact = 0;
+      let boundaryImpact = 0;
 
-      for (let i = 0; i < N; i++) {
+      for (let i = 0; i < n; i++) {
         const k = i * 3;
         const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
         const vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
         let count = 0;
-        let sx = 0, sy = 0, sz = 0;   // 位置累加（聚合）
-        let ax = 0, ay = 0, az = 0;   // 速度累加（对齐）
-        let dxs = 0, dys = 0, dzs = 0; // 分离向量
+        let sx = 0, sy = 0, sz = 0;
+        let ax = 0, ay = 0, az = 0;
+        let dxs = 0, dys = 0, dzs = 0;
 
-        for (let j = 0; j < N; j++) {
-          if (j === i) continue;
-          const m = j * 3;
-          const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
-          const d2 = dx * dx + dy * dy + dz * dz;
-          if (d2 > per2 || d2 < 1e-8) continue;
+        const ix = Math.floor(px / cell), iy = Math.floor(py / cell), iz = Math.floor(pz / cell);
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            for (let oz = -1; oz <= 1; oz++) {
+              const bucket = grid.get(keyOf(ix + ox, iy + oy, iz + oz));
+              if (!bucket) continue;
+              for (let b = 0; b < bucket.length; b++) {
+                const j = bucket[b];
+                if (j === i) continue;
+                const m = j * 3;
+                const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > per2 || d2 < 1e-8) continue;
 
-          count++;
-          sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
-          ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
-          if (d2 < sep2) {
-            const inv = 1 / d2;
-            dxs += dx * inv; dys += dy * inv; dzs += dz * inv;
-          }
-          if (d2 < COLLIDE_DIST2) {
-            collisions++;
-            const rvx = vx - vel[m], rvy = vy - vel[m + 1], rvz = vz - vel[m + 2];
-            impact += Math.sqrt(rvx * rvx + rvy * rvy + rvz * rvz);
+                count++;
+                sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
+                ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
+                if (d2 < sep2) {
+                  const inv = 1 / d2;
+                  dxs += dx * inv; dys += dy * inv; dzs += dz * inv;
+                }
+                if (d2 < COLLIDE_DIST2) {
+                  const dist = Math.sqrt(d2);
+                  const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+                  const rvx = vx - vel[m], rvy = vy - vel[m + 1], rvz = vz - vel[m + 2];
+                  const closing = -(rvx * nx + rvy * ny + rvz * nz); // 相向接近才计冲量
+                  if (closing > 0) impact = Math.max(impact, Math.pow(closing, 1.2));
+                }
+              }
+            }
           }
         }
         neighbors[i] = count;
@@ -593,9 +711,7 @@
         cx += px; cy += py; cz += pz;
 
         let fx = 0, fy = 0, fz = 0;
-
         if (count > 0) {
-          // 对齐：朝邻居平均速度转向
           let len = Math.hypot(ax, ay, az);
           if (len > 1e-6) {
             const s = maxSpeed / len;
@@ -604,7 +720,6 @@
             if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
             fx += tx * params.alignment; fy += ty * params.alignment; fz += tz * params.alignment;
           }
-          // 聚合：朝邻居质心转向
           let tx = sx / count - px, ty = sy / count - py, tz = sz / count - pz;
           len = Math.hypot(tx, ty, tz);
           if (len > 1e-6) {
@@ -615,7 +730,6 @@
             fx += tx * params.cohesion; fy += ty * params.cohesion; fz += tz * params.cohesion;
           }
         }
-        // 分离：距离越近推力越强
         const sl = Math.hypot(dxs, dys, dzs);
         if (sl > 1e-6) {
           const s = maxSpeed / sl;
@@ -624,13 +738,11 @@
           if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
           fx += tx * params.separation; fy += ty * params.separation; fz += tz * params.separation;
         }
-        // 柔性边界：越界前就往回拉
         const dist = Math.hypot(px, py, pz);
         if (dist > B - 3) {
           const push = (dist - (B - 3)) * 2.2;
           fx -= px / dist * push; fy -= py / dist * push; fz -= pz / dist * push;
         }
-        // 缓慢变化的流场：让群体持续游走，密度有起伏，声音才有对比
         fx += Math.sin(py * 0.11 + flowT) * params.flow;
         fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
         fz += Math.sin(px * 0.08 + pz * 0.10 + flowT * 0.6) * params.flow;
@@ -638,8 +750,8 @@
         acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = fz;
       }
 
-      let speedSum = 0;
-      for (let i = 0; i < N; i++) {
+      let speedSum = 0, keSum = 0;
+      for (let i = 0; i < n; i++) {
         const k = i * 3;
         let vx = vel[k] + acc[k] * dt;
         let vy = vel[k + 1] + acc[k + 1] * dt;
@@ -649,6 +761,7 @@
         else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; vz *= q; sp = params.minSpeed; }
         vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = vz;
         speedSum += sp;
+        keSum += 0.5 * sp * sp;
 
         pos[k] += vx * dt; pos[k + 1] += vy * dt; pos[k + 2] += vz * dt;
         const d = Math.hypot(pos[k], pos[k + 1], pos[k + 2]);
@@ -659,26 +772,31 @@
           vel[k] = (vx - 2 * dot * nx) * 0.92;
           vel[k + 1] = (vy - 2 * dot * ny) * 0.92;
           vel[k + 2] = (vz - 2 * dot * nz) * 0.92;
-          audio.hit(0.45);
+          if (dot > 0) boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * dot, 1.2));
         }
       }
 
-      cx /= N; cy /= N; cz /= N;
+      cx /= n; cy /= n; cz /= n;
       let spread = 0;
-      for (let i = 0; i < N; i++) {
+      for (let i = 0; i < n; i++) {
         const k = i * 3;
         const dx = pos[k] - cx, dy = pos[k + 1] - cy, dz = pos[k + 2] - cz;
         spread += dx * dx + dy * dy + dz * dz;
       }
-      avgNeighbors = sumNeighbors / N;
-      const neighborDensity = Math.min(1, avgNeighbors / 45);
-      const coherence = Math.max(0, 1 - Math.sqrt(spread / N) / (B * 0.62));
-      density = Math.min(1, neighborDensity * 0.72 + coherence * 0.28);
-      avgSpeed = speedSum / N;
 
-      if (collisions > 0) {
-        audio.hit(Math.min(1, (impact / collisions) / maxSpeed));
-      }
+      // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
+      avgNeighbors = sumNeighbors / n;
+      const neighborDensity = Math.min(1, avgNeighbors / 45);
+      const coherence = Math.max(0, 1 - Math.sqrt(spread / n) / (B * 0.62));
+      density = Math.min(1, neighborDensity * 0.72 + coherence * 0.28);
+      avgSpeed = speedSum / n;
+      const vRef = params.thermalRef;
+      temperature = Math.min(1, (keSum / n) / (0.5 * vRef * vRef));
+      pressure = density * temperature;
+
+      const norm = Math.pow(maxSpeed, 1.2);
+      collisionImpulse = Math.max(impact, boundaryImpact) / norm;
+      if (collisionImpulse > params.impulseThreshold) audio.hit(collisionImpulse);
     }
 
     // ---------------------------------------------------------------- 渲染
@@ -694,9 +812,8 @@
       if (fpsAcc > 0.5) { fps = fpsFrames / fpsAcc; fpsAcc = 0; fpsFrames = 0; }
 
       if (!params.paused) step(dt, now);
-      audio.update(density);
+      audio.update();
 
-      // 相机阻尼
       orbit.theta += (orbit.tTheta - orbit.theta) * 0.08;
       orbit.phi += (orbit.tPhi - orbit.phi) * 0.08;
       orbit.radius += (orbit.tRadius - orbit.radius) * 0.08;
@@ -709,29 +826,20 @@
       camera.lookAt(0, 0, 0);
       stars.rotation.y += dt * 0.008;
 
-      // 个体颜色：局部邻居数决定色相，速度决定亮度
-      for (let i = 0; i < N; i++) {
+      // CPU 只写颜色/尺寸；箭头的朝向与形状全部交给 GPU 着色器。
+      const n = activeCount;
+      for (let i = 0; i < n; i++) {
         const k = i * 3;
         const local = Math.min(1, neighbors[i] / 24);
-        const speedRatio = Math.min(1, avgSpeed > 0 ? Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed : 0);
-        tmpColor.setHSL(0.52 + local * 0.40, 0.92, 0.42 + speedRatio * 0.22);
-        coreMesh.setColorAt(i, tmpColor);
-        haloMesh.setColorAt(i, tmpColor);
-
-        const r = 0.17 + local * 0.07;
-        dummy.position.set(pos[k], pos[k + 1], pos[k + 2]);
-        dummy.scale.setScalar(r);
-        dummy.rotation.set(0, 0, 0);
-        dummy.updateMatrix();
-        coreMesh.setMatrixAt(i, dummy.matrix);
-        dummy.scale.setScalar(r * 3.1);
-        dummy.updateMatrix();
-        haloMesh.setMatrixAt(i, dummy.matrix);
+        const speedRatio = Math.min(1, Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed);
+        tmpColor.setHSL(0.52 + local * 0.40, 0.95, 0.46 + speedRatio * 0.22);
+        col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
+        siz[i] = params.arrowSize + local * 0.10;
       }
-      coreMesh.instanceMatrix.needsUpdate = true;
-      haloMesh.instanceMatrix.needsUpdate = true;
-      if (coreMesh.instanceColor) coreMesh.instanceColor.needsUpdate = true;
-      if (haloMesh.instanceColor) haloMesh.instanceColor.needsUpdate = true;
+      aPos.needsUpdate = true;
+      aVel.needsUpdate = true;
+      aCol.needsUpdate = true;
+      aSiz.needsUpdate = true;
 
       renderer.render(scene, camera);
 
@@ -741,9 +849,9 @@
       if (hudTimer > 0.1) {
         hudTimer = 0;
         document.getElementById('hDensityBar').style.width = (density * 100).toFixed(0) + '%';
-        document.getElementById('hSpeed').textContent = avgSpeed.toFixed(2);
-        document.getElementById('hPitch').textContent =
-          audio.enabled ? Math.round(55 * Math.pow(2, density * 2.15)) + ' Hz' : '— Hz';
+        document.getElementById('hTemp').textContent = temperature.toFixed(3);
+        document.getElementById('hPress').textContent = pressure.toFixed(3);
+        document.getElementById('hPitch').textContent = audio.enabled ? Math.round(audio.f0) + ' Hz' : '— Hz';
         document.getElementById('hFps').textContent = Math.round(fps) + ' FPS';
         document.getElementById('hHit').className = 'dot' + (collisionFlash > 0.35 ? ' on' : '');
         document.getElementById('hArp').className = 'dot' + (arpFlash > 0.35 ? ' arp' : '');
@@ -758,10 +866,13 @@
 
     requestAnimationFrame(render);
 
-    // 便于在控制台里调试
     window.FlockLab = {
-      params, resetBoids,
+      params, resetBoids, setCount,
+      get count() { return activeCount; },
       get density() { return density; },
+      get temperature() { return temperature; },
+      get pressure() { return pressure; },
+      get impulse() { return collisionImpulse; },
       get avgNeighbors() { return avgNeighbors; }
     };
   </script>
