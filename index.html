@@ -281,7 +281,7 @@
       paused: false,
       // 捕食者：标准 Reynolds pursuit + 预测逃逸模型
       predatorOn: false,
-      predatorCount: 3,
+      predatorCount: 1,
       fleeWeight: 2.6,
       fleeRange: 8.0,
       predict: 0.6,
@@ -372,7 +372,9 @@
       if (next > activeP) initPredators(activeP, next);
       activeP = next;
       params.predatorCount = next;
-      if (predMesh) predMesh.instanceCount = next;
+      // 关键：控制绘制数量的是几何体的 instanceCount，不是 Mesh 的。
+      // 之前误写 predMesh.instanceCount 导致减少数量后旧捕食者仍被绘制且不更新（定住）。
+      if (predGeo) predGeo.instanceCount = next;
       for (let p = 0; p < MAX_P; p++) threatRings[p].visible = params.predatorOn && p < next;
       document.getElementById('hPred').textContent = params.predatorOn ? next : '0';
     }
@@ -626,6 +628,7 @@
         this.predWindow = 0;
         this.arpArmed = true;
         this.f0 = 55;
+        this.muted = false;
       }
 
       async enable() {
@@ -671,14 +674,44 @@
         }
         await this.ctx.resume();
         this.enabled = true;
+        this.muted = false;
         params.enabled = true;
+        this.refreshButton();
+      }
+
+      refreshButton() {
         const btn = document.getElementById('audioBtn');
-        btn.classList.add('live');
-        btn.textContent = '🔊 声音已开启';
+        if (!this.enabled) {
+          btn.classList.remove('live');
+          btn.textContent = '🔇 点击开启声音';
+        } else if (this.muted) {
+          btn.classList.remove('live');
+          btn.textContent = '🔇 声音已关闭';
+        } else {
+          btn.classList.add('live');
+          btn.textContent = '🔊 声音已开启';
+        }
+      }
+
+      // 真正的静音开关：把主增益平滑降到 0，振荡器仍在运行但听不到声音。
+      setMuted(m) {
+        this.muted = m;
+        if (this.master) {
+          this.master.gain.setTargetAtTime(m ? 0 : params.master, this.ctx.currentTime, 0.04);
+        }
+        this.refreshButton();
+      }
+
+      toggle() {
+        if (!this.enabled) return this.enable();
+        this.setMuted(!this.muted);
+        return Promise.resolve();
       }
 
       setMaster(v) {
-        if (this.master) this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.04);
+        if (this.master && !this.muted) {
+          this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.04);
+        }
       }
 
       update() {
@@ -728,7 +761,7 @@
       // 冲量 J 已由碰撞接近速度算出并归一化；Hertz 接触峰值力 ∝ v^1.2，
       // 这里再用 √J 决定撞击音的音高（刚度主导），全程无随机触发。
       hit(J) {
-        if (!this.enabled) return;
+        if (!this.enabled || this.muted) return;
         const now = performance.now();
         if (now - this.lastHit < 80) return;
         if (now > this.hitWindow) { this.hitWindow = now + 1000; this.hitCount = 0; }
@@ -770,7 +803,7 @@
       // 捕食扑击音：捕获冲量 J 决定音量与音高（∝√J，接触刚度主导），
       // 低频闷响 + 带通噪声，比普通碰撞更低沉；独立冷却 90ms + 每秒 6 次。
       predate(J) {
-        if (!this.enabled || !params.predatorOn) return;
+        if (!this.enabled || this.muted || !params.predatorOn) return;
         const now = performance.now();
         if (now - this.predLast < 90) return;
         if (now > this.predWindow) { this.predWindow = now + 1000; this.predCount = 0; }
@@ -811,9 +844,9 @@
       audio.enable().then(() => document.getElementById('intro').classList.add('hidden'))
         .catch((e) => fail('声音开启失败：' + e.message));
     });
+    // 顶部按钮 = 真正的声音总开关：静音时主增益归零，不再弹出引导页。
     document.getElementById('audioBtn').addEventListener('click', () => {
-      if (!audio.enabled) audio.enable().catch((e) => fail('声音开启失败：' + e.message));
-      else document.getElementById('intro').classList.remove('hidden');
+      audio.toggle().catch((e) => fail('声音切换失败：' + e.message));
     });
 
     // ---------------------------------------------------------------- GUI
@@ -852,7 +885,7 @@
       if (v) { initPredators(0, activeP); predCatches = 0; }
     });
     fPred.add(params, 'predatorCount', 1, MAX_P, 1).name('捕食者数量').onChange(setPredCount);
-    fPred.add(params, 'predSpeed', 4, 18, 0.1).name('追击速度').onChange((v) => {
+    fPred.add(params, 'predSpeed', 2, 22, 0.1).name('捕食者速度').onChange((v) => {
       predMat.uniforms.uMaxSpeed.value = v;
     });
     fPred.add(params, 'chaseWeight', 0, 4, 0.05).name('追击权重');
@@ -860,7 +893,8 @@
     fPred.add(params, 'fleeRange', 3, 24, 0.5).name('逃逸半径 R');
     fPred.add(params, 'predict', 0, 1.5, 0.05).name('预测系数');
     fPred.add(params, 'infoCascade').name('信息级联');
-    fPred.close();
+    // 默认展开，让「捕食者速度」等滑块一眼可见
+    fPred.open();
 
     const fScene = gui.addFolder('场景');
     fScene.add(params, 'paused').name('暂停模拟');
@@ -1290,6 +1324,9 @@
         }));
       },
       get catches() { return predCatches; },
+      get predatorDrawCount() { return predGeo.instanceCount; },
+      get muted() { return audio.muted; },
+      get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
       get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },
       get avgPredDist() {
         if (!params.predatorOn) return 0;
