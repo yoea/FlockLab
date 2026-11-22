@@ -87,21 +87,8 @@
   /* 演示模式：只保留切换按钮，其余界面全部隐藏 */
   body.ui-hidden #brand,
   body.ui-hidden #hud,
-  body.ui-hidden #dimBtn,
   body.ui-hidden #audioBtn,
   body.ui-hidden .lil-gui.root { display: none !important; }
-
-  #dimBtn {
-    position: fixed; left: 22px; top: 92px; z-index: 6;
-    cursor: pointer; user-select: none;
-    padding: 8px 14px; font-size: 12px; letter-spacing: 0.04em;
-    color: var(--ink); border-radius: 999px;
-    border: 1px solid rgba(167, 139, 250, 0.45);
-    background: rgba(11, 26, 43, 0.78);
-    transition: transform .18s ease, border-color .25s ease, background .25s ease;
-  }
-  #dimBtn:hover { transform: translateY(-1px); }
-  #dimBtn.mode2d { border-color: rgba(120, 255, 190, 0.42); background: rgba(12, 34, 32, 0.82); }
 
   /* 可折叠玻璃卡片：标题可点，正文不拦截画布拖拽 */
   .card { pointer-events: auto; padding: 0; }
@@ -192,7 +179,6 @@
   /* 触控屏：放大所有可点区域，面板限高可滚动，避免挡住群体 */
   body.touch #audioBtn, body.touch #uiBtn { width: 44px; height: 44px; }
   body.touch #uiBtn { right: 70px; }
-  body.touch #dimBtn { min-height: 40px; padding: 10px 18px; }
   body.touch #startBtn { min-height: 48px; padding: 14px 34px; }
   body.touch .card-head { min-height: 44px; }
   body.touch .lil-gui {
@@ -215,7 +201,6 @@
 
   @media (max-width: 720px) {
     #brand { left: 12px; top: 12px; }
-    #dimBtn { left: 12px; top: 82px; }
     #hud { left: 12px; bottom: 12px; min-width: 0; }
     #audioBtn { right: 10px; top: 10px; }
     #uiBtn { right: 54px; top: 10px; }
@@ -233,8 +218,6 @@
     </button>
     <div class="card-body"><p id="brandSub">二维平面 · 方向个体 · GPU 渲染</p></div>
   </div>
-
-  <div id="dimBtn" class="mode2d" title="切换二维平面 / 三维空间视图">▦ 当前：二维平面</div>
 
   <button id="audioBtn" class="muted" type="button" title="开启声音" aria-label="开启声音">
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -326,7 +309,6 @@
 
     // ---------------------------------------------------------------- 参数
     const params = {
-      dim2D: true,
       count: 300,
       separation: 2.05,
       alignment: 1.1,
@@ -374,13 +356,16 @@
     const fleeDir = new Float32Array(MAX_N * 3);   // 当前帧逃逸力方向
     const prevFlee = new Float32Array(MAX_N * 3);  // 上一帧逃逸力，用于信息级联（传播带一帧延迟）
     const fleeing = new Uint8Array(MAX_N);
-    const caught = new Uint8Array(MAX_N);
+    const caught = new Uint8Array(MAX_N);           // 1=已被捕食，等待重新出生
+    const respawnAt = new Float64Array(MAX_N);      // 重新出生的时间戳（ms），0 表示无需等待
     const birthAt = new Float64Array(MAX_N);       // 新生时间戳：-Infinity 表示普通个体
     birthAt.fill(-Infinity);
     // 逃逸体力：1=满，0=耗尽。爆发结束后按 sprintRecovery 秒恢复，未回满不能再爆发。
     const stamina = new Float32Array(MAX_N);
     stamina.fill(1);
     const sprintUntil = new Float64Array(MAX_N);   // 爆发到期时间（ms）
+    const cruiseBias = new Float32Array(MAX_N);    // 无威胁时的巡航速度比例，缓慢向群体节奏靠拢
+    cruiseBias.fill(0.42);
     let sprintCount = 0, sprintingCount = 0;
 
     // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
@@ -397,8 +382,9 @@
     predPulseAt.fill(-Infinity);
 
     const MAX_FORCE = 14;
-    const CATCH_DIST = 1.0;
-    const CATCH_DIST2 = CATCH_DIST * CATCH_DIST;
+    // 捕食者的碰撞体积跟随外形的等边三角形大小：接触即算捕获（仍受进食冷却限制）。
+    const predBaseSize = () => Math.max(1.1, params.arrowSize * 7);
+    const catchRadius = () => predBaseSize() * 0.78 + params.arrowSize * 0.6;
     const PRED_FORCE = 24;
     const PRED_SEP_RANGE2 = 6 * 6;
     const PRED_SEP_FORCE = 34;
@@ -406,10 +392,11 @@
     const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
     const BIRTH_TOTAL_MS = 3200;                    // 新生标记总时长：前 1.8s 亮绿，后 1.4s 渐变
     const BIRTH_SOLID_MS = 1800;
-    const BURST_MS = 760;                           // 捕杀冲击波动画时长
+    const BURST_MS = 820;                           // 捕杀动画时长，三段音效与其对齐
     const THERMAL_REF = 5.0;                        // 统计用的参考速度，与声音无关
 
     let density = 0, avgSpeed = 0, avgNeighbors = 0;
+    let currentPace = 0;
     // 上一帧鱼群质心：用于群体级躲避，让整群像鱼群一样一起绕开捕食者。
     let groupX = 0, groupY = 0, groupZ = 0;
     // 群体惊吓波纹：捕食者进入范围时整群一起闪避一次，随后恢复群聚，不会永远逃跑。
@@ -418,53 +405,67 @@
     let sprintFlash = 0, birthFlash = 0, predFlash = 0, predCatches = 0;
 
     function initBoids(from, to, isBirth = false) {
-      const bd2 = params.dim2D ? bounds2D() : null;
+      const bd = bounds2D();
       for (let i = from; i < to; i++) {
-        const r = 12 * Math.cbrt(Math.random());
-        const u = Math.random() * 2 - 1;
-        const t = Math.random() * Math.PI * 2;
-        const s = Math.sqrt(1 - u * u);
         const k = i * 3;
-        // 2D 在矩形内铺开；3D 仍用球面采样
-        if (params.dim2D) {
-          pos[k] = (Math.random() * 2 - 1) * bd2.hx * 0.8;
-          pos[k + 1] = (Math.random() * 2 - 1) * bd2.hy * 0.8;
-        } else {
-          pos[k] = r * s * Math.cos(t);
-          pos[k + 1] = r * s * Math.sin(t);
-        }
-        // 2D 模式压平到 XY 平面
-        pos[k + 2] = params.dim2D ? 0 : r * u;
+        pos[k] = (Math.random() * 2 - 1) * bd.hx * 0.8;
+        pos[k + 1] = (Math.random() * 2 - 1) * bd.hy * 0.8;
+        pos[k + 2] = 0;
         const vs = 3 + Math.random() * 4;
         vel[k] = (Math.random() * 2 - 1) * vs;
         vel[k + 1] = (Math.random() * 2 - 1) * vs;
-        vel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
-        rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = vel[k + 2];
+        vel[k + 2] = 0;
+        rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
         birthAt[i] = isBirth ? performance.now() : -Infinity;
-        stamina[i] = 1; sprintUntil[i] = 0;
+        stamina[i] = 1; sprintUntil[i] = 0; cruiseBias[i] = 0.42;
+        caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
     }
+
+    // 被捕食的个体在 1 秒后重新出生：在所有候选点里挑离捕食者最远、
+    // 同时离边界留有余量的位置，避免「刚出生就被吃」。
+    function spawnFar(i, now) {
+      const k = i * 3;
+      const bd = bounds2D();
+      let bestX = 0, bestY = 0, bestScore = -Infinity;
+      const inset = 0.18;   // 离边界至少留 18%
+      for (let c = 0; c < 32; c++) {
+        const x = (Math.random() * 2 - 1) * bd.hx * (1 - inset);
+        const y = (Math.random() * 2 - 1) * bd.hy * (1 - inset);
+        let minD2 = Infinity;
+        for (let p = 0; p < activeP; p++) {
+          const q = p * 3;
+          const dx = x - predPos[q], dy = y - predPos[q + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 < minD2) minD2 = d2;
+        }
+        if (minD2 === Infinity) minD2 = 0;
+        const score = minD2 - Math.hypot(x, y) * 0.05;  // 轻微偏好中心
+        if (score > bestScore) { bestScore = score; bestX = x; bestY = y; }
+      }
+      pos[k] = bestX; pos[k + 1] = bestY; pos[k + 2] = 0;
+      const dir = Math.random() * Math.PI * 2;
+      const vs = params.maxSpeed * (0.6 + Math.random() * 0.2);
+      vel[k] = Math.cos(dir) * vs;
+      vel[k + 1] = Math.sin(dir) * vs;
+      vel[k + 2] = 0;
+      rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
+      birthAt[i] = now;
+      stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; cruiseBias[i] = 0.42;
+    }
+
     function initPredators(from, to) {
-      const bd2 = params.dim2D ? bounds2D() : null;
+      const bd = bounds2D();
       for (let p = from; p < to; p++) {
         const k = p * 3;
-        const r = params.boundary * (0.5 + Math.random() * 0.38);
-        const u = Math.random() * 2 - 1;
-        const t = Math.random() * Math.PI * 2;
-        const s = Math.sqrt(1 - u * u);
-        if (params.dim2D) {
-          predPos[k] = (Math.random() * 2 - 1) * bd2.hx * 0.7;
-          predPos[k + 1] = (Math.random() * 2 - 1) * bd2.hy * 0.7;
-        } else {
-          predPos[k] = r * s * Math.cos(t);
-          predPos[k + 1] = r * s * Math.sin(t);
-        }
-        predPos[k + 2] = params.dim2D ? 0 : r * u;
+        predPos[k] = (Math.random() * 2 - 1) * bd.hx * 0.7;
+        predPos[k + 1] = (Math.random() * 2 - 1) * bd.hy * 0.7;
+        predPos[k + 2] = 0;
         const vs = params.predSpeed * 0.7;
         predVel[k] = (Math.random() * 2 - 1) * vs;
         predVel[k + 1] = (Math.random() * 2 - 1) * vs;
-        predVel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
-        rPredVel[k] = predVel[k]; rPredVel[k + 1] = predVel[k + 1]; rPredVel[k + 2] = predVel[k + 2];
+        predVel[k + 2] = 0;
+        rPredVel[k] = predVel[k]; rPredVel[k + 1] = predVel[k + 1]; rPredVel[k + 2] = 0;
         predFeedAt[p] = 0;
       }
     }
@@ -475,6 +476,7 @@
       initPredators(0, activeP);
       predCatches = 0;
       sprintCount = 0;
+      caught.fill(0); respawnAt.fill(0);
       predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
       clearBursts();
     };
@@ -502,14 +504,12 @@
     // ---------------------------------------------------------------- 场景
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x05070f);
-    scene.fog = new THREE.FogExp2(0x05070f, 0.0105);
 
-    const perspCam = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 600);
     const orthoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 400);
-    let camera = params.dim2D ? orthoCam : perspCam;
-    // 2D 视图：平移中心 + 缩放
+    const camera = orthoCam;
+    // 视图：平移中心 + 缩放
     const view2D = { x: 0, y: 0, zoom: 1, tZoom: 1 };
-    // 2D 相机视野固定：只由 zoom 决定，不随「活动边界」滑块变化。
+    // 相机视野固定：只由 zoom 决定，不随「活动边界」滑块变化。
     // 否则调边界时画面会跟着缩放，看起来像动画错乱。
     const VIEW2D_HALF_H = 22.2;
     // 边界不超过默认 20 时视野固定；超过后自动拉远，保证整个边界框可见。
@@ -520,7 +520,7 @@
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     document.getElementById('scene').appendChild(renderer.domElement);
 
-    // 2D 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
+    // 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
     function updateOrthoFrustum() {
       const aspect = innerWidth / innerHeight;
       const halfH = view2DFitHalfH() / view2D.zoom;
@@ -531,37 +531,13 @@
     }
     updateOrthoFrustum();
 
-    const orbit = {
-      theta: 0.72, phi: 1.13, radius: 55,
-      tTheta: 0.72, tPhi: 1.13, tRadius: 55,
-      dragging: false, x: 0, y: 0
-    };
     const cv = renderer.domElement;
     const pointers = new Map();
     let pinchDist = 0, downTime = 0, moved = 0, lastTap = 0;
 
-    function resetCamera() {
-      orbit.tTheta = 0.72; orbit.tPhi = 1.13; orbit.tRadius = 55;
+    function resetView2D() {
       view2D.x = 0; view2D.y = 0; view2D.tZoom = 1; view2D.zoom = 1;
       updateOrthoFrustum();
-    }
-
-    let dimCtrl = null;   // GUI 开关控制器，创建后赋值
-    function setMode2D(on) {
-      if (params.dim2D === on) {
-        // 首次调用也要刷新 UI
-      }
-      params.dim2D = on;
-      resetBoids();           // 重排个体，使 3D→2D 时 z 归零、2D→3D 时恢复立体分布
-      resetCamera();
-      updateRectFrame();
-      const btn = document.getElementById('dimBtn');
-      btn.classList.toggle('mode2d', on);
-      btn.textContent = on ? '▦ 当前：二维平面' : '◈ 当前：三维空间';
-      document.getElementById('brandSub').textContent = on
-        ? '二维平面 · 方向个体 · GPU 渲染'
-        : '三维空间 · 方向个体 · GPU 渲染';
-      if (dimCtrl) dimCtrl.updateDisplay();
     }
 
     cv.addEventListener('pointerdown', (e) => {
@@ -581,32 +557,18 @@
       const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
       prev.x = e.clientX; prev.y = e.clientY;
       moved += Math.abs(dx) + Math.abs(dy);
-      if (params.dim2D) {
-        if (pointers.size === 1) {
-          // 2D：拖拽平移视图（屏幕像素 → 世界坐标）
-          const scale = (2 * view2DFitHalfH() / view2D.zoom) / innerHeight;
-          view2D.x -= dx * scale;
-          view2D.y += dy * scale;
-        } else if (pointers.size === 2) {
-          const p = [...pointers.values()];
-          const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
-          if (pinchDist > 0 && d > 0) {
-            view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * d / pinchDist));
-          }
-          pinchDist = d;
+      if (pointers.size === 1) {
+        // 拖拽平移视图（屏幕像素 → 世界坐标）
+        const scale = (2 * view2DFitHalfH() / view2D.zoom) / innerHeight;
+        view2D.x -= dx * scale;
+        view2D.y += dy * scale;
+      } else if (pointers.size === 2) {
+        const p = [...pointers.values()];
+        const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+        if (pinchDist > 0 && d > 0) {
+          view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * d / pinchDist));
         }
-      } else {
-        if (pointers.size === 1) {
-          orbit.tTheta -= dx * 0.005;
-          orbit.tPhi = Math.max(0.18, Math.min(Math.PI - 0.18, orbit.tPhi - dy * 0.005));
-        } else if (pointers.size === 2) {
-          const p = [...pointers.values()];
-          const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
-          if (pinchDist > 0 && d > 0) {
-            orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius * pinchDist / d));
-          }
-          pinchDist = d;
-        }
+        pinchDist = d;
       }
     });
 
@@ -619,7 +581,7 @@
       // 触控双击重置视角；鼠标不参与，避免和拖拽冲突
       if (wasSingle && e.pointerType !== 'mouse' && moved < 12 && performance.now() - downTime < 260) {
         const now = performance.now();
-        if (now - lastTap < 340) { resetCamera(); lastTap = 0; }
+        if (now - lastTap < 340) { resetView2D(); lastTap = 0; }
         else lastTap = now;
       }
     }
@@ -628,42 +590,10 @@
     cv.addEventListener('contextmenu', (e) => e.preventDefault());
     cv.addEventListener('wheel', (e) => {
       e.preventDefault();
-      if (params.dim2D) {
-        view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * Math.exp(-e.deltaY * 0.0012)));
-      } else {
-        orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius + e.deltaY * 0.045));
-      }
+      view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * Math.exp(-e.deltaY * 0.0012)));
     }, { passive: false });
 
-    const starGeo = new THREE.BufferGeometry();
-    const starPos = new Float32Array(900 * 3);
-    for (let i = 0; i < 900; i++) {
-      const r = 70 + Math.random() * 110;
-      const u = Math.random() * 2 - 1;
-      const t = Math.random() * Math.PI * 2;
-      const s = Math.sqrt(1 - u * u);
-      starPos[i * 3] = r * s * Math.cos(t);
-      starPos[i * 3 + 1] = r * s * Math.sin(t);
-      starPos[i * 3 + 2] = r * u;
-    }
-    starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
-    const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
-      color: 0x7b9bd4, size: 0.42, transparent: true, opacity: 0.55,
-      depthWrite: false, sizeAttenuation: true
-    }));
-    scene.add(stars);
-
-    const cage = new THREE.Mesh(
-      new THREE.SphereGeometry(1, 28, 16),
-      new THREE.MeshBasicMaterial({
-        color: 0x2a5d8c, wireframe: true, transparent: true,
-        opacity: 0.10, depthWrite: false
-      })
-    );
-    cage.scale.setScalar(params.boundary);
-    scene.add(cage);
-
-    // 2D 模式的安全边界矩形（贴合屏幕宽高比），3D 下隐藏
+    // 安全边界矩形（贴合屏幕宽高比）
     const rectFrameGeo = new THREE.BufferGeometry();
     rectFrameGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(4 * 3), 3));
     const rectFrame = new THREE.LineLoop(rectFrameGeo, new THREE.LineBasicMaterial({
@@ -783,8 +713,7 @@
     predGeo.instanceCount = activeP;
     const predMat = arrowMat.clone();
     predMat.uniforms.uMaxSpeed.value = params.predSpeed;
-    // 实心箭头：三角箭头 + 矩形箭杆 + 亮边辉光 + 高亮尖端。
-    // 猎物是细线「>」，捕食者是填充的橙红色宽箭头，形态与颜色都明确区分。
+    // 等边锐角三角形：三边等长、方向即运动方向，和猎物细线「>」完全不同。
     predMat.fragmentShader = `
       varying vec2 vLocal;
       varying vec3 vColor;
@@ -802,24 +731,18 @@
                      vec2(dot(q2, q2), s * (v2.x * e2.y - v2.y * e2.x)));
         return -sqrt(d.x) * sign(d.y);
       }
-      float sdBox(vec2 p, vec2 b) {
-        vec2 d = abs(p) - b;
-        return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-      }
       void main() {
         vec2 p = vLocal;
-        // 箭头朝 +x：宽三角头部 + 短而粗的箭杆
-        float head = sdTri(p, vec2(1.00, 0.00), vec2(-0.22, 0.68), vec2(-0.22, -0.68));
-        float shaft = sdBox(p - vec2(-0.52, 0.0), vec2(0.52, 0.22));
-        float d = min(head, shaft);
-        float fill = 1.0 - smoothstep(0.0, 0.05, d);
-        float glow = exp(-max(d, 0.0) * 8.0) * 0.40;
+        // 顶点 (1,0)、(-0.5,±√3/2)：中心在原点的等边三角形
+        float d = sdTri(p, vec2(1.0, 0.0), vec2(-0.5, 0.8660254), vec2(-0.5, -0.8660254));
+        float fill = 1.0 - smoothstep(0.0, 0.035, d);
+        float rim = exp(-abs(d) * 20.0) * 0.32;
+        float glow = exp(-max(d, 0.0) * 7.0) * 0.28;
         float a = clamp(fill + glow, 0.0, 1.0) * vFade;
         if (a < 0.004) discard;
-        vec3 c = vColor * (1.0 + 0.35 * vSpeed) * (fill * 0.92 + glow * 0.55);
-        // 尖端一点冷白高光，强化「箭头」感
-        float tip = 1.0 - smoothstep(0.03, 0.24, length(p - vec2(0.74, 0.0)));
-        c = mix(c, vec3(1.0, 0.96, 0.86), tip * 0.65 * fill);
+        vec3 c = vColor * (0.92 + 0.32 * vSpeed) * (fill * 0.88 + rim + glow * 0.5);
+        float tip = 1.0 - smoothstep(0.05, 0.34, length(p - vec2(0.72, 0.0)));
+        c = mix(c, vec3(1.0, 0.95, 0.82), tip * 0.45 * fill);
         gl_FragColor = vec4(c, a);
         #include <colorspace_fragment>
       }
@@ -844,36 +767,54 @@
       threatRings.push(ring);
       scene.add(ring);
       predCol[p * 3] = 1.0; predCol[p * 3 + 1] = 0.34; predCol[p * 3 + 2] = 0.12;
-      predSiz[p] = Math.max(1.1, params.arrowSize * 7);
+      predSiz[p] = predBaseSize();
     }
 
-    // 捕杀冲击波：外圈 + 亮核，池化复用；2D/3D 都用相机朝向做 billboard。
-    const burstRingGeo = new THREE.RingGeometry(0.70, 1.0, 48);
+    // 捕杀特效三段式：0ms 亮核爆闪 → 90ms 内环扩张 + 火花 → 240ms 外环余波。
+    // 三段分别对应 predate() 的三段音。
+    const SPARKS = 10;
+    const burstInnerGeo = new THREE.RingGeometry(0.88, 1.0, 40);
+    const burstOuterGeo = new THREE.RingGeometry(0.72, 1.0, 48);
     const burstCoreGeo = new THREE.CircleGeometry(1, 32);
     const killBursts = [];
-    for (let b = 0; b < 24; b++) {
-      const ring = new THREE.Mesh(burstRingGeo, new THREE.MeshBasicMaterial({
-        color: 0xffa050, transparent: true, opacity: 0, side: THREE.DoubleSide,
-        depthWrite: false, blending: THREE.AdditiveBlending, fog: false
+    for (let b = 0; b < 14; b++) {
+      const common = {
+        transparent: true, side: THREE.DoubleSide, depthWrite: false,
+        blending: THREE.AdditiveBlending, fog: false
+      };
+      const core = new THREE.Mesh(burstCoreGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xffffff, opacity: 0 }));
+      const inner = new THREE.Mesh(burstInnerGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xffd6a0, opacity: 0 }));
+      const outer = new THREE.Mesh(burstOuterGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xff7a3d, opacity: 0 }));
+      const sparkGeo = new THREE.BufferGeometry();
+      sparkGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(SPARKS * 3), 3));
+      const sparks = new THREE.Points(sparkGeo, new THREE.PointsMaterial({
+        color: 0xffdcae, size: 3.6, sizeAttenuation: false,
+        transparent: true, opacity: 0, depthWrite: false,
+        blending: THREE.AdditiveBlending, fog: false
       }));
-      const core = new THREE.Mesh(burstCoreGeo, new THREE.MeshBasicMaterial({
-        color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide,
-        depthWrite: false, blending: THREE.AdditiveBlending, fog: false
-      }));
-      ring.visible = false; core.visible = false;
-      ring.frustumCulled = false; core.frustumCulled = false;
-      scene.add(ring); scene.add(core);
-      killBursts.push({ ring, core, active: false, born: 0, x: 0, y: 0, z: 0 });
+      for (const o of [core, inner, outer, sparks]) {
+        o.visible = false; o.frustumCulled = false; scene.add(o);
+      }
+      killBursts.push({
+        core, inner, outer, sparks,
+        dirs: new Float32Array(SPARKS * 2),
+        active: false, born: 0, x: 0, y: 0
+      });
     }
     function spawnBurst(x, y, z, now) {
       let slot = killBursts.find((b) => !b.active);
       if (!slot) slot = killBursts.reduce((a, b) => (a.born < b.born ? a : b)); // 池满则复用最老
-      slot.active = true; slot.born = now; slot.x = x; slot.y = y; slot.z = z;
-      slot.ring.visible = true; slot.core.visible = true;
+      slot.active = true; slot.born = now; slot.x = x; slot.y = y;
+      for (let s = 0; s < SPARKS; s++) {
+        const a = Math.random() * Math.PI * 2;
+        slot.dirs[s * 2] = Math.cos(a); slot.dirs[s * 2 + 1] = Math.sin(a);
+      }
+      for (const o of [slot.core, slot.inner, slot.outer, slot.sparks]) o.visible = true;
     }
     function clearBursts() {
       for (const b of killBursts) {
-        b.active = false; b.ring.visible = false; b.core.visible = false;
+        b.active = false;
+        for (const o of [b.core, b.inner, b.outer, b.sparks]) o.visible = false;
       }
     }
 
@@ -893,6 +834,7 @@
         this.lastSprint = 0; this.sprintWindow = 0; this.sprintCount = 0;
         this.lastPred = 0;   this.predWindow = 0;   this.predCount = 0;
         this.lastBirth = 0;  this.birthWindow = 0;  this.birthCount = 0;
+        this.lastSprintDur = 0;
         this.total = { sprint: 0, predate: 0, birth: 0 };
       }
 
@@ -959,79 +901,104 @@
         return Promise.resolve();
       }
 
-      // 1) 加速逃逸：向上扫频的气流声 + 短促上扬音，像「弹出去」的那一下。
-      //    群体同时爆发时限流，避免几十个音叠成噪音。
+      // 1) 加速逃逸：轻柔、短促的一次向上滑音，像「提速」而不是爆响。
+      //    多只同时爆发时限流并压低音量；时长随爆发持续时间变化。
       sprint(intensity = 0) {
         if (!this.enabled || this.muted || !params.predatorOn) return;
         const now = performance.now();
-        if (now - this.lastSprint < 70) return;
+        if (now - this.lastSprint < 120) return;
         if (now > this.sprintWindow) { this.sprintWindow = now + 1000; this.sprintCount = 0; }
-        if (this.sprintCount >= 8) return;
+        if (this.sprintCount >= 6) return;
         this.lastSprint = now; this.sprintCount++; this.total.sprint++;
         sprintFlash = 1;
 
         const ctx = this.ctx, t = ctx.currentTime;
-        const amp = 0.55 + 0.45 * Math.max(0, Math.min(1, intensity));
+        const amp = 0.4 + 0.6 * Math.max(0, Math.min(1, intensity));
+        const dur = Math.max(0.14, Math.min(0.55, params.sprintDuration * 0.30));
+        this.lastSprintDur = +dur.toFixed(3);
+        const fade = Math.max(0.012, dur - 0.012);
+
+        // 低通后的极轻气流层：只有一点点「呼」的加速感
         const src = ctx.createBufferSource();
         src.buffer = this.noise;
-        const bp = ctx.createBiquadFilter();
-        bp.type = 'bandpass'; bp.Q.value = 1.2;
-        bp.frequency.setValueAtTime(420, t);
-        bp.frequency.exponentialRampToValueAtTime(1900, t + 0.15);
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass'; lp.Q.value = 0.6;
+        lp.frequency.setValueAtTime(280, t);
+        lp.frequency.exponentialRampToValueAtTime(1100, t + dur);
         const g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(0.075 * amp, t + 0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.19);
-        src.connect(bp); bp.connect(g); g.connect(this.master);
-        src.start(t); src.stop(t + 0.2);
+        g.gain.exponentialRampToValueAtTime(0.010 + 0.010 * amp, t + Math.min(0.03, dur * 0.2));
+        g.gain.exponentialRampToValueAtTime(0.0001, t + fade);
+        src.connect(lp); lp.connect(g); g.connect(this.master);
+        src.start(t); src.stop(t + dur + 0.02);
 
+        // 柔和正弦上滑，和气流层叠在一起只占很低音量
         const o = ctx.createOscillator();
         o.type = 'sine';
-        o.frequency.setValueAtTime(230, t);
-        o.frequency.exponentialRampToValueAtTime(760, t + 0.13);
+        o.frequency.setValueAtTime(210, t);
+        o.frequency.exponentialRampToValueAtTime(580, t + dur * 0.85);
         const g2 = ctx.createGain();
         g2.gain.setValueAtTime(0.0001, t);
-        g2.gain.exponentialRampToValueAtTime(0.05 * amp, t + 0.015);
-        g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+        g2.gain.exponentialRampToValueAtTime(0.007 + 0.008 * amp, t + Math.min(0.025, dur * 0.18));
+        g2.gain.exponentialRampToValueAtTime(0.0001, t + fade);
         o.connect(g2); g2.connect(this.master);
-        o.start(t); o.stop(t + 0.17);
+        o.start(t); o.stop(t + dur + 0.02);
       }
 
-      // 2) 被吃掉：低频闷响 + 咬合噪声 + 下坠短音，和逃逸的上扬音形成反差。
+      // 2) 被吃掉：三段音与捕杀动画同步——
+      //    0ms 亮核闪光=低频撞击；90ms 内环扩张=撕裂噪声；240ms 外环与火花=低沉余波。
       predate(J) {
         if (!this.enabled || this.muted || !params.predatorOn) return;
         const now = performance.now();
-        if (now - this.lastPred < 90) return;
+        if (now - this.lastPred < 120) return;
         if (now > this.predWindow) { this.predWindow = now + 1000; this.predCount = 0; }
-        if (this.predCount >= 6) return;
+        if (this.predCount >= 5) return;
         this.lastPred = now; this.predCount++; this.total.predate++;
         predFlash = 1;
 
         const ctx = this.ctx, t = ctx.currentTime;
         const amp = Math.max(0, Math.min(1, J));
-        const f = 90 + 170 * Math.sqrt(amp);
+        const f = 95 + 150 * Math.sqrt(amp);
 
+        // 第一段：撞击（对应亮核爆闪）
+        const o1 = ctx.createOscillator();
+        o1.type = 'triangle';
+        o1.frequency.setValueAtTime(f, t);
+        o1.frequency.exponentialRampToValueAtTime(f * 0.55, t + 0.10);
+        const g1 = ctx.createGain();
+        g1.gain.setValueAtTime(0.0001, t);
+        g1.gain.exponentialRampToValueAtTime(0.065 + 0.055 * amp, t + 0.006);
+        g1.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+        o1.connect(g1); g1.connect(this.master);
+        o1.start(t); o1.stop(t + 0.13);
+
+        // 第二段：撕裂（对应内环扩张与火花飞散）
+        const t2 = t + 0.09;
         const src = ctx.createBufferSource();
         src.buffer = this.noise;
         const bp = ctx.createBiquadFilter();
-        bp.type = 'bandpass'; bp.frequency.value = 850; bp.Q.value = 0.9;
-        const g = ctx.createGain();
-        g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(0.16 + 0.10 * amp, t + 0.006);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
-        src.connect(bp); bp.connect(g); g.connect(this.master);
-        src.start(t); src.stop(t + 0.13);
-
-        const o = ctx.createOscillator();
-        o.type = 'triangle';
-        o.frequency.setValueAtTime(f, t);
-        o.frequency.exponentialRampToValueAtTime(f * 0.42, t + 0.15);
+        bp.type = 'bandpass'; bp.Q.value = 1.0;
+        bp.frequency.setValueAtTime(1500, t2);
+        bp.frequency.exponentialRampToValueAtTime(520, t2 + 0.17);
         const g2 = ctx.createGain();
-        g2.gain.setValueAtTime(0.0001, t);
-        g2.gain.exponentialRampToValueAtTime(0.11 + 0.10 * amp, t + 0.008);
-        g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.17);
-        o.connect(g2); g2.connect(this.master);
-        o.start(t); o.stop(t + 0.18);
+        g2.gain.setValueAtTime(0.0001, t2);
+        g2.gain.exponentialRampToValueAtTime(0.055 + 0.045 * amp, t2 + 0.02);
+        g2.gain.exponentialRampToValueAtTime(0.0001, t2 + 0.19);
+        src.connect(bp); bp.connect(g2); g2.connect(this.master);
+        src.start(t2); src.stop(t2 + 0.2);
+
+        // 第三段：余波（对应外环扩散到最大）
+        const t3 = t + 0.24;
+        const o3 = ctx.createOscillator();
+        o3.type = 'sine';
+        o3.frequency.setValueAtTime(f * 0.85, t3);
+        o3.frequency.exponentialRampToValueAtTime(f * 0.42, t3 + 0.34);
+        const g3 = ctx.createGain();
+        g3.gain.setValueAtTime(0.0001, t3);
+        g3.gain.exponentialRampToValueAtTime(0.04 + 0.035 * amp, t3 + 0.03);
+        g3.gain.exponentialRampToValueAtTime(0.0001, t3 + 0.38);
+        o3.connect(g3); g3.connect(this.master);
+        o3.start(t3); o3.stop(t3 + 0.4);
       }
 
       // 3) 新生：两声短促上行的清亮提示音，捕获后被吃的声音之后响起。
@@ -1070,7 +1037,6 @@
     document.getElementById('audioBtn').addEventListener('click', () => {
       audio.toggle().catch((e) => fail('声音切换失败：' + e.message));
     });
-    document.getElementById('dimBtn').addEventListener('click', () => setMode2D(!params.dim2D));
 
     // 演示模式：一次点击隐藏控制台、卡片、提示等所有 UI，只留这个图标用于恢复。
     const uiBtn = document.getElementById('uiBtn');
@@ -1135,12 +1101,11 @@
       arrowMat.uniforms.uMaxSpeed.value = v;
     }),
       '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。');
-    tip(fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动范围').onChange((v) => {
-      cage.scale.setScalar(v);
-      // 2D 的显示矩形必须跟着模拟边界一起变；相机视野保持固定，画面不会跟着缩放。
-      if (params.dim2D) { updateRectFrame(); updateOrthoFrustum(); }
+    tip(fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动范围').onChange(() => {
+      // 显示矩形跟着模拟边界一起变；相机视野保持固定，画面不会跟着缩放。
+      updateRectFrame(); updateOrthoFrustum();
     }),
-      '活动范围｜场地大小。调大：鸟有更大空间、更分散。调小：更拥挤、撞边更频繁。2D 下画面边框会同步变化。');
+      '活动范围｜场地大小。调大：鸟有更大空间、更分散。调小：更拥挤、撞边更频繁。画面边框会同步变化。');
     tip(fMotion.add(params, 'flow', 0, 4, 0.05).name('气流扰动'),
       '气流扰动｜调大：鸟更容易被随机气流带偏，运动更自然，但队形更松散。调 0：完全按三规则飞行。');
     tip(fMotion.add(params, 'arrowSize', 0.18, 0.9, 0.01).name('箭头大小'),
@@ -1157,7 +1122,7 @@
         predCatches = 0; sprintCount = 0; stamina.fill(1); sprintUntil.fill(0);
       }
     }),
-      '开启捕食者｜打开后出现橙红色实心箭头追杀鸟群；鸟会逃逸，危险时会短时爆发加速。');
+      '开启捕食者｜打开后出现橙红色等边三角形，接触即捕获；鸟会逃逸，危险时会短时爆发加速。');
     tip(fPred.add(params, 'predatorCount', 1, MAX_P, 1).name('捕食者数量').onChange(setPredCount),
       '捕食者数量｜调多：鸟群压力更大、逃生更混乱。调少（推荐 1 只）：更容易看清追击、爆发和捕杀动画。');
     tip(fPred.add(params, 'predSpeed', 2, 36, 0.1).name('捕食者速度').onChange((v) => {
@@ -1181,13 +1146,11 @@
     fPred.open();
 
     const fScene = gui.addFolder('场景');
-    dimCtrl = tip(fScene.add(params, 'dim2D').name('二维平面模式').onChange((v) => setMode2D(v)),
-      '二维平面模式｜开启：正交视角、鸟只在平面上飞。关闭：透视视角、恢复立体分布。');
     tip(fScene.add(params, 'paused').name('暂停模拟'),
       '暂停模拟｜冻结运动，方便观察某一帧；再点一次继续。');
     tip(fScene.add({ reset: resetBoids }, 'reset').name('重新初始化'),
       '重新初始化｜把鸟群和捕食者放回随机初始位置，清空捕获与体力记录。');
-    tip(fScene.add({ view: resetCamera }, 'view').name('重置视角'),
+    tip(fScene.add({ view: resetView2D }, 'view').name('重置视角'),
       '重置视角｜把缩放和平移恢复到默认。');
     fScene.open();
 
@@ -1217,9 +1180,8 @@
       const maxSpeed = params.maxSpeed;
       const maxForce = MAX_FORCE;
       const B = params.boundary;
-      const D2 = params.dim2D;
-      const bd = D2 ? bounds2D() : null;       // 2D 矩形半宽/半高
-      const hx = D2 ? bd.hx : 0, hy = D2 ? bd.hy : 0;
+      const bd = bounds2D();                        // 矩形半宽/半高
+      const hx = bd.hx, hy = bd.hy;
       const flowT = time * 0.00022;
       const P = params.predatorOn ? activeP : 0;
       const fleeR = params.fleeRange;
@@ -1227,6 +1189,10 @@
       const predSpeed = params.predSpeed;
       const predNorm = Math.pow(predSpeed, 1.2);
       const sprintSpeed = maxSpeed * params.sprintFactor;
+      const catchR2 = Math.pow(catchRadius(), 2);
+      // 群体巡航节奏：无威胁时逐只向这个速度靠拢，避免全员一直顶着上限飞。
+      const paceSpeed = Math.max(maxSpeed * 0.62, Math.min(maxSpeed * 0.88, avgSpeed || maxSpeed * 0.78));
+      currentPace = paceSpeed;
       sprintingCount = 0;
 
       // 群体惊吓检测：捕食者接近鱼群质心时触发一次波纹，离开后再进入才重新触发。
@@ -1234,7 +1200,7 @@
         let near = false;
         for (let p = 0; p < P; p++) {
           const q = p * 3;
-          if (Math.hypot(groupX - predPos[q], groupY - predPos[q + 1], D2 ? 0 : groupZ - predPos[q + 2]) < fleeR * 2.5) {
+          if (Math.hypot(groupX - predPos[q], groupY - predPos[q + 1]) < fleeR * 2.5) {
             near = true; break;
           }
         }
@@ -1244,8 +1210,9 @@
 
       grid.clear();
       for (let i = 0; i < n; i++) {
+        if (caught[i]) continue;   // 等待重生的个体不参与邻域
         const k = i * 3;
-        const key = keyOf(Math.floor(pos[k] / cell), Math.floor(pos[k + 1] / cell), Math.floor(pos[k + 2] / cell));
+        const key = keyOf(Math.floor(pos[k] / cell), Math.floor(pos[k + 1] / cell), 0);
         let bucket = grid.get(key);
         if (!bucket) { bucket = []; grid.set(key, bucket); }
         bucket.push(i);
@@ -1257,19 +1224,24 @@
           const q = p * 3;
           const ppx = predPos[q], ppy = predPos[q + 1], ppz = predPos[q + 2];
           const pvx = predVel[q], pvy = predVel[q + 1], pvz = predVel[q + 2];
+          // 进食冷却期减速巡游，节省体力；追击转向也随之变缓。
+          const cooling = time - predFeedAt[p] < params.feedCooldown * 1000;
+          const curSpeed = cooling ? predSpeed * 0.55 : predSpeed;
+          const chase = params.chaseWeight * (cooling ? 0.55 : 1);
 
           // 目标锁定：先沿用旧目标，超出视野或锁定过期才重选最近个体。
           // 每帧改追最近者会让鱼群的「迷惑效应」把捕食者拖死，短期记忆可形成稳定直线追击。
           const vision2 = Math.pow(Math.max(fleeR * 3, B * 1.3), 2);
           let best = predTarget[p], bestD2 = Infinity;
-          if (best >= 0 && best < n) {
+          if (best >= 0 && best < n && !caught[best]) {
             const m = best * 3;
             const dx = pos[m] - ppx, dy = pos[m + 1] - ppy, dz = pos[m + 2] - ppz;
             bestD2 = dx * dx + dy * dy + dz * dz;
           }
-          if (best < 0 || best >= n || bestD2 > vision2 || time > predLockUntil[p]) {
+          if (best < 0 || best >= n || caught[best] || bestD2 > vision2 || time > predLockUntil[p]) {
             best = -1; bestD2 = Infinity;
             for (let j = 0; j < n; j++) {
+              if (caught[j]) continue;
               const m = j * 3;
               const dx = pos[m] - ppx, dy = pos[m + 1] - ppy, dz = pos[m + 2] - ppz;
               const d2 = dx * dx + dy * dy + dz * dz;
@@ -1291,14 +1263,14 @@
             const u2 = ux * ux + uy * uy + uz * uz;
             const ru = (pos[m] - ppx) * ux + (pos[m + 1] - ppy) * uy + (pos[m + 2] - ppz) * uz;
             // 解 |r + u·t| = v·t：比 τ=d/v 更准确地预判侧向移动目标。
-            const a = predSpeed * predSpeed - u2;
+            const a = curSpeed * curSpeed - u2;
             let tau;
             if (a > 1e-6) {
               tau = (ru + Math.sqrt(Math.max(0, ru * ru + a * bestD2))) / a;
             } else {
-              tau = d / Math.max(predSpeed, 1e-6);   // 捕食者不够快时退化为直追
+              tau = d / Math.max(curSpeed, 1e-6);   // 捕食者不够快时退化为直追
             }
-            if (!isFinite(tau) || tau < 0) tau = d / Math.max(predSpeed, 1e-6);
+            if (!isFinite(tau) || tau < 0) tau = d / Math.max(curSpeed, 1e-6);
             tau = Math.min(1.2, tau);                 // 限制远距离过度预判
             const aimx = pos[m] + ux * tau;
             const aimy = pos[m + 1] + uy * tau;
@@ -1306,14 +1278,12 @@
             let tx = aimx - ppx, ty = aimy - ppy, tz = aimz - ppz;
             const tl = Math.hypot(tx, ty, tz);
             if (tl > 1e-6) {
-              tx = tx / tl * predSpeed - pvx;
-              ty = ty / tl * predSpeed - pvy;
-              tz = tz / tl * predSpeed - pvz;
+              tx = tx / tl * curSpeed - pvx;
+              ty = ty / tl * curSpeed - pvy;
+              tz = tz / tl * curSpeed - pvz;
               const sl = Math.hypot(tx, ty, tz);
               if (sl > PRED_FORCE) { const k = PRED_FORCE / sl; tx *= k; ty *= k; tz *= k; }
-              ax += tx * params.chaseWeight;
-              ay += ty * params.chaseWeight;
-              az += tz * params.chaseWeight;
+              ax += tx * chase; ay += ty * chase; az += tz * chase;
             }
           }
 
@@ -1329,62 +1299,46 @@
             }
           }
 
-          // 软边界：靠近边缘时往回推（2D 矩形 / 3D 球形）
-          if (D2) {
-            const m = 2;
-            if (ppx > hx - m) ax -= (ppx - (hx - m)) * 3;
-            if (ppx < -hx + m) ax += (-hx + m - ppx) * 3;
-            if (ppy > hy - m) ay -= (ppy - (hy - m)) * 3;
-            if (ppy < -hy + m) ay += (-hy + m - ppy) * 3;
-            az = 0;
-          } else {
-            const dp = Math.hypot(ppx, ppy, ppz);
-            if (dp > B - 2) {
-              const push = (dp - (B - 2)) * 3;
-              ax -= ppx / dp * push; ay -= ppy / dp * push; az -= ppz / dp * push;
-            }
-          }
+          // 软边界：靠近边缘时往回推
+          const m = 2;
+          if (ppx > hx - m) ax -= (ppx - (hx - m)) * 3;
+          if (ppx < -hx + m) ax += (-hx + m - ppx) * 3;
+          if (ppy > hy - m) ay -= (ppy - (hy - m)) * 3;
+          if (ppy < -hy + m) ay += (-hy + m - ppy) * 3;
+          az = 0;
 
-          let nvx = pvx + ax * dt, nvy = pvy + ay * dt, nvz = pvz + az * dt;
-          if (D2) nvz = 0;
-          let sp = Math.hypot(nvx, nvy, nvz);
-          if (sp > predSpeed) { const k = predSpeed / sp; nvx *= k; nvy *= k; nvz *= k; }
-          else if (sp < predSpeed * 0.35 && sp > 1e-6) { const k = predSpeed * 0.35 / sp; nvx *= k; nvy *= k; nvz *= k; }
-          predVel[q] = nvx; predVel[q + 1] = nvy; predVel[q + 2] = nvz;
+          let nvx = pvx + ax * dt, nvy = pvy + ay * dt;
+          let sp = Math.hypot(nvx, nvy);
+          if (sp > curSpeed) { const k = curSpeed / sp; nvx *= k; nvy *= k; }
+          else if (sp < curSpeed * 0.35 && sp > 1e-6) { const k = curSpeed * 0.35 / sp; nvx *= k; nvy *= k; }
+          predVel[q] = nvx; predVel[q + 1] = nvy; predVel[q + 2] = 0;
           predPos[q] = ppx + nvx * dt;
           predPos[q + 1] = ppy + nvy * dt;
-          predPos[q + 2] = ppz + nvz * dt;
-          if (D2) {
-            // 矩形硬边界：逐轴夹紧并弹性反射
-            if (predPos[q] > hx) { predPos[q] = hx; predVel[q] = -Math.abs(nvx) * 0.9; }
-            else if (predPos[q] < -hx) { predPos[q] = -hx; predVel[q] = Math.abs(nvx) * 0.9; }
-            if (predPos[q + 1] > hy) { predPos[q + 1] = hy; predVel[q + 1] = -Math.abs(nvy) * 0.9; }
-            else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; predVel[q + 1] = Math.abs(nvy) * 0.9; }
-            predPos[q + 2] = 0; predVel[q + 2] = 0;
-          } else {
-            const nd = Math.hypot(predPos[q], predPos[q + 1], predPos[q + 2]);
-            if (nd > B) {
-              const k = B / nd;
-              predPos[q] *= k; predPos[q + 1] *= k; predPos[q + 2] *= k;
-              const nx = predPos[q] / B, ny = predPos[q + 1] / B, nz = predPos[q + 2] / B;
-              const dot = nvx * nx + nvy * ny + nvz * nz;
-              predVel[q] = (nvx - 2 * dot * nx) * 0.9;
-              predVel[q + 1] = (nvy - 2 * dot * ny) * 0.9;
-              predVel[q + 2] = (nvz - 2 * dot * nz) * 0.9;
-            }
-          }
+          predPos[q + 2] = 0;
+          // 矩形硬边界：逐轴夹紧并弹性反射
+          if (predPos[q] > hx) { predPos[q] = hx; predVel[q] = -Math.abs(nvx) * 0.9; }
+          else if (predPos[q] < -hx) { predPos[q] = -hx; predVel[q] = Math.abs(nvx) * 0.9; }
+          if (predPos[q + 1] > hy) { predPos[q + 1] = hy; predVel[q + 1] = -Math.abs(nvy) * 0.9; }
+          else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; predVel[q + 1] = Math.abs(nvy) * 0.9; }
         }
       }
 
       let sumNeighbors = 0;
+      let deadCount = 0;
+      for (let i = 0; i < n; i++) if (caught[i]) deadCount++;
+      const aliveN = Math.max(1, n - deadCount);
       let cx = 0, cy = 0, cz = 0;
       let impact = 0;
       let boundaryImpact = 0;
 
       for (let i = 0; i < n; i++) {
+        if (caught[i]) continue;   // 死亡等待期不参与运动与统计
         const k = i * 3;
         const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
         let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
+        // 安全时按群体节奏控速；受惊或爆发时恢复满速规则。
+        const calm = !fleeing[i] && time >= sprintUntil[i];
+        const desiredSpeed = calm ? paceSpeed : maxSpeed;
         let count = 0;
         let sx = 0, sy = 0, sz = 0;
         let ax = 0, ay = 0, az = 0;
@@ -1399,7 +1353,7 @@
               if (!bucket) continue;
               for (let b = 0; b < bucket.length; b++) {
                 const j = bucket[b];
-                if (j === i) continue;
+                if (j === i || caught[j]) continue;
                 const m = j * 3;
                 const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
                 const d2 = dx * dx + dy * dy + dz * dz;
@@ -1435,7 +1389,7 @@
         if (count > 0) {
           let len = Math.hypot(ax, ay, az);
           if (len > 1e-6) {
-            const s = maxSpeed / len;
+            const s = desiredSpeed / len;
             let tx = ax * s - vx, ty = ay * s - vy, tz = az * s - vz;
             const tl = Math.hypot(tx, ty, tz);
             if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
@@ -1444,7 +1398,7 @@
           let tx = sx / count - px, ty = sy / count - py, tz = sz / count - pz;
           len = Math.hypot(tx, ty, tz);
           if (len > 1e-6) {
-            const s = maxSpeed / len;
+            const s = desiredSpeed / len;
             tx = tx * s - vx; ty = ty * s - vy; tz = tz * s - vz;
             const tl = Math.hypot(tx, ty, tz);
             if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
@@ -1453,7 +1407,7 @@
         }
         const sl = Math.hypot(dxs, dys, dzs);
         if (sl > 1e-6) {
-          const s = maxSpeed / sl;
+          const s = desiredSpeed / sl;
           let tx = dxs * s - vx, ty = dys * s - vy, tz = dzs * s - vz;
           const tl = Math.hypot(tx, ty, tz);
           if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
@@ -1479,13 +1433,13 @@
             audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
             // 瞬间启动冲量（类似鱼类 fast-start）：立刻拉开距离，而不是只提高速度上限。
             const q = nearestP * 3;
-            let bx = px - predPos[q], by = py - predPos[q + 1], bz = D2 ? 0 : pz - predPos[q + 2];
-            let bl = Math.hypot(bx, by, bz);
-            if (bl < 1e-6) { bx = vx; by = vy; bz = vz; bl = Math.hypot(bx, by, bz); }
+            let bx = px - predPos[q], by = py - predPos[q + 1];
+            let bl = Math.hypot(bx, by);
+            if (bl < 1e-6) { bx = vx; by = vy; bl = Math.hypot(bx, by); }
             if (bl > 1e-6) {
-              const dash = Math.max(maxSpeed * 1.25, Math.hypot(vx, vy, vz) * 1.35);
-              vx = bx / bl * dash; vy = by / bl * dash; vz = D2 ? 0 : bz / bl * dash;
-              vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = vz;
+              const dash = Math.max(maxSpeed * 1.25, Math.hypot(vx, vy) * 1.35);
+              vx = bx / bl * dash; vy = by / bl * dash; vz = 0;
+              vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = 0;
             }
           }
           sprinting = time < sprintUntil[i];
@@ -1522,17 +1476,16 @@
             for (let p = 0; p < P; p++) {
               const q = p * 3;
               const gdx = groupX - predPos[q], gdy = groupY - predPos[q + 1];
-              const gdz = D2 ? 0 : groupZ - predPos[q + 2];
-              const gl = Math.hypot(gdx, gdy, gdz);
+              const gl = Math.hypot(gdx, gdy);
               if (gl < 1e-6) continue;
-              const dx = px - predPos[q], dy = py - predPos[q + 1], dz = pz - predPos[q + 2];
-              const d = Math.hypot(dx, dy, dz);
+              const dx = px - predPos[q], dy = py - predPos[q + 1];
+              const d = Math.hypot(dx, dy);
               if (d > fleeR * 2.5) continue;
               const w = Math.max(0, 1 - d / (fleeR * 2.5));
               const strength = params.fleeWeight * w * ripple * 1.6;
               efx += gdx / gl * strength;
               efy += gdy / gl * strength;
-              efz += D2 ? 0 : gdz / gl * strength;
+              efz = 0;
             }
           }
           // 信息级联：邻居上一帧的逃逸方向传播过来，形成波状逃逸
@@ -1556,114 +1509,101 @@
         if (sprinting) sprintingCount++;
         else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
 
-        // 边界力（2D 矩形 / 3D 球形）
-        if (D2) {
-          const m = 3;
-          if (px > hx - m) fx -= (px - (hx - m)) * 2.2;
-          if (px < -hx + m) fx += (-hx + m - px) * 2.2;
-          if (py > hy - m) fy -= (py - (hy - m)) * 2.2;
-          if (py < -hy + m) fy += (-hy + m - py) * 2.2;
-          fz = 0;
-        } else {
-          const dist = Math.hypot(px, py, pz);
-          if (dist > B - 3) {
-            const push = (dist - (B - 3)) * 2.2;
-            fx -= px / dist * push; fy -= py / dist * push; fz -= pz / dist * push;
-          }
-        }
+        // 矩形边界力
+        const m = 3;
+        if (px > hx - m) fx -= (px - (hx - m)) * 2.2;
+        if (px < -hx + m) fx += (-hx + m - px) * 2.2;
+        if (py > hy - m) fy -= (py - (hy - m)) * 2.2;
+        if (py < -hy + m) fy += (-hy + m - py) * 2.2;
         fx += Math.sin(py * 0.11 + flowT) * params.flow;
         fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
-        fz += D2 ? 0 : Math.sin(px * 0.08 + pz * 0.10 + flowT * 0.6) * params.flow;
-
-        acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = D2 ? 0 : fz;
+        acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = 0;
       }
-      if (n > 0) { groupX = cx / n; groupY = cy / n; groupZ = cz / n; }
+      if (aliveN > 0) { groupX = cx / aliveN; groupY = cy / aliveN; groupZ = 0; }
 
       let speedSum = 0, keSum = 0;
       for (let i = 0; i < n; i++) {
+        if (caught[i]) continue;
         const k = i * 3;
         let vx = vel[k] + acc[k] * dt;
         let vy = vel[k + 1] + acc[k + 1] * dt;
-        let vz = vel[k + 2] + acc[k + 2] * dt;
-        if (D2) vz = 0;
-        let sp = Math.hypot(vx, vy, vz);
-        const cap = time < sprintUntil[i] ? sprintSpeed : maxSpeed;
-        if (sp > cap) { const q = cap / sp; vx *= q; vy *= q; vz *= q; sp = cap; }
-        else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; vz *= q; sp = params.minSpeed; }
-        vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = vz;
+        let sp = Math.hypot(vx, vy);
+        const sprinting = time < sprintUntil[i];
+        const cap = sprinting ? sprintSpeed : maxSpeed;
+        if (sp > cap) { const q = cap / sp; vx *= q; vy *= q; sp = cap; }
+        else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; sp = params.minSpeed; }
+        // 无威胁且不在爆发期：个体巡航比例缓慢向群体节奏靠拢（约 2.5 秒时间常数）。
+        if (!sprinting && !fleeing[i]) {
+          cruiseBias[i] += (paceSpeed / maxSpeed - cruiseBias[i]) * Math.min(1, dt / 2.5);
+          const target = Math.max(params.minSpeed, maxSpeed * cruiseBias[i]);
+          // 比例本身用 2.5s 慢慢贴近群体节奏；实际速度紧跟这个比例（只控速、不改方向）。
+          const ns = Math.max(params.minSpeed,
+            sp + (target - sp) * Math.min(1, dt / 0.08));
+          const q = ns / sp; vx *= q; vy *= q; sp = ns;
+        }
+        vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = 0;
         speedSum += sp;
         keSum += 0.5 * sp * sp;
 
-        pos[k] += vx * dt; pos[k + 1] += vy * dt; pos[k + 2] += vz * dt;
-        if (D2) {
-          // 矩形硬边界：逐轴夹紧并弹性反射，z 恒为 0
-          if (pos[k] > hx) { pos[k] = hx; vel[k] = -Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
-          else if (pos[k] < -hx) { pos[k] = -hx; vel[k] = Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
-          if (pos[k + 1] > hy) { pos[k + 1] = hy; vel[k + 1] = -Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
-          else if (pos[k + 1] < -hy) { pos[k + 1] = -hy; vel[k + 1] = Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
-          pos[k + 2] = 0; vel[k + 2] = 0;
-        } else {
-          const d = Math.hypot(pos[k], pos[k + 1], pos[k + 2]);
-          if (d > B) {
-            const nx = pos[k] / d, ny = pos[k + 1] / d, nz = pos[k + 2] / d;
-            pos[k] = nx * B; pos[k + 1] = ny * B; pos[k + 2] = nz * B;
-            const dot = vx * nx + vy * ny + vz * nz;
-            vel[k] = (vx - 2 * dot * nx) * 0.92;
-            vel[k + 1] = (vy - 2 * dot * ny) * 0.92;
-            vel[k + 2] = (vz - 2 * dot * nz) * 0.92;
-            if (dot > 0) boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * dot, 1.2));
-          }
-        }
+        pos[k] += vx * dt; pos[k + 1] += vy * dt;
+        // 矩形硬边界：逐轴夹紧并弹性反射
+        if (pos[k] > hx) { pos[k] = hx; vel[k] = -Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
+        else if (pos[k] < -hx) { pos[k] = -hx; vel[k] = Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
+        if (pos[k + 1] > hy) { pos[k + 1] = hy; vel[k + 1] = -Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
+        else if (pos[k + 1] < -hy) { pos[k + 1] = -hy; vel[k + 1] = Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
+        pos[k + 2] = 0; vel[k + 2] = 0;
 
-        // 捕获：进入 CATCH_DIST 且捕食者已过饱腹冷却 → 冲量发声 + 冲击波 + 标记移除
+        // 捕获：捕食者三角形有碰撞体积，接触即算捕食成功（仍受进食冷却限制）
         if (P > 0 && !caught[i]) {
           for (let p = 0; p < P; p++) {
-            if (time - predFeedAt[p] < params.feedCooldown * 1000) continue;  // 进食消化期
+            if (time - predFeedAt[p] < params.feedCooldown * 1000) continue;
             const q = p * 3;
-            const dx = pos[k] - predPos[q], dy = pos[k + 1] - predPos[q + 1], dz = pos[k + 2] - predPos[q + 2];
-            const d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 >= CATCH_DIST2) continue;
-            const rvx = vx - predVel[q], rvy = vy - predVel[q + 1], rvz = vz - predVel[q + 2];
-            const vrel = Math.max(0.5, Math.hypot(rvx, rvy, rvz));
-            const J = Math.pow(vrel, 1.2) / predNorm;   // Hertz 接触：冲量 ∝ v^1.2
+            const dx = pos[k] - predPos[q], dy = pos[k + 1] - predPos[q + 1];
+            if (dx * dx + dy * dy >= catchR2) continue;
+            const rvx = vx - predVel[q], rvy = vy - predVel[q + 1];
+            const vrel = Math.max(0.5, Math.hypot(rvx, rvy));
+            const J = Math.pow(vrel, 1.2) / predNorm;
             audio.predate(J);
-            spawnBurst(pos[k], pos[k + 1], pos[k + 2], time);
+            spawnBurst(pos[k], pos[k + 1], 0, time);
             predFeedAt[p] = time;
             predPulseAt[p] = time;
-            predTarget[p] = -1;                         // 猎物已死，解除锁定
+            predTarget[p] = -1;
             predCatches++;
             caught[i] = 1;
+            respawnAt[i] = time + 1000;   // 1 秒后重新出生
+            birthAt[i] = -Infinity;
+            stamina[i] = 0; sprintUntil[i] = 0;
             break;
           }
         }
       }
 
-      // 立即补位：新生个体带亮绿标记，元素总数保持恒定
+      // 延迟补位：1 秒后在离捕食者最远、离边界有余量的位置出生
       for (let i = 0; i < n; i++) {
-        if (caught[i]) {
-          initBoids(i, i + 1, true);
-          caught[i] = 0;
+        if (caught[i] && time >= respawnAt[i]) {
+          spawnFar(i, time);
+          caught[i] = 0; respawnAt[i] = 0;
           audio.birth();
         }
       }
       if (P > 0) prevFlee.set(fleeDir);   // 信息级联使用上一帧逃逸方向
 
-      cx /= n; cy /= n; cz /= n;
       let spread = 0;
       for (let i = 0; i < n; i++) {
+        if (caught[i]) continue;
         const k = i * 3;
-        const dx = pos[k] - cx, dy = pos[k + 1] - cy, dz = pos[k + 2] - cz;
-        spread += dx * dx + dy * dy + dz * dz;
+        const dx = pos[k] - cx, dy = pos[k + 1] - cy;
+        spread += dx * dx + dy * dy;
       }
 
       // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
-      avgNeighbors = sumNeighbors / n;
+      avgNeighbors = sumNeighbors / aliveN;
       const neighborDensity = Math.min(1, avgNeighbors / 45);
-      const coherence = Math.max(0, 1 - Math.sqrt(spread / n) / (B * 0.62));
+      const coherence = Math.max(0, 1 - Math.sqrt(spread / aliveN) / (B * 0.62));
       density = Math.min(1, neighborDensity * 0.72 + coherence * 0.28);
-      avgSpeed = speedSum / n;
+      avgSpeed = speedSum / aliveN;
       const vRef = THERMAL_REF;
-      temperature = Math.min(1, (keSum / n) / (0.5 * vRef * vRef));
+      temperature = Math.min(1, (keSum / aliveN) / (0.5 * vRef * vRef));
       pressure = density * temperature;
 
       // 碰撞强度只作为统计保留，不再触发音效。
@@ -1684,34 +1624,16 @@
 
       if (!params.paused) step(dt, now);
 
-      if (params.dim2D) {
-        view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
-        updateOrthoFrustum();
-        camera = orthoCam;
-        camera.position.set(view2D.x, view2D.y, 40);
-        camera.up.set(0, 1, 0);
-        camera.lookAt(view2D.x, view2D.y, 0);
-      } else {
-        orbit.theta += (orbit.tTheta - orbit.theta) * 0.08;
-        orbit.phi += (orbit.tPhi - orbit.phi) * 0.08;
-        orbit.radius += (orbit.tRadius - orbit.radius) * 0.08;
-        const sp = Math.sin(orbit.phi);
-        camera = perspCam;
-        camera.position.set(
-          orbit.radius * sp * Math.sin(orbit.theta),
-          orbit.radius * Math.cos(orbit.phi),
-          orbit.radius * sp * Math.cos(orbit.theta)
-        );
-        camera.up.set(0, 1, 0);
-        camera.lookAt(0, 0, 0);
-      }
-      cage.visible = !params.dim2D;
-      rectFrame.visible = params.dim2D;
-      stars.rotation.y += dt * 0.008;
+      view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
+      updateOrthoFrustum();
+      camera.position.set(view2D.x, view2D.y, 40);
+      camera.up.set(0, 1, 0);
+      camera.lookAt(view2D.x, view2D.y, 0);
 
       // CPU 只写颜色/尺寸；箭头的朝向与形状全部交给 GPU 着色器。
       const n = activeCount;
       for (let i = 0; i < n; i++) {
+        if (caught[i]) { siz[i] = 0; continue; }   // 等待重生的 1 秒完全隐藏
         const k = i * 3;
         const local = Math.min(1, neighbors[i] / 24);
         const speedRatio = Math.min(1, Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed);
@@ -1768,30 +1690,61 @@
           ring.visible = true;
           // 扑击瞬间箭头放大脉冲，与冲击波同步。
           const pulse = Math.max(0, 1 - (now - predPulseAt[p]) / 280);
-          predSiz[p] = Math.max(1.1, params.arrowSize * 7) * (1 + 0.32 * pulse);
+          predSiz[p] = predBaseSize() * (1 + 0.32 * pulse);
         }
       } else {
         for (const ring of threatRings) ring.visible = false;
       }
 
-      // 捕杀冲击波：外圈快速扩张、亮核闪灭，朝相机 billboard。
+      // 捕杀三段动画，节拍与 predate() 的三段音一致
       for (const b of killBursts) {
         if (!b.active) continue;
         const age = now - b.born;
         if (age >= BURST_MS) {
-          b.active = false; b.ring.visible = false; b.core.visible = false;
+          b.active = false;
+          for (const o of [b.core, b.inner, b.outer, b.sparks]) o.visible = false;
           continue;
         }
+        // 第一段 0ms：亮核闪灭（撞击音）
+        const cu = Math.min(1, age / 160);
+        b.core.position.set(b.x, b.y, 0.3);
+        b.core.quaternion.copy(camera.quaternion);
+        b.core.scale.setScalar(0.25 + 1.35 * cu);
+        b.core.material.opacity = Math.pow(1 - Math.min(1, age / 260), 2);
+
+        // 第二段 90ms：内环扩张（撕裂音）
+        const ia = age - 90;
+        if (ia > 0) {
+          const iu = Math.min(1, ia / 420);
+          b.inner.position.set(b.x, b.y, 0.2);
+          b.inner.quaternion.copy(camera.quaternion);
+          b.inner.scale.setScalar(0.35 + 2.6 * (1 - Math.pow(1 - iu, 3)));
+          b.inner.material.opacity = 0.85 * (1 - iu);
+        } else b.inner.material.opacity = 0;
+
+        // 第三段 240ms：外环余波（低沉尾音）
         const u = age / BURST_MS;
         const ease = 1 - Math.pow(1 - u, 3);
-        b.ring.position.set(b.x, b.y, b.z);
-        b.core.position.set(b.x, b.y, b.z);
-        b.ring.quaternion.copy(camera.quaternion);
-        b.core.quaternion.copy(camera.quaternion);
-        b.ring.scale.setScalar(0.4 + 4.2 * ease);
-        b.core.scale.setScalar(0.2 + 1.1 * ease);
-        b.ring.material.opacity = 1.0 * (1 - u);
-        b.core.material.opacity = 1.0 * Math.pow(1 - u, 2);
+        b.outer.position.set(b.x, b.y, 0.1);
+        b.outer.quaternion.copy(camera.quaternion);
+        b.outer.scale.setScalar(0.5 + 5.0 * ease);
+        b.outer.material.opacity = 0.75 * Math.pow(1 - u, 1.4);
+
+        // 火花：随内环一起飞散
+        const sa = age - 90;
+        if (sa > 0 && sa < 560) {
+          const su = sa / 560, se = 1 - Math.pow(1 - su, 2);
+          const arr = b.sparks.geometry.attributes.position.array;
+          for (let s = 0; s < SPARKS; s++) {
+            const r = 0.4 + 5.2 * se;
+            arr[s * 3] = b.x + b.dirs[s * 2] * r;
+            arr[s * 3 + 1] = b.y + b.dirs[s * 2 + 1] * r;
+            arr[s * 3 + 2] = 0.25;
+          }
+          b.sparks.geometry.attributes.position.needsUpdate = true;
+          b.sparks.material.opacity = 0.9 * (1 - su);
+          b.sparks.visible = true;
+        } else b.sparks.visible = false;
       }
 
       renderer.render(scene, camera);
@@ -1817,20 +1770,16 @@
     }
 
     addEventListener('resize', () => {
-      perspCam.aspect = innerWidth / innerHeight;
-      perspCam.updateProjectionMatrix();
       updateOrthoFrustum();
       updateRectFrame();
       renderer.setSize(innerWidth, innerHeight);
     });
 
-    // 初始化为 2D 平面模式（用户反馈 3D 不直观）
-    setMode2D(true);
+    updateRectFrame();
     requestAnimationFrame(render);
 
     window.FlockLab = {
-      params, resetBoids, setCount, setPredCount, setMode2D, spawnBurst,
-      get dim2D() { return params.dim2D; },
+      params, resetBoids, setCount, setPredCount, spawnBurst,
       get maxAbsZ() {
         let m = 0;
         for (let i = 0; i < activeCount; i++) m = Math.max(m, Math.abs(pos[i * 3 + 2]));
@@ -1851,7 +1800,6 @@
         return { hx: +a[3].toFixed(2), hy: +a[7].toFixed(2) };
       },
       get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
-      get cageScale() { return +cage.scale.x.toFixed(2); },
       get count() { return activeCount; },
       get velocities() { return Array.from(vel.slice(0, activeCount * 3)); },
       get renderVelocities() { return Array.from(rVel.slice(0, activeCount * 3)); },
@@ -1922,7 +1870,26 @@
       get pressure() { return pressure; },
       get impulse() { return collisionImpulse; },
       get avgNeighbors() { return avgNeighbors; },
-      get camera() { return { theta: orbit.tTheta, phi: orbit.tPhi, radius: orbit.tRadius }; }
+      get avgSpeed() { return +avgSpeed.toFixed(3); },
+      get paceSpeed() { return +currentPace.toFixed(3); },
+      get deadCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += caught[i]; return c; },
+      get respawnDelays() {
+        const now = performance.now();
+        return Array.from({ length: activeCount }, (_, i) => caught[i] ? Math.max(0, Math.round(respawnAt[i] - now)) : 0);
+      },
+      get catchRadius() { return +catchRadius().toFixed(2); },
+      get predatorSpeeds() {
+        return Array.from({ length: params.predatorOn ? activeP : 0 },
+          (_, p) => +Math.hypot(predVel[p * 3], predVel[p * 3 + 1]).toFixed(2));
+      },
+      get positions() {
+        return Array.from({ length: activeCount }, (_, i) => ({
+          x: +pos[i * 3].toFixed(2), y: +pos[i * 3 + 1].toFixed(2),
+          born: birthAt[i] === -Infinity ? 0 : Math.round(birthAt[i]),
+          dead: !!caught[i]
+        }));
+      },
+      get sprintSoundDuration() { return audio.lastSprintDur; }
     };
   </script>
 </body>
