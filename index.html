@@ -21,9 +21,13 @@
                  "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
     overflow: hidden;
     -webkit-font-smoothing: antialiased;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
   }
   #scene { position: fixed; inset: 0; }
-  #scene canvas { display: block; }
+  #scene canvas { display: block; touch-action: none; }
 
   .glass {
     background: var(--glass);
@@ -143,6 +147,29 @@
     z-index: 7 !important;
   }
   .lil-gui.root { margin-top: 76px; margin-right: 18px; }
+
+  /* 触控屏：放大所有可点区域，面板限高可滚动，避免挡住群体 */
+  body.touch #audioBtn { min-height: 44px; padding: 12px 24px; }
+  body.touch #startBtn { min-height: 48px; padding: 14px 34px; }
+  body.touch #hud, body.touch #hint, body.touch #brand { pointer-events: none; }
+  body.touch .lil-gui {
+    --font-size: 13px;
+    --widget-height: 26px;
+    --title-height: 32px;
+    --slider-knob-width: 10px;
+    --padding: 7px;
+    --spacing: 6px;
+    --name-width: 52%;
+  }
+  body.touch .lil-gui.root {
+    max-height: 62vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  body.touch .lil-gui .controller { min-height: 30px; }
+  body.touch .lil-gui .controller input,
+  body.touch .lil-gui .controller .slider { touch-action: none; }
+
   @media (max-width: 720px) {
     #brand { left: 12px; top: 12px; }
     #hud { left: 12px; bottom: 12px; min-width: 0; }
@@ -224,6 +251,13 @@
       throw e;
     }
 
+    // 触控屏检测：混合设备（有触摸屏但鼠标为主）也算进去
+    const isTouch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
+    if (isTouch) document.body.classList.add('touch');
+    document.getElementById('hint').textContent = isTouch
+      ? '单指拖拽旋转 · 双指捏合缩放 · 双击重置视角 · 右上角实时调参'
+      : '箭头朝向即运动方向 · 拖拽旋转 · 滚轮缩放 · 右上角实时调参';
+
     // ---------------------------------------------------------------- 参数
     const params = {
       count: 300,
@@ -296,7 +330,7 @@
 
     const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 600);
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+    renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
     renderer.setSize(innerWidth, innerHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     document.getElementById('scene').appendChild(renderer.domElement);
@@ -307,20 +341,59 @@
       dragging: false, x: 0, y: 0
     };
     const cv = renderer.domElement;
+    const pointers = new Map();
+    let pinchDist = 0, downTime = 0, moved = 0, lastTap = 0;
+
+    function resetCamera() {
+      orbit.tTheta = 0.72; orbit.tPhi = 1.13; orbit.tRadius = 55;
+    }
+
     cv.addEventListener('pointerdown', (e) => {
-      orbit.dragging = true; orbit.x = e.clientX; orbit.y = e.clientY;
-      cv.setPointerCapture(e.pointerId);
+      try { cv.setPointerCapture(e.pointerId); } catch (_) { /* 合成事件无真实指针 */ }
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pointers.size === 1) {
+        downTime = performance.now(); moved = 0;
+      } else if (pointers.size === 2) {
+        const p = [...pointers.values()];
+        pinchDist = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+      }
     });
+
     cv.addEventListener('pointermove', (e) => {
-      if (!orbit.dragging) return;
-      orbit.tTheta -= (e.clientX - orbit.x) * 0.005;
-      orbit.tPhi = Math.max(0.18, Math.min(Math.PI - 0.18, orbit.tPhi - (e.clientY - orbit.y) * 0.005));
-      orbit.x = e.clientX; orbit.y = e.clientY;
+      const prev = pointers.get(e.pointerId);
+      if (!prev) return;
+      const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+      prev.x = e.clientX; prev.y = e.clientY;
+      moved += Math.abs(dx) + Math.abs(dy);
+      if (pointers.size === 1) {
+        orbit.tTheta -= dx * 0.005;
+        orbit.tPhi = Math.max(0.18, Math.min(Math.PI - 0.18, orbit.tPhi - dy * 0.005));
+      } else if (pointers.size === 2) {
+        const p = [...pointers.values()];
+        const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+        if (pinchDist > 0 && d > 0) {
+          orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius * pinchDist / d));
+        }
+        pinchDist = d;
+      }
     });
-    cv.addEventListener('pointerup', (e) => {
-      orbit.dragging = false;
+
+    function endPointer(e) {
+      if (!pointers.has(e.pointerId)) return;
+      const wasSingle = pointers.size === 1;
+      pointers.delete(e.pointerId);
+      if (pointers.size < 2) pinchDist = 0;
       if (cv.hasPointerCapture(e.pointerId)) cv.releasePointerCapture(e.pointerId);
-    });
+      // 触控双击重置视角；鼠标不参与，避免和拖拽冲突
+      if (wasSingle && e.pointerType !== 'mouse' && moved < 12 && performance.now() - downTime < 260) {
+        const now = performance.now();
+        if (now - lastTap < 340) { resetCamera(); lastTap = 0; }
+        else lastTap = now;
+      }
+    }
+    cv.addEventListener('pointerup', endPointer);
+    cv.addEventListener('pointercancel', endPointer);
+    cv.addEventListener('contextmenu', (e) => e.preventDefault());
     cv.addEventListener('wheel', (e) => {
       e.preventDefault();
       orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius + e.deltaY * 0.045));
@@ -632,6 +705,7 @@
     const fScene = gui.addFolder('场景');
     fScene.add(params, 'paused').name('暂停模拟');
     fScene.add({ reset: resetBoids }, 'reset').name('重新初始化');
+    fScene.add({ view: resetCamera }, 'view').name('重置视角');
     fScene.close();
 
     // ---------------------------------------------------------------- 空间哈希
@@ -873,7 +947,8 @@
       get temperature() { return temperature; },
       get pressure() { return pressure; },
       get impulse() { return collisionImpulse; },
-      get avgNeighbors() { return avgNeighbors; }
+      get avgNeighbors() { return avgNeighbors; },
+      get camera() { return { theta: orbit.tTheta, phi: orbit.tPhi, radius: orbit.tRadius }; }
     };
   </script>
 </body>
