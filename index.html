@@ -240,7 +240,7 @@
       <span class="card-title">实时状态</span><span class="chev">▾</span>
     </button>
     <div class="card-body">
-      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">300</span> <span style="color:#ff8a5c">◆<span id="hPred">1</span></span></span></div>
+      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">880</span> <span style="color:#ff8a5c">◆<span id="hPred">2</span></span></span></div>
       <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
       <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
       <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
@@ -308,35 +308,37 @@
     }
 
     // ---------------------------------------------------------------- 参数
+    // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
+    const BOUND = 40;
     const params = {
-      count: 300,
-      separation: 2.05,
-      alignment: 1.1,
-      cohesion: 0.7,
-      perception: 6.0,
-      separationRange: 2.9,
-      flow: 1.3,
-      maxSpeed: 9.0,
+      count: 880,
+      separation: 1.39,
+      alignment: 1.35,
+      cohesion: 1.16,
+      perception: 2.7,
+      separationRange: 1.9,
+      flow: 2.05,
+      maxSpeed: 15.2,
       minSpeed: 2.2,
-      boundary: 35,
-      arrowSize: 0.2,
+      boundary: BOUND,
+      arrowSize: 0.22,
       master: 0.38,
       enabled: false,
       paused: false,
       // 捕食者：标准 Reynolds pursuit + 预测逃逸模型
       predatorOn: true,
-      predatorCount: 1,
-      fleeWeight: 2.6,
-      fleeRange: 7.0,
+      predatorCount: 2,
+      fleeWeight: 1.5,      // 逃跑力度
+      fleeRange: 7.0,       // 危险感知距离
       predict: 0.6,
-      chaseWeight: 1.5,
-      predSpeed: 14.5,
-      lockTime: 1.5,
+      chaseWeight: 2.6,     // 追击力度
+      predSpeed: 36,
+      lockTime: 1.0,
       feedCooldown: 3.0,
       infoCascade: true,
       // 逃逸爆发：白肌式短时冲刺，体力耗尽后必须恢复，不能连续多次爆发
-      sprintFactor: 1.6,
-      sprintDuration: 1.2,
+      sprintFactor: 1.35,
+      sprintDuration: 0.8,
       sprintRecovery: 5.0
     };
     const MAX_N = 1200;
@@ -364,8 +366,12 @@
     const stamina = new Float32Array(MAX_N);
     stamina.fill(1);
     const sprintUntil = new Float64Array(MAX_N);   // 爆发到期时间（ms）
-    const cruiseBias = new Float32Array(MAX_N);    // 无威胁时的巡航速度比例，缓慢向群体节奏靠拢
-    cruiseBias.fill(0.42);
+    // 速度上限本身也做成受加速度限制的状态量：
+    // 起步/收速都要经过若干帧，从加速度积分出速度曲线，而不是一帧内跳变。
+    const capNow = new Float32Array(MAX_N);
+    capNow.fill(params.maxSpeed * 0.78);
+    const PREY_ACCEL = 40;                         // 加速上限（单位/秒²），约 0.35 秒从静止到巡航
+    const PREY_DECEL = 24;                         // 减速更柔和，像滑翔收速
     let sprintCount = 0, sprintingCount = 0;
 
     // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
@@ -380,6 +386,14 @@
     const predLockUntil = new Float64Array(MAX_P); // 锁定到期时间（ms）
     const predPulseAt = new Float64Array(MAX_P);   // 扑击瞬间，用于箭头脉冲
     predPulseAt.fill(-Infinity);
+    // 捕食者也受加速度限制：进食冷却切换速度时不会瞬间变速。
+    const predCap = new Float32Array(MAX_P);
+    predCap.fill(params.predSpeed);
+    const PRED_ACCEL = 70;
+    const PRED_DECEL = 45;
+    // 冷却期随机巡游的航向与下一次改向时间
+    const predWanderAng = new Float32Array(MAX_P);
+    const predWanderUntil = new Float64Array(MAX_P);
 
     const MAX_FORCE = 14;
     // 捕食者的碰撞体积跟随外形的等边三角形大小：接触即算捕获（仍受进食冷却限制）。
@@ -417,7 +431,7 @@
         vel[k + 2] = 0;
         rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
         birthAt[i] = isBirth ? performance.now() : -Infinity;
-        stamina[i] = 1; sprintUntil[i] = 0; cruiseBias[i] = 0.42;
+        stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
     }
@@ -451,7 +465,7 @@
       vel[k + 2] = 0;
       rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
       birthAt[i] = now;
-      stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; cruiseBias[i] = 0.42;
+      stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
     }
 
     function initPredators(from, to) {
@@ -467,6 +481,9 @@
         predVel[k + 2] = 0;
         rPredVel[k] = predVel[k]; rPredVel[k + 1] = predVel[k + 1]; rPredVel[k + 2] = 0;
         predFeedAt[p] = 0;
+        predCap[p] = params.predSpeed;
+        predWanderAng[p] = Math.random() * Math.PI * 2;
+        predWanderUntil[p] = 0;
       }
     }
     initPredators(0, activeP);
@@ -509,11 +526,9 @@
     const camera = orthoCam;
     // 视图：平移中心 + 缩放
     const view2D = { x: 0, y: 0, zoom: 1, tZoom: 1 };
-    // 相机视野固定：只由 zoom 决定，不随「活动边界」滑块变化。
-    // 否则调边界时画面会跟着缩放，看起来像动画错乱。
-    const VIEW2D_HALF_H = 22.2;
-    // 边界不超过默认 20 时视野固定；超过后自动拉远，保证整个边界框可见。
-    function view2DFitHalfH() { return Math.max(VIEW2D_HALF_H, params.boundary + 2.2); }
+    // 相机视野固定：世界半高＝活动范围，短边正好铺满屏幕；留 2% 边距让边界线可见。
+    const VIEW2D_MARGIN = 1.02;
+    function view2DFitHalfH() { return BOUND * VIEW2D_MARGIN; }
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
     renderer.setSize(innerWidth, innerHeight);
@@ -602,7 +617,8 @@
     rectFrame.frustumCulled = false;
     scene.add(rectFrame);
     function bounds2D() {
-      return { hx: params.boundary * (innerWidth / innerHeight), hy: params.boundary };
+      // 高度固定为 BOUND，宽度按显示器比例展开 → 场地铺满全屏
+      return { hx: BOUND * (innerWidth / innerHeight), hy: BOUND };
     }
     function updateRectFrame() {
       const { hx, hy } = bounds2D();
@@ -1101,11 +1117,6 @@
       arrowMat.uniforms.uMaxSpeed.value = v;
     }),
       '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。');
-    tip(fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动范围').onChange(() => {
-      // 显示矩形跟着模拟边界一起变；相机视野保持固定，画面不会跟着缩放。
-      updateRectFrame(); updateOrthoFrustum();
-    }),
-      '活动范围｜场地大小。调大：鸟有更大空间、更分散。调小：更拥挤、撞边更频繁。画面边框会同步变化。');
     tip(fMotion.add(params, 'flow', 0, 4, 0.05).name('气流扰动'),
       '气流扰动｜调大：鸟更容易被随机气流带偏，运动更自然，但队形更松散。调 0：完全按三规则飞行。');
     tip(fMotion.add(params, 'arrowSize', 0.18, 0.9, 0.01).name('箭头大小'),
@@ -1161,8 +1172,8 @@
       '预判系数｜鸟逃跑时会朝捕食者未来位置躲。调大：躲得更提前；太大像未卜先知。');
     tip(fAdv.add(params, 'lockTime', 0, 5, 0.1).name('锁定目标(秒)'),
       '锁定目标｜捕食者专注追同一只鸟的秒数。调大：不容易被鸟群晃动骗到，追击更稳定。');
-    tip(fAdv.add(params, 'feedCooldown', 0.3, 8, 0.1).name('进食冷却(秒)'),
-      '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。调小：连续屠杀。调大：捕获间隔变长。');
+    tip(fAdv.add(params, 'feedCooldown', 0.3, 60, 0.1).name('进食冷却(秒)'),
+      '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
     fAdv.close();
 
     // ---------------------------------------------------------------- 空间哈希
@@ -1179,7 +1190,7 @@
       const sep2 = params.separationRange * params.separationRange;
       const maxSpeed = params.maxSpeed;
       const maxForce = MAX_FORCE;
-      const B = params.boundary;
+      const B = BOUND;
       const bd = bounds2D();                        // 矩形半宽/半高
       const hx = bd.hx, hy = bd.hy;
       const flowT = time * 0.00022;
@@ -1190,8 +1201,8 @@
       const predNorm = Math.pow(predSpeed, 1.2);
       const sprintSpeed = maxSpeed * params.sprintFactor;
       const catchR2 = Math.pow(catchRadius(), 2);
-      // 群体巡航节奏：无威胁时逐只向这个速度靠拢，避免全员一直顶着上限飞。
-      const paceSpeed = Math.max(maxSpeed * 0.62, Math.min(maxSpeed * 0.88, avgSpeed || maxSpeed * 0.78));
+      // 群体巡航节奏：无威胁时统一收敛到巡航速度的 78%，受惊/爆发才放开到上限。
+      const paceSpeed = maxSpeed * 0.78;
       currentPace = paceSpeed;
       sprintingCount = 0;
 
@@ -1224,39 +1235,61 @@
           const q = p * 3;
           const ppx = predPos[q], ppy = predPos[q + 1], ppz = predPos[q + 2];
           const pvx = predVel[q], pvy = predVel[q + 1], pvz = predVel[q + 2];
-          // 进食冷却期减速巡游，节省体力；追击转向也随之变缓。
+          // 进食冷却：吃饱后不再追击，只以四成左右的速度随机巡游保存体力。
+          // 速度上限本身按加速度积分变化，所以「追击 ↔ 巡游」之间是平滑过渡。
           const cooling = time - predFeedAt[p] < params.feedCooldown * 1000;
-          const curSpeed = cooling ? predSpeed * 0.55 : predSpeed;
-          const chase = params.chaseWeight * (cooling ? 0.55 : 1);
-
-          // 目标锁定：先沿用旧目标，超出视野或锁定过期才重选最近个体。
-          // 每帧改追最近者会让鱼群的「迷惑效应」把捕食者拖死，短期记忆可形成稳定直线追击。
-          const vision2 = Math.pow(Math.max(fleeR * 3, B * 1.3), 2);
-          let best = predTarget[p], bestD2 = Infinity;
-          if (best >= 0 && best < n && !caught[best]) {
-            const m = best * 3;
-            const dx = pos[m] - ppx, dy = pos[m + 1] - ppy, dz = pos[m + 2] - ppz;
-            bestD2 = dx * dx + dy * dy + dz * dz;
-          }
-          if (best < 0 || best >= n || caught[best] || bestD2 > vision2 || time > predLockUntil[p]) {
-            best = -1; bestD2 = Infinity;
-            for (let j = 0; j < n; j++) {
-              if (caught[j]) continue;
-              const m = j * 3;
-              const dx = pos[m] - ppx, dy = pos[m + 1] - ppy, dz = pos[m + 2] - ppz;
-              const d2 = dx * dx + dy * dy + dz * dz;
-              if (d2 < bestD2) { bestD2 = d2; best = j; }
-            }
-          }
-          if (best >= 0) {
-            predTarget[p] = best;
-            predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
-          } else {
-            predTarget[p] = -1;
-          }
+          const capTarget = cooling ? predSpeed * 0.42 : predSpeed;
+          const dCap = capTarget - predCap[p];
+          const capStep = (dCap > 0 ? PRED_ACCEL : PRED_DECEL) * dt;
+          predCap[p] += Math.max(-capStep, Math.min(capStep, dCap));
+          const curSpeed = Math.max(1.5, predCap[p]);
+          const chase = params.chaseWeight;
 
           let ax = 0, ay = 0, az = 0;
-          if (best >= 0) {
+          let best = -1, bestD2 = Infinity;
+
+          if (cooling) {
+            // 随机巡游：每 1~2.5 秒换一次航向，只做省力的低速滑行
+            predTarget[p] = -1;
+            if (time > predWanderUntil[p]) {
+              predWanderAng[p] += (Math.random() - 0.5) * 2.2;
+              predWanderUntil[p] = time + 1000 + Math.random() * 1500;
+            }
+            let tx = Math.cos(predWanderAng[p]) * curSpeed - pvx;
+            let ty = Math.sin(predWanderAng[p]) * curSpeed - pvy;
+            const tl = Math.hypot(tx, ty);
+            const capF = PRED_FORCE * 0.45;
+            if (tl > capF) { const k = capF / tl; tx *= k; ty *= k; }
+            ax += tx; ay += ty;
+          } else {
+            // 目标锁定：先沿用旧目标，超出视野或锁定过期才重选最近个体。
+            // 每帧改追最近者会让鱼群的「迷惑效应」把捕食者拖死，短期记忆可形成稳定直线追击。
+            const vision2 = Math.pow(Math.max(fleeR * 3, B * 1.3), 2);
+            best = predTarget[p];
+            if (best >= 0 && best < n && !caught[best]) {
+              const m = best * 3;
+              const dx = pos[m] - ppx, dy = pos[m + 1] - ppy;
+              bestD2 = dx * dx + dy * dy;
+            }
+            if (best < 0 || best >= n || caught[best] || bestD2 > vision2 || time > predLockUntil[p]) {
+              best = -1; bestD2 = Infinity;
+              for (let j = 0; j < n; j++) {
+                if (caught[j]) continue;
+                const m = j * 3;
+                const dx = pos[m] - ppx, dy = pos[m + 1] - ppy;
+                const d2 = dx * dx + dy * dy;
+                if (d2 < bestD2) { bestD2 = d2; best = j; }
+              }
+            }
+            if (best >= 0) {
+              predTarget[p] = best;
+              predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
+            } else {
+              predTarget[p] = -1;
+            }
+          }
+
+          if (!cooling && best >= 0) {
             const m = best * 3;
             const d = Math.sqrt(bestD2);
             const ux = vel[m], uy = vel[m + 1], uz = vel[m + 2];
@@ -1310,7 +1343,11 @@
           let nvx = pvx + ax * dt, nvy = pvy + ay * dt;
           let sp = Math.hypot(nvx, nvy);
           if (sp > curSpeed) { const k = curSpeed / sp; nvx *= k; nvy *= k; }
-          else if (sp < curSpeed * 0.35 && sp > 1e-6) { const k = curSpeed * 0.35 / sp; nvx *= k; nvy *= k; }
+          else if (sp < curSpeed * 0.35 && sp > 1e-6) {
+            // 起步同样受加速度限制，不在一帧里从静止弹到目标速度
+            const want = Math.min(curSpeed * 0.35, sp + PRED_ACCEL * dt);
+            const k = want / sp; nvx *= k; nvy *= k;
+          }
           predVel[q] = nvx; predVel[q + 1] = nvy; predVel[q + 2] = 0;
           predPos[q] = ppx + nvx * dt;
           predPos[q + 1] = ppy + nvy * dt;
@@ -1320,6 +1357,8 @@
           else if (predPos[q] < -hx) { predPos[q] = -hx; predVel[q] = Math.abs(nvx) * 0.9; }
           if (predPos[q + 1] > hy) { predPos[q + 1] = hy; predVel[q + 1] = -Math.abs(nvy) * 0.9; }
           else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; predVel[q + 1] = Math.abs(nvy) * 0.9; }
+          // 撞墙后随机巡游的航向也跟着掉头，避免一直顶在边上
+          if (cooling) predWanderAng[p] = Math.atan2(predVel[q + 1], predVel[q]);
         }
       }
 
@@ -1431,16 +1470,8 @@
             stamina[i] = 0;
             sprintCount++;
             audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
-            // 瞬间启动冲量（类似鱼类 fast-start）：立刻拉开距离，而不是只提高速度上限。
-            const q = nearestP * 3;
-            let bx = px - predPos[q], by = py - predPos[q + 1];
-            let bl = Math.hypot(bx, by);
-            if (bl < 1e-6) { bx = vx; by = vy; bl = Math.hypot(bx, by); }
-            if (bl > 1e-6) {
-              const dash = Math.max(maxSpeed * 1.25, Math.hypot(vx, vy) * 1.35);
-              vx = bx / bl * dash; vy = by / bl * dash; vz = 0;
-              vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = 0;
-            }
+            // 不再瞬间拉满速度：爆发只提高「速度上限」，实际提速由下方
+            // 受加速度限制的 capNow 逐帧积分，形成可见的加速曲线。
           }
           sprinting = time < sprintUntil[i];
 
@@ -1529,18 +1560,20 @@
         let vy = vel[k + 1] + acc[k + 1] * dt;
         let sp = Math.hypot(vx, vy);
         const sprinting = time < sprintUntil[i];
-        const cap = sprinting ? sprintSpeed : maxSpeed;
+        // 目标速度：爆发 > 受惊 > 巡航节奏。速度上限本身按加速度积分变化，
+        // 因此起爆与收速都是平滑曲线，不会在一帧内突然变快或变慢。
+        const capTarget = sprinting ? sprintSpeed : (fleeing[i] ? maxSpeed : paceSpeed);
+        const dCap = capTarget - capNow[i];
+        const capStep = (dCap > 0 ? PREY_ACCEL : PREY_DECEL) * dt;
+        capNow[i] += Math.max(-capStep, Math.min(capStep, dCap));
+        const cap = Math.max(params.minSpeed, Math.min(sprintSpeed, capNow[i]));
         if (sp > cap) { const q = cap / sp; vx *= q; vy *= q; sp = cap; }
-        else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; sp = params.minSpeed; }
-        // 无威胁且不在爆发期：个体巡航比例缓慢向群体节奏靠拢（约 2.5 秒时间常数）。
-        if (!sprinting && !fleeing[i]) {
-          cruiseBias[i] += (paceSpeed / maxSpeed - cruiseBias[i]) * Math.min(1, dt / 2.5);
-          const target = Math.max(params.minSpeed, maxSpeed * cruiseBias[i]);
-          // 比例本身用 2.5s 慢慢贴近群体节奏；实际速度紧跟这个比例（只控速、不改方向）。
-          const ns = Math.max(params.minSpeed,
-            sp + (target - sp) * Math.min(1, dt / 0.08));
+        else if (sp < cap && sp > 1e-4) {
+          // 速度不足时也按加速度上限追上去：起步是斜坡，而不是一帧拉满
+          const ns = Math.min(cap, sp + PREY_ACCEL * dt);
           const q = ns / sp; vx *= q; vy *= q; sp = ns;
         }
+        else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; sp = params.minSpeed; }
         vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = 0;
         speedSum += sp;
         keSum += 0.5 * sp * sp;
@@ -1882,6 +1915,17 @@
         return Array.from({ length: params.predatorOn ? activeP : 0 },
           (_, p) => +Math.hypot(predVel[p * 3], predVel[p * 3 + 1]).toFixed(2));
       },
+      get predatorCaps() {
+        return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => +predCap[p].toFixed(2));
+      },
+      get predatorCooling() {
+        const now = performance.now();
+        const cd = params.feedCooldown * 1000;
+        return Array.from({ length: params.predatorOn ? activeP : 0 },
+          (_, p) => Math.max(0, Math.round(cd - (now - predFeedAt[p]))));
+      },
+      get capSample() { return Array.from(capNow.slice(0, 8)).map((v) => +v.toFixed(2)); },
+      get bound() { return BOUND; },
       get positions() {
         return Array.from({ length: activeCount }, (_, i) => ({
           x: +pos[i * 3].toFixed(2), y: +pos[i * 3 + 1].toFixed(2),
