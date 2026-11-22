@@ -38,36 +38,31 @@
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
   }
 
-  #brand {
-    position: fixed; left: 22px; top: 20px; z-index: 5;
-    padding: 13px 18px 12px; pointer-events: none;
-  }
-  #brand h1 {
-    margin: 0; font-size: 20px; font-weight: 650; letter-spacing: 0.06em;
+  #brand { position: fixed; left: 22px; top: 20px; z-index: 5; }
+  #brand .card-title {
+    font-size: 20px; font-weight: 650; letter-spacing: 0.06em;
     background: linear-gradient(92deg, #8ff3ff 0%, #a6b4ff 48%, #ff8dc2 100%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  #brand p { margin: 5px 0 0; font-size: 11px; color: var(--dim); letter-spacing: 0.08em; }
+  #brand .card-body p { margin: 5px 0 0; font-size: 11px; color: var(--dim); letter-spacing: 0.08em; }
 
   #audioBtn {
-    position: fixed; left: 50%; top: 20px; transform: translateX(-50%);
-    z-index: 6; cursor: pointer; user-select: none;
-    padding: 10px 20px; font-size: 13px; letter-spacing: 0.04em;
-    color: var(--ink); border-radius: 999px;
-    border: 1px solid rgba(99, 230, 255, 0.45);
-    background: rgba(11, 26, 43, 0.78);
-    transition: transform .18s ease, box-shadow .25s ease, border-color .25s ease;
-    animation: breathe 2.4s ease-in-out infinite;
+    position: fixed; right: 18px; top: 18px; z-index: 8;
+    width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
+    cursor: pointer; color: var(--ink); border-radius: 50%;
+    border: 1px solid rgba(99, 230, 255, 0.38);
+    background: rgba(11, 26, 43, 0.82);
+    transition: transform .18s ease, border-color .25s ease, box-shadow .25s ease;
   }
-  #audioBtn:hover { transform: translateX(-50%) translateY(-1px); }
-  #audioBtn.live {
-    animation: none; border-color: rgba(120, 255, 190, 0.4);
-    box-shadow: 0 0 22px rgba(70, 230, 175, 0.14) inset;
+  #audioBtn:hover { transform: translateY(-1px); border-color: rgba(99, 230, 255, 0.85); }
+  #audioBtn.live { border-color: rgba(120, 255, 190, 0.52); box-shadow: 0 0 16px rgba(70, 230, 175, 0.15); }
+  #audioBtn svg { width: 19px; height: 19px; }
+  #audioBtn .spk { fill: currentColor; }
+  #audioBtn .waves, #audioBtn .cross {
+    fill: none; stroke: currentColor; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round;
   }
-  @keyframes breathe {
-    0%, 100% { box-shadow: 0 0 0 rgba(99, 230, 255, 0); }
-    50% { box-shadow: 0 0 22px rgba(99, 230, 255, 0.28); }
-  }
+  #audioBtn.live .cross, #audioBtn:not(.live) .waves { display: none; }
 
   #dimBtn {
     position: fixed; left: 22px; top: 92px; z-index: 6;
@@ -81,11 +76,23 @@
   #dimBtn:hover { transform: translateY(-1px); }
   #dimBtn.mode2d { border-color: rgba(120, 255, 190, 0.42); background: rgba(12, 34, 32, 0.82); }
 
+  /* 可折叠玻璃卡片：标题可点，正文不拦截画布拖拽 */
+  .card { pointer-events: auto; padding: 0; }
+  .card-head {
+    width: 100%; display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 11px 15px; border: 0; background: none;
+    color: inherit; font: inherit; text-align: left; cursor: pointer;
+  }
+  .card-head .chev { color: var(--dim); font-size: 12px; transition: transform .2s ease; }
+  .card.collapsed .chev { transform: rotate(-90deg); }
+  .card-body { padding: 0 15px 13px; pointer-events: none; }
+  .card.collapsed .card-body { display: none; }
+
   #hud {
     position: fixed; left: 22px; bottom: 22px; z-index: 5;
-    padding: 14px 17px; min-width: 252px; pointer-events: none;
-    font-variant-numeric: tabular-nums;
+    min-width: 252px; font-variant-numeric: tabular-nums;
   }
+  #hud .card-title { font-size: 12px; color: var(--dim); letter-spacing: 0.12em; }
   .hud-row {
     display: flex; align-items: center; justify-content: space-between;
     gap: 18px; font-size: 11px; line-height: 2.0;
@@ -111,9 +118,10 @@
 
   #hint {
     position: fixed; right: 22px; bottom: 22px; z-index: 5;
-    padding: 9px 14px; font-size: 11px; color: var(--dim);
-    letter-spacing: 0.05em; pointer-events: none;
+    font-size: 11px; color: var(--dim); letter-spacing: 0.05em;
   }
+  #hint .card-head { padding: 9px 14px; }
+  #hint .card-body { padding: 0 14px 10px; max-width: 320px; line-height: 1.7; }
 
   #intro {
     position: fixed; inset: 0; z-index: 10;
@@ -162,10 +170,10 @@
   .lil-gui.root { margin-top: 76px; margin-right: 18px; }
 
   /* 触控屏：放大所有可点区域，面板限高可滚动，避免挡住群体 */
-  body.touch #audioBtn { min-height: 44px; padding: 12px 24px; }
+  body.touch #audioBtn { width: 44px; height: 44px; }
   body.touch #dimBtn { min-height: 40px; padding: 10px 18px; }
   body.touch #startBtn { min-height: 48px; padding: 14px 34px; }
-  body.touch #hud, body.touch #hint, body.touch #brand { pointer-events: none; }
+  body.touch .card-head { min-height: 44px; }
   body.touch .lil-gui {
     --font-size: 13px;
     --widget-height: 26px;
@@ -188,36 +196,53 @@
     #brand { left: 12px; top: 12px; }
     #dimBtn { left: 12px; top: 82px; }
     #hud { left: 12px; bottom: 12px; min-width: 0; }
-    #hint { display: none; }
-    #audioBtn { top: auto; bottom: 18px; left: auto; right: 12px; transform: none; }
-    #audioBtn:hover { transform: translateY(-1px); }
-    .lil-gui.root { margin-top: 12px; margin-right: 6px; }
+    #hint { right: 12px; bottom: 12px; }
+    #audioBtn { right: 10px; top: 10px; }
+    .lil-gui.root { margin-top: 58px; margin-right: 6px; }
   }
 </style>
 </head>
 <body>
   <div id="scene"></div>
 
-  <div id="brand" class="glass">
-    <h1>FLOCKLAB</h1>
-    <p id="brandSub">二维平面 · 方向个体 · GPU 渲染</p>
+  <div id="brand" class="glass card">
+    <button class="card-head" type="button" aria-expanded="true">
+      <span class="card-title">FLOCKLAB</span><span class="chev">▾</span>
+    </button>
+    <div class="card-body"><p id="brandSub">二维平面 · 方向个体 · GPU 渲染</p></div>
   </div>
 
   <div id="dimBtn" class="mode2d" title="切换二维平面 / 三维空间视图">▦ 当前：二维平面</div>
 
-  <div id="audioBtn" title="浏览器要求用户手势才能播放声音">🔇 点击开启声音</div>
+  <button id="audioBtn" class="muted" type="button" title="开启声音" aria-label="开启声音">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path class="spk" d="M4 9h4l5-4v14l-5-4H4z" />
+      <path class="waves" d="M16.5 9.2c1.1 1.1 1.1 4.5 0 5.6M19.4 6.6c2.4 2.8 2.4 8 0 10.8" />
+      <path class="cross" d="M17 9.5l5 5M22 9.5l-5 5" />
+    </svg>
+  </button>
 
-  <div id="hud" class="glass">
-    <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">300</span> <span style="color:#ff8a5c">◆<span id="hPred">0</span></span></span></div>
-    <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
-    <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
-    <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
-    <div class="hud-row"><span class="k">集体音高 ∝ √T</span><span class="v" id="hPitch">— Hz</span></div>
-    <div class="hud-row"><span class="k">碰撞 / 琶音 / 扑击</span><span class="v"><span class="dot" id="hHit"></span><span class="dot" id="hArp"></span><span class="dot" id="hPredHit"></span></span></div>
-    <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
+  <div id="hud" class="glass card">
+    <button class="card-head" type="button" aria-expanded="true">
+      <span class="card-title">实时状态</span><span class="chev">▾</span>
+    </button>
+    <div class="card-body">
+      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">300</span> <span style="color:#ff8a5c">◆<span id="hPred">0</span></span></span></div>
+      <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
+      <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
+      <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
+      <div class="hud-row"><span class="k">集体音高 ∝ √T</span><span class="v" id="hPitch">— Hz</span></div>
+      <div class="hud-row"><span class="k">碰撞 / 琶音 / 扑击</span><span class="v"><span class="dot" id="hHit"></span><span class="dot" id="hArp"></span><span class="dot" id="hPredHit"></span></span></div>
+      <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
+    </div>
   </div>
 
-  <div id="hint" class="glass">箭头朝向即运动方向 · 拖拽平移 · 滚轮缩放 · 点左侧按钮切 3D</div>
+  <div id="hint" class="glass card">
+    <button class="card-head" type="button" aria-expanded="true">
+      <span class="card-title">操作提示</span><span class="chev">▾</span>
+    </button>
+    <div class="card-body"><span id="hintText">箭头朝向即运动方向 · 拖拽平移 · 滚轮缩放 · 点左侧按钮切 3D</span></div>
+  </div>
 
   <div id="intro">
     <div class="card glass">
@@ -228,10 +253,10 @@
         每个箭头只遵循三条规则：<em>分离</em>、<em>对齐</em>、<em>聚合</em>，箭头朝向就是它的运动方向。<br />
         群体温度 T 由平均动能给出，气压 P = ρT：<em>音高 ∝ √T</em>（理想气体声速关系），<em>音量与滤波亮度由 P 决定</em>。<br />
         P 越阈值触发<em>泛音列上行琶音</em>，碰撞按<em>接近冲量</em>触发打击音，均有冷却保护。<br />
-        右上角可开启<em>捕食者</em>：橙红箭头按拦截点追击，群体预测逃逸并沿邻居传递警报。
+        右侧控制台可开启<em>捕食者</em>：橙红箭头锁定目标并预判拦截，群体预测逃逸并沿邻居传递警报；捕获瞬间有冲击闪光与音效，新生个体以亮绿色标注，几秒后渐变为普通色。
       </p>
       <button id="startBtn">开启声音并进入</button>
-      <div class="foot">箭头变换在顶点着色器中完成 · 邻域用空间哈希查询</div>
+      <div class="foot">右上角小图标随时开关声音 · 各卡片标题可折叠 · 邻域用空间哈希查询</div>
     </div>
   </div>
 
@@ -273,9 +298,18 @@
     // 触控屏检测：混合设备（有触摸屏但鼠标为主）也算进去
     const isTouch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
     if (isTouch) document.body.classList.add('touch');
-    document.getElementById('hint').textContent = isTouch
+    document.getElementById('hintText').textContent = isTouch
       ? '单指拖拽旋转 · 双指捏合缩放 · 双击重置视角 · 右上角实时调参'
       : '箭头朝向即运动方向 · 拖拽旋转 · 滚轮缩放 · 右上角实时调参';
+
+    // 所有玻璃卡片标题可点击折叠；默认全部展开。
+    for (const head of document.querySelectorAll('.card > .card-head')) {
+      head.addEventListener('click', () => {
+        const card = head.closest('.card');
+        card.classList.toggle('collapsed');
+        head.setAttribute('aria-expanded', String(!card.classList.contains('collapsed')));
+      });
+    }
 
     // ---------------------------------------------------------------- 参数
     const params = {
@@ -303,8 +337,10 @@
       fleeWeight: 2.6,
       fleeRange: 8.0,
       predict: 0.6,
-      chaseWeight: 1.35,
-      predSpeed: 10.5,
+      chaseWeight: 1.5,
+      predSpeed: 12.5,
+      lockTime: 1.5,
+      feedCooldown: 3.0,
       infoCascade: true
     };
     const MAX_N = 1200;
@@ -323,6 +359,8 @@
     const prevFlee = new Float32Array(MAX_N * 3);  // 上一帧逃逸力，用于信息级联（传播带一帧延迟）
     const fleeing = new Uint8Array(MAX_N);
     const caught = new Uint8Array(MAX_N);
+    const birthAt = new Float64Array(MAX_N);       // 新生时间戳：-Infinity 表示普通个体
+    birthAt.fill(-Infinity);
 
     // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
     const predPos = new Float32Array(MAX_P * 3);
@@ -330,22 +368,29 @@
     const predCol = new Float32Array(MAX_P * 3);
     const predSiz = new Float32Array(MAX_P);
     const predFeedAt = new Float64Array(MAX_P);    // 饱腹冷却时间戳
+    const predTarget = new Int16Array(MAX_P);      // 锁定的目标编号，-1 为未锁定
+    predTarget.fill(-1);
+    const predLockUntil = new Float64Array(MAX_P); // 锁定到期时间（ms）
+    const predPulseAt = new Float64Array(MAX_P);   // 扑击瞬间，用于箭头脉冲
+    predPulseAt.fill(-Infinity);
 
     const COLLIDE_DIST = 0.55;
     const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
     const MAX_FORCE = 14;
-    const CATCH_DIST = 0.85;
+    const CATCH_DIST = 1.0;
     const CATCH_DIST2 = CATCH_DIST * CATCH_DIST;
-    const PRED_FORCE = 20;
+    const PRED_FORCE = 24;
     const PRED_SEP_RANGE2 = 6 * 6;
     const PRED_SEP_FORCE = 34;
-    const FEED_COOLDOWN = 600;                      // ms，防止同一捕食者连续扑击
+    const BIRTH_TOTAL_MS = 3200;                    // 新生标记总时长：前 1.8s 亮绿，后 1.4s 渐变
+    const BIRTH_SOLID_MS = 1800;
+    const BURST_MS = 760;                           // 捕杀冲击波动画时长
 
     let density = 0, avgSpeed = 0, avgNeighbors = 0;
     let temperature = 0, pressure = 0, collisionImpulse = 0;
     let collisionFlash = 0, arpFlash = 0, predFlash = 0, predCatches = 0;
 
-    function initBoids(from, to) {
+    function initBoids(from, to, isBirth = false) {
       const bd2 = params.dim2D ? bounds2D() : null;
       for (let i = from; i < to; i++) {
         const r = 12 * Math.cbrt(Math.random());
@@ -367,6 +412,7 @@
         vel[k] = (Math.random() * 2 - 1) * vs;
         vel[k + 1] = (Math.random() * 2 - 1) * vs;
         vel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
+        birthAt[i] = isBirth ? performance.now() : -Infinity;
       }
     }
     function initPredators(from, to) {
@@ -398,12 +444,15 @@
       initBoids(0, activeCount);
       initPredators(0, activeP);
       predCatches = 0;
+      predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
+      clearBursts();
     };
     function setPredCount(v) {
       const next = Math.max(1, Math.min(MAX_P, Math.round(v)));
       if (next > activeP) initPredators(activeP, next);
       activeP = next;
       params.predatorCount = next;
+      for (let p = next; p < MAX_P; p++) predTarget[p] = -1;
       // 关键：控制绘制数量的是几何体的 instanceCount，不是 Mesh 的。
       // 之前误写 predMesh.instanceCount 导致减少数量后旧捕食者仍被绘制且不更新（定住）。
       if (predGeo) predGeo.instanceCount = next;
@@ -476,7 +525,7 @@
       document.getElementById('brandSub').textContent = on
         ? '二维平面 · 方向个体 · GPU 渲染'
         : '三维空间 · 方向个体 · GPU 渲染';
-      document.getElementById('hint').textContent = on
+      document.getElementById('hintText').textContent = on
         ? (isTouch ? '单指拖拽平移 · 双指捏合缩放 · 双击重置 · 左侧按钮切 3D'
                    : '箭头朝向即运动方向 · 拖拽平移 · 滚轮缩放 · 左侧按钮切 3D')
         : (isTouch ? '单指拖拽旋转 · 双指捏合缩放 · 双击重置 · 左侧按钮切 2D'
@@ -724,7 +773,38 @@
       predSiz[p] = params.arrowSize * 2.2;
     }
 
+    // 捕杀冲击波：外圈 + 亮核，池化复用；2D/3D 都用相机朝向做 billboard。
+    const burstRingGeo = new THREE.RingGeometry(0.70, 1.0, 48);
+    const burstCoreGeo = new THREE.CircleGeometry(1, 32);
+    const killBursts = [];
+    for (let b = 0; b < 24; b++) {
+      const ring = new THREE.Mesh(burstRingGeo, new THREE.MeshBasicMaterial({
+        color: 0xffa050, transparent: true, opacity: 0, side: THREE.DoubleSide,
+        depthWrite: false, blending: THREE.AdditiveBlending, fog: false
+      }));
+      const core = new THREE.Mesh(burstCoreGeo, new THREE.MeshBasicMaterial({
+        color: 0xffffff, transparent: true, opacity: 0, side: THREE.DoubleSide,
+        depthWrite: false, blending: THREE.AdditiveBlending, fog: false
+      }));
+      ring.visible = false; core.visible = false;
+      ring.frustumCulled = false; core.frustumCulled = false;
+      scene.add(ring); scene.add(core);
+      killBursts.push({ ring, core, active: false, born: 0, x: 0, y: 0, z: 0 });
+    }
+    function spawnBurst(x, y, z, now) {
+      let slot = killBursts.find((b) => !b.active);
+      if (!slot) slot = killBursts.reduce((a, b) => (a.born < b.born ? a : b)); // 池满则复用最老
+      slot.active = true; slot.born = now; slot.x = x; slot.y = y; slot.z = z;
+      slot.ring.visible = true; slot.core.visible = true;
+    }
+    function clearBursts() {
+      for (const b of killBursts) {
+        b.active = false; b.ring.visible = false; b.core.visible = false;
+      }
+    }
+
     const tmpColor = new THREE.Color();
+    const tmpBirth = new THREE.Color(0x7dff9a);
 
     // ---------------------------------------------------------------- 声音（物理映射）
     class FlockAudio {
@@ -793,16 +873,11 @@
 
       refreshButton() {
         const btn = document.getElementById('audioBtn');
-        if (!this.enabled) {
-          btn.classList.remove('live');
-          btn.textContent = '🔇 点击开启声音';
-        } else if (this.muted) {
-          btn.classList.remove('live');
-          btn.textContent = '🔇 声音已关闭';
-        } else {
-          btn.classList.add('live');
-          btn.textContent = '🔊 声音已开启';
-        }
+        const live = this.enabled && !this.muted;
+        btn.classList.toggle('live', live);
+        const label = !this.enabled ? '开启声音' : (this.muted ? '声音已关闭，点击开启' : '声音已开启，点击静音');
+        btn.title = label;
+        btn.setAttribute('aria-label', label);
       }
 
       // 真正的静音开关：把主增益平滑降到 0，振荡器仍在运行但听不到声音。
@@ -913,7 +988,7 @@
       }
 
       // 捕食扑击音：捕获冲量 J 决定音量与音高（∝√J，接触刚度主导），
-      // 低频闷响 + 带通噪声，比普通碰撞更低沉；独立冷却 90ms + 每秒 6 次。
+      // 低频闷响 + 带通噪声 + 高频「咔」瞬态，明显区别于普通碰撞；冷却 90ms + 每秒 6 次。
       predate(J) {
         if (!this.enabled || this.muted || !params.predatorOn) return;
         const now = performance.now();
@@ -933,7 +1008,7 @@
         bp.type = 'bandpass'; bp.frequency.value = f * 3.2; bp.Q.value = 1.05;
         const g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, t);
-        g.gain.exponentialRampToValueAtTime(0.05 + 0.12 * amp, t + 0.006);
+        g.gain.exponentialRampToValueAtTime(0.06 + 0.13 * amp, t + 0.006);
         g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
         src.connect(bp); bp.connect(g); g.connect(this.master);
         src.start(t); src.stop(t + 0.16);
@@ -944,13 +1019,26 @@
         o.frequency.exponentialRampToValueAtTime(f * 0.45, t + 0.13);
         const g2 = ctx.createGain();
         g2.gain.setValueAtTime(0.0001, t);
-        g2.gain.exponentialRampToValueAtTime(0.065 + 0.13 * amp, t + 0.008);
+        g2.gain.exponentialRampToValueAtTime(0.07 + 0.14 * amp, t + 0.008);
         g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
         o.connect(g2); g2.connect(this.master);
         o.start(t); o.stop(t + 0.18);
+
+        // 高频「咔」：快速下扫的方波瞬态，让捕杀在混音中一眼可辨。
+        const snap = ctx.createOscillator();
+        snap.type = 'square';
+        snap.frequency.setValueAtTime(900 + 700 * Math.sqrt(amp), t);
+        snap.frequency.exponentialRampToValueAtTime(180, t + 0.075);
+        const gs = ctx.createGain();
+        gs.gain.setValueAtTime(0.0001, t);
+        gs.gain.exponentialRampToValueAtTime(0.035 + 0.055 * amp, t + 0.004);
+        gs.gain.exponentialRampToValueAtTime(0.0001, t + 0.085);
+        snap.connect(gs); gs.connect(this.master);
+        snap.start(t); snap.stop(t + 0.09);
       }
     }
     const audio = new FlockAudio();
+    audio.refreshButton();
 
     document.getElementById('startBtn').addEventListener('click', () => {
       audio.enable().then(() => document.getElementById('intro').classList.add('hidden'))
@@ -968,6 +1056,7 @@
     fRules.add(params, 'separation', 0, 4, 0.01).name('分离 Separation');
     fRules.add(params, 'alignment', 0, 4, 0.01).name('对齐 Alignment');
     fRules.add(params, 'cohesion', 0, 4, 0.01).name('聚合 Cohesion');
+    fRules.open();
 
     const fMotion = gui.addFolder('感知与运动');
     fMotion.add(params, 'count', 50, MAX_N, 10).name('元素数量').onChange(setCount);
@@ -980,7 +1069,7 @@
     fMotion.add(params, 'minSpeed', 0.5, 8, 0.1).name('最小速度');
     fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动边界').onChange((v) => cage.scale.setScalar(v));
     fMotion.add(params, 'arrowSize', 0.18, 0.9, 0.01).name('箭头大小');
-    fMotion.close();
+    fMotion.open();
 
     const fSound = gui.addFolder('物理声音映射');
     fSound.add(params, 'master', 0, 1, 0.01).name('总音量').onChange((v) => audio.setMaster(v));
@@ -988,20 +1077,22 @@
     fSound.add(params, 'pressureThreshold', 0.05, 0.8, 0.01).name('琶音气压阈值');
     fSound.add(params, 'impulseThreshold', 0.01, 0.6, 0.01).name('碰撞冲量阈值');
     fSound.add({ toggle: () => document.getElementById('audioBtn').click() }, 'toggle').name('开启 / 关闭声音');
-    fSound.close();
+    fSound.open();
 
     const fPred = gui.addFolder('捕食者 Predator');
     fPred.add(params, 'predatorOn').name('开启捕食者').onChange((v) => {
       predMesh.visible = v;
       for (let p = 0; p < MAX_P; p++) threatRings[p].visible = v && p < activeP;
       document.getElementById('hPred').textContent = v ? activeP : '0';
-      if (v) { initPredators(0, activeP); predCatches = 0; }
+      if (v) { initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0); predCatches = 0; }
     });
     fPred.add(params, 'predatorCount', 1, MAX_P, 1).name('捕食者数量').onChange(setPredCount);
-    fPred.add(params, 'predSpeed', 2, 22, 0.1).name('捕食者速度').onChange((v) => {
+    fPred.add(params, 'predSpeed', 2, 30, 0.1).name('捕食者速度').onChange((v) => {
       predMat.uniforms.uMaxSpeed.value = v;
     });
     fPred.add(params, 'chaseWeight', 0, 4, 0.05).name('追击权重');
+    fPred.add(params, 'lockTime', 0, 5, 0.1).name('目标锁定秒数');
+    fPred.add(params, 'feedCooldown', 0.3, 8, 0.1).name('进食冷却（秒）');
     fPred.add(params, 'fleeWeight', 0, 6, 0.05).name('逃逸权重');
     fPred.add(params, 'fleeRange', 3, 24, 0.5).name('逃逸半径 R');
     fPred.add(params, 'predict', 0, 1.5, 0.05).name('预测系数');
@@ -1014,7 +1105,7 @@
     fScene.add(params, 'paused').name('暂停模拟');
     fScene.add({ reset: resetBoids }, 'reset').name('重新初始化');
     fScene.add({ view: resetCamera }, 'view').name('重置视角');
-    fScene.close();
+    fScene.open();
 
     // ---------------------------------------------------------------- 空间哈希
     const grid = new Map();
@@ -1057,23 +1148,51 @@
           const ppx = predPos[q], ppy = predPos[q + 1], ppz = predPos[q + 2];
           const pvx = predVel[q], pvy = predVel[q + 1], pvz = predVel[q + 2];
 
-          // 追全场最近的个体（用户选择：最近个体）
-          let best = -1, bestD2 = Infinity;
-          for (let j = 0; j < n; j++) {
-            const m = j * 3;
+          // 目标锁定：先沿用旧目标，超出视野或锁定过期才重选最近个体。
+          // 每帧改追最近者会让鱼群的「迷惑效应」把捕食者拖死，短期记忆可形成稳定直线追击。
+          const vision2 = Math.pow(Math.max(fleeR * 2.4, 18), 2);
+          let best = predTarget[p], bestD2 = Infinity;
+          if (best >= 0 && best < n) {
+            const m = best * 3;
             const dx = pos[m] - ppx, dy = pos[m + 1] - ppy, dz = pos[m + 2] - ppz;
-            const d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 < bestD2) { bestD2 = d2; best = j; }
+            bestD2 = dx * dx + dy * dy + dz * dz;
+          }
+          if (best < 0 || best >= n || bestD2 > vision2 || time > predLockUntil[p]) {
+            best = -1; bestD2 = Infinity;
+            for (let j = 0; j < n; j++) {
+              const m = j * 3;
+              const dx = pos[m] - ppx, dy = pos[m + 1] - ppy, dz = pos[m + 2] - ppz;
+              const d2 = dx * dx + dy * dy + dz * dz;
+              if (d2 < bestD2) { bestD2 = d2; best = j; }
+            }
+          }
+          if (best >= 0) {
+            predTarget[p] = best;
+            predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
+          } else {
+            predTarget[p] = -1;
           }
 
           let ax = 0, ay = 0, az = 0;
           if (best >= 0) {
             const m = best * 3;
             const d = Math.sqrt(bestD2);
-            const tau = d / predSpeed;               // 拦截时间 = 距离 / 自身速度
-            const aimx = pos[m] + vel[m] * tau;      // 预测点：目标位置 + 目标速度 × τ
-            const aimy = pos[m + 1] + vel[m + 1] * tau;
-            const aimz = pos[m + 2] + vel[m + 2] * tau;
+            const ux = vel[m], uy = vel[m + 1], uz = vel[m + 2];
+            const u2 = ux * ux + uy * uy + uz * uz;
+            const ru = (pos[m] - ppx) * ux + (pos[m + 1] - ppy) * uy + (pos[m + 2] - ppz) * uz;
+            // 解 |r + u·t| = v·t：比 τ=d/v 更准确地预判侧向移动目标。
+            const a = predSpeed * predSpeed - u2;
+            let tau;
+            if (a > 1e-6) {
+              tau = (ru + Math.sqrt(Math.max(0, ru * ru + a * bestD2))) / a;
+            } else {
+              tau = d / Math.max(predSpeed, 1e-6);   // 捕食者不够快时退化为直追
+            }
+            if (!isFinite(tau) || tau < 0) tau = d / Math.max(predSpeed, 1e-6);
+            tau = Math.min(1.2, tau);                 // 限制远距离过度预判
+            const aimx = pos[m] + ux * tau;
+            const aimy = pos[m + 1] + uy * tau;
+            const aimz = pos[m + 2] + uz * tau;
             let tx = aimx - ppx, ty = aimy - ppy, tz = aimz - ppz;
             const tl = Math.hypot(tx, ty, tz);
             if (tl > 1e-6) {
@@ -1332,10 +1451,10 @@
           }
         }
 
-        // 捕获：进入 CATCH_DIST 且捕食者已过饱腹冷却 → 冲量发声 + 标记移除
-        if (P > 0) {
+        // 捕获：进入 CATCH_DIST 且捕食者已过饱腹冷却 → 冲量发声 + 冲击波 + 标记移除
+        if (P > 0 && !caught[i]) {
           for (let p = 0; p < P; p++) {
-            if (time - predFeedAt[p] < FEED_COOLDOWN) continue;
+            if (time - predFeedAt[p] < params.feedCooldown * 1000) continue;  // 进食消化期
             const q = p * 3;
             const dx = pos[k] - predPos[q], dy = pos[k + 1] - predPos[q + 1], dz = pos[k + 2] - predPos[q + 2];
             const d2 = dx * dx + dy * dy + dz * dz;
@@ -1344,7 +1463,10 @@
             const vrel = Math.max(0.5, Math.hypot(rvx, rvy, rvz));
             const J = Math.pow(vrel, 1.2) / predNorm;   // Hertz 接触：冲量 ∝ v^1.2
             audio.predate(J);
+            spawnBurst(pos[k], pos[k + 1], pos[k + 2], time);
             predFeedAt[p] = time;
+            predPulseAt[p] = time;
+            predTarget[p] = -1;                         // 猎物已死，解除锁定
             predCatches++;
             caught[i] = 1;
             break;
@@ -1352,9 +1474,9 @@
         }
       }
 
-      // 立即补充新个体：被捕获者原位重生，元素总数保持恒定
+      // 立即补位：新生个体带亮绿标记，元素总数保持恒定
       for (let i = 0; i < n; i++) {
-        if (caught[i]) { initBoids(i, i + 1); caught[i] = 0; }
+        if (caught[i]) { initBoids(i, i + 1, true); caught[i] = 0; }
       }
       if (P > 0) prevFlee.set(fleeDir);   // 信息级联使用上一帧逃逸方向
 
@@ -1428,8 +1550,22 @@
         const local = Math.min(1, neighbors[i] / 24);
         const speedRatio = Math.min(1, Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed);
         tmpColor.setHSL(0.52 + local * 0.40, 0.95, 0.46 + speedRatio * 0.22);
-        col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
-        siz[i] = params.arrowSize + local * 0.10;
+        let size = params.arrowSize + local * 0.10;
+        // 新生个体：亮绿色 + 轻微脉冲，1.8s 后开始渐变为普通色，3.2s 后完全一致。
+        const age = now - birthAt[i];
+        if (age >= 0 && age < BIRTH_TOTAL_MS) {
+          const fade = Math.max(0, Math.min(1,
+            (age - BIRTH_SOLID_MS) / (BIRTH_TOTAL_MS - BIRTH_SOLID_MS)));
+          const pulse = 0.5 + 0.5 * Math.cos(Math.min(age, 700) * 0.014);
+          const glow = 0.85 + 0.3 * pulse;
+          col[k] = tmpColor.r * fade + tmpBirth.r * (1 - fade) * glow;
+          col[k + 1] = tmpColor.g * fade + tmpBirth.g * (1 - fade) * glow;
+          col[k + 2] = tmpColor.b * fade + tmpBirth.b * (1 - fade) * glow;
+          size *= 1 + (1 - fade) * (0.28 + 0.12 * pulse);
+        } else {
+          col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
+        }
+        siz[i] = size;
       }
       aPos.needsUpdate = true;
       aVel.needsUpdate = true;
@@ -1451,9 +1587,32 @@
           ring.quaternion.copy(camera.quaternion);
           ring.scale.setScalar(params.fleeRange);
           ring.visible = true;
+          // 扑击瞬间箭头放大脉冲，与冲击波同步。
+          const pulse = Math.max(0, 1 - (now - predPulseAt[p]) / 280);
+          predSiz[p] = params.arrowSize * 2.2 * (1 + 0.45 * pulse);
         }
       } else {
         for (const ring of threatRings) ring.visible = false;
+      }
+
+      // 捕杀冲击波：外圈快速扩张、亮核闪灭，朝相机 billboard。
+      for (const b of killBursts) {
+        if (!b.active) continue;
+        const age = now - b.born;
+        if (age >= BURST_MS) {
+          b.active = false; b.ring.visible = false; b.core.visible = false;
+          continue;
+        }
+        const u = age / BURST_MS;
+        const ease = 1 - Math.pow(1 - u, 3);
+        b.ring.position.set(b.x, b.y, b.z);
+        b.core.position.set(b.x, b.y, b.z);
+        b.ring.quaternion.copy(camera.quaternion);
+        b.core.quaternion.copy(camera.quaternion);
+        b.ring.scale.setScalar(0.4 + 4.2 * ease);
+        b.core.scale.setScalar(0.2 + 1.1 * ease);
+        b.ring.material.opacity = 1.0 * (1 - u);
+        b.core.material.opacity = 1.0 * Math.pow(1 - u, 2);
       }
 
       renderer.render(scene, camera);
@@ -1488,7 +1647,7 @@
     requestAnimationFrame(render);
 
     window.FlockLab = {
-      params, resetBoids, setCount, setPredCount, setMode2D,
+      params, resetBoids, setCount, setPredCount, setMode2D, spawnBurst,
       get dim2D() { return params.dim2D; },
       get maxAbsZ() {
         let m = 0;
@@ -1513,6 +1672,16 @@
         }));
       },
       get catches() { return predCatches; },
+      get newbornCount() {
+        const now = performance.now();
+        let c = 0;
+        for (let i = 0; i < activeCount; i++) if (now - birthAt[i] < BIRTH_TOTAL_MS) c++;
+        return c;
+      },
+      get activeBursts() { return killBursts.filter((b) => b.active).length; },
+      get predatorTargets() {
+        return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => predTarget[p]);
+      },
       get predatorDrawCount() { return predGeo.instanceCount; },
       get muted() { return audio.muted; },
       get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
