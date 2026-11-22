@@ -358,7 +358,7 @@
         <li><b>捕食者</b>锐角三角形，带碰撞体积，接触即捕食；进食后减速随机巡游。</li>
         <li><b>爆发</b>只有被捕食者逼近时才会冲刺逃命（洋红发光 + 渐隐拖尾）；体力耗尽后必须恢复，不能连续爆发。</li>
         <li><b>反应延迟</b>看到捕食者不会立刻爆发：贴身的鸟约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像一圈涟漪从捕食者身边扩散开。</li>
-        <li><b>草地</b>场地里有 2~3 片云朵状草地（约占屏幕 1/9），鸟每隔二三十秒会挑一片降落歇 3~6 秒；捕食者靠近就立刻惊飞。</li>
+        <li><b>草地</b>场地里有 2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 2 分钟）；落地的鸟变成苔绿色，飞行中的鸟会绕开草地。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时只有低频嗡鸣，抱团后和声变厚、节拍渐起。与提示音共用右上角声音开关。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
       </ul>
@@ -585,6 +585,11 @@
     const restUntil = new Float64Array(MAX_N);         // 起身时间
     const restDue = new Float64Array(MAX_N);           // 下次想休息的时间
     const restTgt = new Float32Array(MAX_N * 2);       // 落点
+    const restSince = new Float64Array(MAX_N);         // 真正「停稳」的时间（用于「至少 5 秒」）
+    // settled：只有「已经到了落点并且几乎不动」才算在休息。
+    // resting 只是「打算去 / 正在往过飞」，不算休息——否则一脱队就被算成休息了。
+    const settled = new Uint8Array(MAX_N);
+    const restApproachUntil = new Float64Array(MAX_N);  // 前往草地的截止时间，飞太久就放弃
     // ---------------------------------------------------------------- 个体差异
     // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
     // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
@@ -695,7 +700,7 @@
         birthAt[i] = isBirth ? performance.now() : -Infinity;
         stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
         alertMs[i] = 0; trailAmt[i] = 0;
-        resting[i] = 0; restPatch[i] = -1;
+        resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
         restDue[i] = performance.now() + 4000 + Math.random() * 26000;
         rollTraits(i);
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
@@ -734,7 +739,7 @@
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
       alertMs[i] = 0; trailAmt[i] = 0;
       trailTail[i * 2] = pos[k]; trailTail[i * 2 + 1] = pos[k + 1];
-      resting[i] = 0; restPatch[i] = -1;
+      resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
       restDue[i] = now + 5000 + Math.random() * 20000;
       rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
     }
@@ -1037,22 +1042,47 @@
         uniform float uTime;
         uniform float uFade;
         float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        // 值噪声：草地内部的明暗斑块与细颗粒都靠它，比纯正弦更像真的植被
+        float vnoise(vec2 p) {
+          vec2 i = floor(p), f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          float a = hash(i), b = hash(i + vec2(1.0, 0.0));
+          float c = hash(i + vec2(0.0, 1.0)), d = hash(i + vec2(1.0, 1.0));
+          return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
+        float fbm(vec2 p) {
+          return vnoise(p) * 0.6 + vnoise(p * 2.13 + 7.3) * 0.28 + vnoise(p * 4.7 - 3.1) * 0.12;
+        }
         void main() {
           vec2 d = vWorld - uCenter;
           float th = atan(d.y, d.x);
-          float rr = uR * (1.0 + uHarm.x * sin(3.0 * th + uHarm.y) + uHarm.z * sin(5.0 * th + uHarm.w));
           float r = length(d);
-          if (r > rr + 1.6) discard;
-          float inside = 1.0 - smoothstep(rr - 1.0, rr + 0.2, r);
-          // 内部：低频斑块（两三个正弦相乘，不引入贴图）
-          float n = 0.5 + 0.5 * sin(d.x * 0.33 + uTime * 0.12) * sin(d.y * 0.29 - uTime * 0.09);
-          float n2 = 0.5 + 0.5 * sin(d.x * 0.9 - d.y * 0.7 + uTime * 0.05);
-          vec3 col = mix(vec3(0.05, 0.34, 0.23), vec3(0.20, 0.66, 0.45), n * 0.7 + n2 * 0.3);
-          // 边缘：一圈很淡的荧光，和整体霓虹感一致
-          float rim = exp(-abs(r - rr) * 2.0);
-          float a = (inside * (0.070 + 0.050 * n) + rim * 0.18) * uFade;
+          // 边缘：两条谐波叠一点极慢的角向扰动，让轮廓像被风轻轻推着
+          float wob = 0.012 * sin(th * 7.0 + uTime * 0.21) + 0.008 * sin(th * 11.0 - uTime * 0.15);
+          float rr = uR * (1.0 + uHarm.x * sin(3.0 * th + uHarm.y) + uHarm.z * sin(5.0 * th + uHarm.w) + wob);
+          if (r > rr + 2.2) discard;
+          float inside = 1.0 - smoothstep(rr - 0.9, rr + 0.35, r);
+          float t = clamp(r / max(rr, 0.001), 0.0, 1.0);   // 0=中心 1=边缘
+
+          // 底层：大块的明暗（r 越靠外越暗，像中间被照亮）
+          float base = fbm(d * 0.16 + vec2(uTime * 0.02, 0.0));
+          float shade = mix(1.0, 0.55, pow(t, 1.6));
+          vec3 col = mix(vec3(0.035, 0.20, 0.13), vec3(0.16, 0.50, 0.33), base) * shade;
+
+          // 草叶：沿角向切出来的细碎条纹，靠近边缘更明显（像草丛轮廓）
+          float blade = fbm(vec2(th * 22.0, r * 0.55));
+          blade = smoothstep(0.52, 0.95, blade) * smoothstep(0.25, 0.95, t);
+          col += vec3(0.10, 0.42, 0.24) * blade * 0.55;
+
+          // 细颗粒：近看才有的一点点杂色
+          float grain = vnoise(d * 3.1) * 0.5 + vnoise(d * 7.7) * 0.5;
+          col *= 0.86 + 0.28 * grain;
+
+          // 边缘一圈很淡的荧光，和整体霓虹感一致
+          float rim = exp(-abs(r - rr) * 2.4);
+          float a = (inside * (0.10 + 0.07 * base + 0.10 * blade) + rim * 0.16) * uFade;
           if (a < 0.003) discard;
-          gl_FragColor = vec4(col * (0.85 + 0.5 * rim), a);
+          gl_FragColor = vec4(col * (0.9 + 0.6 * rim), a);
           #include <colorspace_fragment>
         }
       `,
@@ -1061,10 +1091,33 @@
       depthWrite: false,
       depthTest: false
     });
+    // 草地总面积占屏幕的比例
+    const GRASS_FRAC = 0.15;
+    // 停留时长：只要没危险就一直待着，最长 100~120 秒
+    const REST_MAX_MIN = 100000, REST_MAX_SPAN = 20000;   // ms
+
+    // 估算一片草地上落在场地内的面积（蒙特卡洛）：用于按目标面积反推 R，
+    // 这样即使草地压在边界上、被切掉一块，场地里看到的面积仍然是目标值。
+    function inFieldArea(gp, R, bd, samples = 900) {
+      const ext = R * 1.4;
+      const x0 = gp.x - ext, x1 = gp.x + ext, y0 = gp.y - ext, y1 = gp.y + ext;
+      let hit = 0;
+      for (let i = 0; i < samples; i++) {
+        const x = x0 + Math.random() * (x1 - x0);
+        const y = y0 + Math.random() * (y1 - y0);
+        if (Math.abs(x) > bd.hx || Math.abs(y) > bd.hy) continue;
+        const dx = x - gp.x, dy = y - gp.y;
+        const th = Math.atan2(dy, dx);
+        const rr = R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2));
+        if (Math.hypot(dx, dy) <= rr) hit++;
+      }
+      return (x1 - x0) * (y1 - y0) * hit / samples;
+    }
+
     function buildGrass() {
       const bd = bounds2D();
-      // 屏幕面积 = 4·hx·hy，草地总面积取 1/9
-      const totalArea = (2 * bd.hx * 2 * bd.hy) / 9;
+      // 屏幕面积 = 4·hx·hy
+      const totalArea = (2 * bd.hx * 2 * bd.hy) * GRASS_FRAC;
       grass.length = 0;
       const count = 2 + (Math.random() < 0.5 ? 1 : 0);   // 2 或 3 片
       const perArea = totalArea / count;
@@ -1073,15 +1126,25 @@
         const a2 = 0.04 + Math.random() * 0.09;
         const p1 = Math.random() * Math.PI * 2;
         const p2 = Math.random() * Math.PI * 2;
-        // 面积 ≈ πR²(1 + (a1²+a2²)/2)，反解 R
-        const R = Math.sqrt(perArea / (Math.PI * (1 + (a1 * a1 + a2 * a2) / 2)));
+        const gp = { x: 0, y: 0, R: 1, a1, p1, a2, p2, area: perArea, cap: 0, count: 0 };
+        // 位置：允许压在边界上（草地可以有一部分在场地外），但中心留在场内
         let x = 0, y = 0;
-        for (let t = 0; t < 80; t++) {
-          x = (Math.random() * 2 - 1) * Math.max(0.1, bd.hx - R * 1.25);
-          y = (Math.random() * 2 - 1) * Math.max(0.1, bd.hy - R * 1.25);
-          if (grass.every((e) => Math.hypot(e.x - x, e.y - y) > (e.R + R) * 1.3)) break;
+        for (let t = 0; t < 60; t++) {
+          x = (Math.random() * 2 - 1) * bd.hx * 0.86;
+          y = (Math.random() * 2 - 1) * bd.hy * 0.86;
+          gp.x = x; gp.y = y;
+          if (grass.every((e) => Math.hypot(e.x - x, e.y - y) > (e.R + 6) * 1.15)) break;
         }
-        grass.push({ x, y, R, a1, p1, a2, p2, area: perArea, cap: Math.max(16, Math.round(perArea / 3.6)), count: 0 });
+        // 先按「完全在场内」估一个 R，再用实测面积反推（面积 ∝ R²，一次收敛）
+        let R = Math.sqrt(perArea / (Math.PI * (1 + (a1 * a1 + a2 * a2) / 2)));
+        for (let it = 0; it < 2; it++) {
+          gp.R = R;
+          const measured = Math.max(1e-3, inFieldArea(gp, R, bd));
+          R = Math.min(R * Math.sqrt(perArea / measured), Math.max(bd.hx, bd.hy) * 1.1);
+        }
+        gp.R = R;
+        gp.cap = Math.max(20, Math.round(perArea / 4.2));
+        grass.push(gp);
       }
       // 复用/补齐网格
       while (grassMeshes.length < GRASS_N) {
@@ -1094,7 +1157,7 @@
       for (let g = 0; g < grassMeshes.length; g++) {
         const m = grassMeshes[g], gp = grass[g];
         if (!gp) { m.visible = false; continue; }
-        const span = gp.R * 2.75;          // 谐波最大 1.23 倍 R，再留点余量
+        const span = gp.R * 2.6;           // 谐波最大 1.23 倍 R，再加角向扰动与边缘柔化
         m.scale.set(span, span, 1);
         m.position.set(gp.x, gp.y, -1);
         m.visible = params.grassOn;
@@ -1108,13 +1171,17 @@
 
     // 在草地内取一个点：极坐标均匀采样，再按谐波半径筛一遍，保证落在形状里
     function pickRestPoint(gp) {
-      for (let t = 0; t < 14; t++) {
+      const bd = bounds2D();
+      const cl = (v, h) => Math.max(-h + 1.2, Math.min(h - 1.2, v));
+      for (let t = 0; t < 18; t++) {
         const th = Math.random() * Math.PI * 2;
-        const rr = gp.R * Math.sqrt(Math.random()) * 0.92;
-        const lim = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2)) * 0.9;
-        if (rr <= lim) return [gp.x + Math.cos(th) * rr, gp.y + Math.sin(th) * rr];
+        const rr = gp.R * Math.sqrt(Math.random()) * 0.94;
+        const lim = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2)) * 0.92;
+        const x = gp.x + Math.cos(th) * rr, y = gp.y + Math.sin(th) * rr;
+        // 草地可以压边界，但鸟必须停在场内
+        if (rr <= lim && Math.abs(x) < bd.hx - 1.2 && Math.abs(y) < bd.hy - 1.2) return [x, y];
       }
-      return [gp.x, gp.y];
+      return [cl(gp.x, bd.hx), cl(gp.y, bd.hy)];
     }
     // 让第 i 只鸟出发去休息：挑一片没满且最近的草地
     function startRest(i, time) {
@@ -1131,10 +1198,12 @@
       const gp = grass[best];
       const [tx, ty] = pickRestPoint(gp);
       restTgt[i * 2] = tx; restTgt[i * 2 + 1] = ty;
-      resting[i] = 1; restPatch[i] = best; gp.count++;
-      // 停留时间从「飞到」开始算，所以要先估一段路程
-      const travel = Math.hypot(tx - pos[k], ty - pos[k + 1]) / Math.max(4, params.maxSpeed * 0.78);
-      restUntil[i] = time + travel * 1000 + 2800 + Math.random() * 3200;
+      resting[i] = 1; settled[i] = 0; restPatch[i] = best; gp.count++;
+      restSince[i] = 0;
+      // 先给一段赶路时间；真正「开始休息」要等它到点并停稳（见 settled）
+      const travel = Math.hypot(tx - pos[k], ty - pos[k + 1]) / Math.max(6, params.maxSpeed * 0.6);
+      restApproachUntil[i] = time + travel * 1000 + 8000;
+      restUntil[i] = time + travel * 1000 + 6000;   // 到点后会重设成 100~120 秒
       restDue[i] = time + 24000 + Math.random() * 22000;
     }
     // 结束休息（起飞或被惊到）
@@ -1148,11 +1217,17 @@
       for (let g = 0; g < grassMeshes.length; g++) grassMeshes[g].visible = params.grassOn && !!grass[g];
     }
     function endRest(i, time, scared) {
-      resting[i] = 0;
+      const wasSettled = settled[i] === 1;
+      resting[i] = 0; settled[i] = 0;
       const g = restPatch[i];
       if (g >= 0 && grass[g]) grass[g].count--;
       restPatch[i] = -1;
-      restDue[i] = time + (scared ? 4000 : 22000) + Math.random() * 18000;
+      // 「必须停留至少 5 秒」：真正停稳过、且被吓走时待够了 5 秒，才算休成；
+      // 没停稳（还在赶路）或没待够就被赶走，都当作这次没休成，隔几秒重来。
+      const dwell = wasSettled ? time - restSince[i] : 0;
+      restDue[i] = (scared && dwell < 5000)
+        ? time + 6000 + Math.random() * 8000
+        : time + 24000 + Math.random() * 22000;
     }
 
     // ---------------------------------------------------------------- GPU 箭头
@@ -2158,7 +2233,7 @@
 
     const fGrass = gui.addFolder('草地');
     bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
-      '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 1/9）。每只鸟每隔二三十秒会挑一片最近、还没满的草地降落，停 3~6 秒再起飞；附近有捕食者会立刻惊飞。关掉后草地隐藏，正在休息的鸟会马上起飞。',
+      '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 15%，可以压到边界上）。每只鸟每隔二三十秒必须去一次，挑一片最近、没满的降落，只要没有危险就一直待着（最长 100~120 秒）；被惊到会立刻飞走并重新计时，没待够 5 秒的下次很快会再来。不休息的鸟会主动绕开草地。关掉后草地隐藏，正在休息的鸟马上起飞。',
       (v) => { syncGrassVisibility(); if (!v) liftAllResting(); });
     fGrass.open();
 
@@ -2434,13 +2509,9 @@
           const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
           const ddx = tx - px, ddy = ty - py;
           const dd = Math.hypot(ddx, ddy);
-          let rfx = 0, rfy = 0;
-          if (dd > 0.7) {
-            rfx = ddx / dd * 9; rfy = ddy / dd * 9;          // 慢慢走过去
-          } else {
-            rfx = (Math.random() - 0.5) * 2.6; rfy = (Math.random() - 0.5) * 2.6;   // 站定时轻微挪动
-          }
-          acc[k] = rfx; acc[k + 1] = rfy; acc[k + 2] = 0;
+          // 移动由积分分支统一处理（赶路用巡航速度直飞，停稳后才强阻尼），
+          // 这里只负责「该不该继续待着」。
+          acc[k] = 0; acc[k + 1] = 0; acc[k + 2] = 0;
           fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
           fleeing[i] = 0; neighbors[i] = 0;
           let scared = false;
@@ -2449,6 +2520,17 @@
             const q = p * 3;
             const ex = px - predPos[q], ey = py - predPos[q + 1];
             if (ex * ex + ey * ey < safe2) { scared = true; break; }
+          }
+          // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算
+          if (!settled[i] && dd < 1.2 && Math.hypot(vx, vy) < 1.6) {
+            settled[i] = 1;
+            restSince[i] = time;
+            restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN;   // 100~120 秒
+          }
+          // 飞太久还没停稳（草地太挤/一直被挤）就放弃，别一直算作「在路上」
+          if (!settled[i] && time > restApproachUntil[i]) {
+            endRest(i, time, false);
+            continue;
           }
           if (scared || time >= restUntil[i] || !params.grassOn) {
             endRest(i, time, scared);
@@ -2652,6 +2734,33 @@
         if (px < -hx + m) fx += (-hx + m - px) * 2.2;
         if (py > hy - m) fy -= (py - (hy - m)) * 2.2;
         if (py < -hy + m) fy += (-hy + m - py) * 2.2;
+        // 绕开草地：不休息的鸟会主动沿着草地边缘滑过去，而不是直接从草地上方穿过去。
+        // 做法是「法向推开 + 沿当前运动方向的切向」——只推法向的话看起来像撞到墙弹开。
+        if (params.grassOn && grass.length) {
+          for (let g = 0; g < grass.length; g++) {
+            const gp = grass[g];
+            const gdx = px - gp.x, gdy = py - gp.y;
+            const gd2 = gdx * gdx + gdy * gdy;
+            const reach = gp.R * 1.3 + 7;
+            if (gd2 > reach * reach) continue;
+            const gd = Math.sqrt(gd2) || 1e-4;
+            const th = Math.atan2(gdy, gdx);
+            const rr = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2));
+            const nx = gdx / gd, ny = gdy / gd;
+            if (gd < rr) {
+              // 已经压在草地上（比如刚起飞）：先往外推，力度随深入程度加大
+              const k = Math.min(1, (rr - gd) / Math.max(1, rr * 0.5));
+              fx += nx * (10 + 14 * k); fy += ny * (10 + 14 * k);
+            } else {
+              const w = 1 - (gd - rr) / 7;          // 0~1，越靠近边缘越强
+              if (w <= 0) continue;
+              const tx2 = -ny, ty2 = nx;
+              const sgn = (vx * tx2 + vy * ty2) >= 0 ? 1 : -1;   // 往自己正在走的那一侧绕
+              fx += (nx * 9 + tx2 * sgn * 7) * w;
+              fy += (ny * 9 + ty2 * sgn * 7) * w;
+            }
+          }
+        }
         fx += Math.sin(py * 0.11 + flowT) * params.flow;
         fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
         // 个体游走：每只鸟带一条缓慢漂移的私人航向。邻居越多，群体把它「稳住」的力度越大，
@@ -2682,13 +2791,26 @@
         if (caught[i]) continue;
         const k = i * 3;
         if (resting[i]) {
-          // 停在草地上：强阻尼把速度收到 0 附近（不适用最低速度与边界反弹）
-          const damp = Math.exp(-dt / 0.4);
-          const rvx = (vel[k] + acc[k] * dt) * damp;
-          const rvy = (vel[k + 1] + acc[k + 1] * dt) * damp;
-          vel[k] = rvx; vel[k + 1] = rvy; vel[k + 2] = 0;
-          pos[k] += rvx * dt; pos[k + 1] += rvy * dt;
-          const rsp = Math.hypot(rvx, rvy);
+          if (!settled[i]) {
+            // 赶路：朝落点直飞，速度随剩余距离收敛（远处接近巡航速度，近处慢慢落）
+            const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
+            const dx = tx - pos[k], dy = ty - pos[k + 1];
+            const dd = Math.hypot(dx, dy) || 1e-4;
+            const want = Math.min(paceSpeed, Math.max(1.1, dd * 2.2));
+            const wx = dx / dd * want, wy = dy / dd * want;
+            const kk = 1 - Math.exp(-dt / 0.10);
+            vel[k] += (wx - vel[k]) * kk;
+            vel[k + 1] += (wy - vel[k + 1]) * kk;
+            vel[k + 2] = 0;
+          } else {
+            // 停稳：强阻尼把速度收到 0 附近（不适用最低速度与边界反弹）
+            const damp = Math.exp(-dt / 0.4);
+            vel[k] = (vel[k] + acc[k] * dt) * damp;
+            vel[k + 1] = (vel[k + 1] + acc[k + 1] * dt) * damp;
+            vel[k + 2] = 0;
+          }
+          pos[k] += vel[k] * dt; pos[k + 1] += vel[k + 1] * dt;
+          const rsp = Math.hypot(vel[k], vel[k + 1]);
           speedSum += rsp; keSum += 0.5 * rsp * rsp;
           continue;
         }
@@ -2796,7 +2918,7 @@
       let spread = 0, restN = 0;
       for (let i = 0; i < n; i++) {
         if (caught[i]) continue;
-        if (resting[i]) restN++;
+        if (settled[i]) restN++;
         const k = i * 3;
         // 参考点必须是用质心（cx 此时还是坐标总和，需要除以 aliveN），
         // 之前直接用总和对减，算出来的半径大了一个数量级，相干度永远是 0。
@@ -2861,7 +2983,10 @@
         const k = i * 3;
         const local = Math.min(1, neighbors[i] / 24);
         const speedRatio = Math.min(1, Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed);
-        tmpColor.setHSL(0.52 + local * 0.40, 0.95, 0.46 + speedRatio * 0.22);
+        // 落在草地上的鸟换一身「苔绿」：和飞行中的青蓝—紫渐变色系一眼分开，
+        // 又不至于像新生个体的亮绿那样抢眼。
+        if (settled[i]) tmpColor.setHSL(0.36 + local * 0.04, 0.52, 0.46);
+        else tmpColor.setHSL(0.52 + local * 0.40, 0.95, 0.46 + speedRatio * 0.22);
         let size = params.arrowSize + local * 0.10;
         // 新生个体：亮绿色 + 轻微脉冲，1.8s 后开始渐变为普通色，3.2s 后完全一致。
         const age = now - birthAt[i];
@@ -2879,7 +3004,7 @@
         }
         // 停在草地上时把渲染速度固定成一个私人朝向：否则速度归零后
         // atan(0,0)=0，整片鸟会齐刷刷指向右边，看着很假。
-        if (resting[i]) {
+        if (settled[i]) {
           rVel[k] = Math.cos(wAng[i]); rVel[k + 1] = Math.sin(wAng[i]); rVel[k + 2] = 0;
         }
         // 爆发中：不换成另一种颜色（原来抹成黄色，和冷色调的群体完全打架），
@@ -3191,14 +3316,39 @@
       get sprintingCount() { return sprintingCount; },
       get trailCount() { return trailGeo.instanceCount; },
       get restingCount() { return restingCount; },
+      get grassRest() {
+        let traveling = 0, still = 0;
+        for (let i = 0; i < activeCount; i++) {
+          if (caught[i]) continue;
+          if (settled[i]) still++;
+          else if (resting[i]) traveling++;
+        }
+        return { traveling, settled: still };
+      },
       get grassInfo() {
         return grass.map((g) => ({ x: +g.x.toFixed(1), y: +g.y.toFixed(1), R: +g.R.toFixed(1), area: Math.round(g.area), cap: g.cap, count: g.count }));
       },
-      // 草地总面积占屏幕的比例（应为 0.111 ≈ 1/9）
+      // 正在「飞越草地」的个体数（不含休息中的）：用来验证绕行是否生效
+      get flyingOverGrass() {
+        let n = 0;
+        for (let i = 0; i < activeCount; i++) {
+          if (resting[i] || caught[i]) continue;
+          const x = pos[i * 3], y = pos[i * 3 + 1];
+          for (const gp of grass) {
+            const dx = x - gp.x, dy = y - gp.y;
+            const th = Math.atan2(dy, dx);
+            const rr = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2));
+            if (Math.hypot(dx, dy) < rr * 0.96) { n++; break; }
+          }
+        }
+        return n;
+      },
+      // 草地「落在场地内」的总面积占屏幕的比例（目标 0.15，实测口径）
       get grassRatio() {
         if (!grass.length) return 0;
         const bd = bounds2D();
-        return +(grass.reduce((a, g) => a + g.area, 0) / (2 * bd.hx * 2 * bd.hy)).toFixed(3);
+        const sum = grass.reduce((a, g) => a + inFieldArea(g, g.R, bd, 900), 0);
+        return +(sum / (2 * bd.hx * 2 * bd.hy)).toFixed(3);
       },
       get maxTrailSpan() {
         let m = 0;
