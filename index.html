@@ -260,7 +260,7 @@
       <span class="card-title">实时状态</span><span class="chev">▾</span>
     </button>
     <div class="card-body">
-      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">300</span> <span style="color:#ff8a5c">◆<span id="hPred">0</span></span></span></div>
+      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">300</span> <span style="color:#ff8a5c">◆<span id="hPred">1</span></span></span></div>
       <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
       <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
       <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
@@ -287,7 +287,7 @@
         每个箭头只遵循三条规则：<em>分离</em>、<em>对齐</em>、<em>聚合</em>，箭头朝向就是它的运动方向。<br />
         群体温度 T 由平均动能给出，气压 P = ρT：<em>音高 ∝ √T</em>（理想气体声速关系），<em>音量与滤波亮度由 P 决定</em>。<br />
         P 越阈值触发<em>泛音列上行琶音</em>，碰撞按<em>接近冲量</em>触发打击音，均有冷却保护。<br />
-        右侧控制台可开启<em>捕食者</em>：橙红箭头锁定目标并预判拦截，群体预测逃逸并沿邻居传递警报；捕获瞬间有冲击闪光与音效，新生个体以亮绿色标注，几秒后渐变为普通色。
+        默认有 1 只<em>捕食者</em>：橙红色鲨鱼剪影锁定目标并预判拦截，鱼群会整体绕开、预测逃逸并沿邻居传递警报；捕获瞬间有冲击闪光与音效，新生个体以亮绿色标注，几秒后渐变为普通色。
       </p>
       <button id="startBtn">开启声音并进入</button>
       <div class="foot">右上角小图标开关声音 / 一键隐藏界面 · 各卡片标题可折叠 · 邻域用空间哈希查询</div>
@@ -357,8 +357,8 @@
       flow: 1.3,
       maxSpeed: 9.0,
       minSpeed: 2.2,
-      boundary: 20,
-      arrowSize: 0.42,
+      boundary: 35,
+      arrowSize: 0.2,
       thermalRef: 5.0,
       pressureThreshold: 0.20,
       impulseThreshold: 0.08,
@@ -366,10 +366,10 @@
       enabled: false,
       paused: false,
       // 捕食者：标准 Reynolds pursuit + 预测逃逸模型
-      predatorOn: false,
+      predatorOn: true,
       predatorCount: 1,
       fleeWeight: 2.6,
-      fleeRange: 8.0,
+      fleeRange: 7.0,
       predict: 0.6,
       chaseWeight: 1.5,
       predSpeed: 13.2,
@@ -433,6 +433,10 @@
     const BURST_MS = 760;                           // 捕杀冲击波动画时长
 
     let density = 0, avgSpeed = 0, avgNeighbors = 0;
+    // 上一帧鱼群质心：用于群体级躲避，让整群像鱼群一样一起绕开捕食者。
+    let groupX = 0, groupY = 0, groupZ = 0;
+    // 群体惊吓波纹：捕食者进入范围时整群一起闪避一次，随后恢复群聚，不会永远逃跑。
+    let groupThreatAt = -Infinity, groupWasThreat = false;
     let temperature = 0, pressure = 0, collisionImpulse = 0;
     let collisionFlash = 0, arpFlash = 0, predFlash = 0, predCatches = 0;
 
@@ -806,6 +810,48 @@
     predGeo.instanceCount = activeP;
     const predMat = arrowMat.clone();
     predMat.uniforms.uMaxSpeed.value = params.predSpeed;
+    // 鲨鱼剪影：尖吻躯干 + 背鳍 + 分叉尾 + 胸鳍，实心填充 + 边缘辉光 + 亮眼。
+    // 猎物仍是细箭头，两者形态差异足够大，一眼就能分辨捕食者。
+    predMat.fragmentShader = `
+      varying vec2 vLocal;
+      varying vec3 vColor;
+      varying float vSpeed;
+      varying float vFade;
+      float sdTri(vec2 p, vec2 a, vec2 b, vec2 c) {
+        vec2 e0 = b - a, e1 = c - b, e2 = a - c;
+        vec2 v0 = p - a, v1 = p - b, v2 = p - c;
+        vec2 q0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+        vec2 q1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+        vec2 q2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+        float s = sign(e0.x * e2.y - e0.y * e2.x);
+        vec2 d = min(min(vec2(dot(q0, q0), s * (v0.x * e0.y - v0.y * e0.x)),
+                         vec2(dot(q1, q1), s * (v1.x * e1.y - v1.y * e1.x))),
+                     vec2(dot(q2, q2), s * (v2.x * e2.y - v2.y * e2.x)));
+        return -sqrt(d.x) * sign(d.y);
+      }
+      void main() {
+        vec2 p = vLocal;
+        float body = (length((p - vec2(0.02, 0.0)) / vec2(0.86, 0.34)) - 1.0) * 0.30;
+        float snout = sdTri(p, vec2(0.48, 0.17), vec2(1.06, 0.0), vec2(0.48, -0.17));
+        float dorsal = sdTri(p, vec2(-0.16, 0.24), vec2(0.06, 0.62), vec2(0.26, 0.20));
+        float tail = min(
+          sdTri(p, vec2(-0.70, 0.05), vec2(-1.06, 0.46), vec2(-0.90, -0.02)),
+          sdTri(p, vec2(-0.70, -0.05), vec2(-1.06, -0.46), vec2(-0.90, 0.02))
+        );
+        float fin = sdTri(p, vec2(0.20, -0.16), vec2(-0.20, -0.46), vec2(-0.04, -0.12));
+        float d = min(min(min(body, snout), dorsal), min(tail, fin));
+        float fill = 1.0 - smoothstep(0.0, 0.045, d);
+        float glow = exp(-max(d, 0.0) * 7.0) * 0.42;
+        float a = clamp(fill + glow, 0.0, 1.0) * vFade;
+        if (a < 0.004) discard;
+        vec3 c = vColor * (0.95 + 0.45 * vSpeed) * (fill * 0.95 + glow * 0.6);
+        float eye = 1.0 - smoothstep(0.025, 0.055, length(p - vec2(0.45, 0.09)));
+        c = mix(c, vec3(1.0, 0.98, 0.82), eye * 0.9);
+        gl_FragColor = vec4(c, a);
+        #include <colorspace_fragment>
+      }
+    `;
+    predMat.needsUpdate = true;
     let predMesh = new THREE.Mesh(predGeo, predMat);
     predMesh.frustumCulled = false;
     predMesh.visible = params.predatorOn;
@@ -825,7 +871,7 @@
       threatRings.push(ring);
       scene.add(ring);
       predCol[p * 3] = 1.0; predCol[p * 3 + 1] = 0.40; predCol[p * 3 + 2] = 0.16;
-      predSiz[p] = params.arrowSize * 2.2;
+      predSiz[p] = Math.max(4.5, params.arrowSize * 24);
     }
 
     // 捕杀冲击波：外圈 + 亮核，池化复用；2D/3D 都用相机朝向做 billboard。
@@ -877,6 +923,7 @@
         this.arpArmed = true;
         this.f0 = 55;
         this.muted = false;
+        this.outputConnected = false;
       }
 
       async enable() {
@@ -888,6 +935,7 @@
           this.master = ctx.createGain();
           this.master.gain.value = params.master;
           this.master.connect(ctx.destination);
+          this.outputConnected = true;
 
           const filter = this.filter = ctx.createBiquadFilter();
           filter.type = 'lowpass';
@@ -936,16 +984,24 @@
         btn.setAttribute('aria-label', label);
       }
 
-      // 真正的总静音：主增益立即归零 + 暂停整个 AudioContext。
-      // 仅靠 setTargetAtTime(0) 会有短暂残余，且琶音仍会调度节点；暂停后所有声源彻底停摆。
+      // 彻底静音：增益归零 + 断开主输出 + 暂停整个 AudioContext。
+      // 只把增益降到 0 仍可能让已排队的碰撞/琶音节点漏出残响，所以必须同时断开到 destination 的连接。
       setMuted(m) {
         this.muted = m;
         if (this.master) {
           const t = this.ctx.currentTime;
           this.master.gain.cancelScheduledValues(t);
-          // 直接赋值，避免 suspend 时音频线程还没处理 setValueAtTime 而读到旧增益。
           this.master.gain.value = m ? 0 : params.master;
+          if (m) {
+            this.master.disconnect();
+            this.outputConnected = false;
+          } else {
+            this.master.disconnect();
+            this.master.connect(this.ctx.destination);
+            this.outputConnected = true;
+          }
         }
+        if (this.droneGain && m) this.droneGain.gain.value = 0;
         if (this.ctx) {
           if (m) this.ctx.suspend().catch(() => {});
           else this.ctx.resume().catch(() => {});
@@ -1175,16 +1231,16 @@
       '开启捕食者｜打开后出现橙红色大箭头追杀鸟群；鸟会逃逸，危险时会短时爆发加速。');
     tip(fPred.add(params, 'predatorCount', 1, MAX_P, 1).name('捕食者数量').onChange(setPredCount),
       '捕食者数量｜调多：鸟群压力更大、逃生更混乱。调少（推荐 1 只）：更容易看清追击、爆发和捕杀动画。');
-    tip(fPred.add(params, 'predSpeed', 2, 30, 0.1).name('捕食者速度').onChange((v) => {
+    tip(fPred.add(params, 'predSpeed', 2, 36, 0.1).name('捕食者速度').onChange((v) => {
       predMat.uniforms.uMaxSpeed.value = v;
     }),
       '捕食者速度｜调大：追得更快、更容易抓到鸟（捕获间隔变短）。调小：鸟更容易逃掉。');
     tip(fPred.add(params, 'chaseWeight', 0, 4, 0.05).name('追击力度'),
       '追击力度｜调大：捕食者拐弯追得更凶、咬得更紧；太大急转会不自然。');
     tip(fPred.add(params, 'fleeRange', 3, 24, 0.5).name('危险感知距离'),
-      '危险感知距离｜鸟在多远开始害怕。调大：整群很早就四散。调小：捕食者贴脸才逃，容易被抓。');
+      '危险感知距离｜鱼群在多远开始察觉捕食者。调大：整群提前绕开，几乎不会被逼近。调小：捕食者贴脸才逃，容易被抓。');
     tip(fPred.add(params, 'fleeWeight', 0, 6, 0.05).name('逃跑力度'),
-      '逃跑力度｜调大：鸟逃得更拼命、散得更开。太大会盖过群聚，鸟群不再成形。');
+      '逃跑力度｜调大：个体和整群都逃得更拼命，鱼群会更整齐地绕开捕食者。太大会盖过群聚，队形散掉。');
     tip(fPred.add(params, 'sprintFactor', 1, 2.5, 0.05).name('爆发速度倍率'),
       '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
     tip(fPred.add(params, 'sprintDuration', 0.2, 3, 0.1).name('爆发持续(秒)'),
@@ -1194,13 +1250,6 @@
     tip(fPred.add(params, 'infoCascade').name('警报传递'),
       '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
     fPred.open();
-
-    const fSound = gui.addFolder('声音');
-    tip(fSound.add(params, 'master', 0, 1, 0.01).name('总音量').onChange((v) => audio.setMaster(v)),
-      '总音量｜整体声音大小。设 0 相当于静音；右上角小图标可以彻底关闭所有音效。');
-    tip(fSound.add({ toggle: () => document.getElementById('audioBtn').click() }, 'toggle').name('开关声音'),
-      '开关声音｜效果和右上角小图标相同：关闭后持续音、琶音、碰撞声、捕杀声全部静音。');
-    fSound.open();
 
     const fScene = gui.addFolder('场景');
     dimCtrl = tip(fScene.add(params, 'dim2D').name('二维平面模式').onChange((v) => setMode2D(v)),
@@ -1216,12 +1265,6 @@
     const fAdv = gui.addFolder('高级参数（很少用）');
     tip(fAdv.add(params, 'minSpeed', 0.5, 8, 0.1).name('最低速度'),
       '最低速度｜鸟再慢也不会低于这个值，避免悬停不动。一般不用调。');
-    tip(fAdv.add(params, 'thermalRef', 2, 10, 0.1).name('热速度参考'),
-      '热速度参考｜把鸟群速度折算成声音“温度”的基准。调小：同样速度听起来更热、音高更高。');
-    tip(fAdv.add(params, 'pressureThreshold', 0.05, 0.8, 0.01).name('琶音气压阈值'),
-      '琶音气压阈值｜气压 P=密度×温度 超过它才触发上行琶音。调小：更容易响。调大：更安静。');
-    tip(fAdv.add(params, 'impulseThreshold', 0.01, 0.6, 0.01).name('碰撞冲量阈值'),
-      '碰撞冲量阈值｜碰撞强度超过它才发出打击音。调小：轻微碰撞也响。调大：只有重撞才响。');
     tip(fAdv.add(params, 'predict', 0, 1.5, 0.05).name('预判系数'),
       '预判系数｜鸟逃跑时会朝捕食者未来位置躲。调大：躲得更提前；太大像未卜先知。');
     tip(fAdv.add(params, 'lockTime', 0, 5, 0.1).name('锁定目标(秒)'),
@@ -1257,6 +1300,19 @@
       const sprintSpeed = maxSpeed * params.sprintFactor;
       sprintingCount = 0;
 
+      // 群体惊吓检测：捕食者接近鱼群质心时触发一次波纹，离开后再进入才重新触发。
+      if (P > 0) {
+        let near = false;
+        for (let p = 0; p < P; p++) {
+          const q = p * 3;
+          if (Math.hypot(groupX - predPos[q], groupY - predPos[q + 1], D2 ? 0 : groupZ - predPos[q + 2]) < fleeR * 2.5) {
+            near = true; break;
+          }
+        }
+        if (near && !groupWasThreat) groupThreatAt = time;
+        groupWasThreat = near;
+      } else groupWasThreat = false;
+
       grid.clear();
       for (let i = 0; i < n; i++) {
         const k = i * 3;
@@ -1275,7 +1331,7 @@
 
           // 目标锁定：先沿用旧目标，超出视野或锁定过期才重选最近个体。
           // 每帧改追最近者会让鱼群的「迷惑效应」把捕食者拖死，短期记忆可形成稳定直线追击。
-          const vision2 = Math.pow(Math.max(fleeR * 2.4, 18), 2);
+          const vision2 = Math.pow(Math.max(fleeR * 3, B * 1.3), 2);
           let best = predTarget[p], bestD2 = Infinity;
           if (best >= 0 && best < n) {
             const m = best * 3;
@@ -1529,9 +1585,29 @@
             const mag = params.fleeWeight * w * w * (sprinting ? 1.25 : 1);
             efx += tx * mag; efy += ty * mag; efz += tz * mag;
           }
+          // 群体级躲避：捕食者进入范围时整群沿远离它的方向一起偏航一次（约 1.2 秒波纹），
+          // 随后停止群体推力，让鱼群重新聚合——像真实鱼群遇鲨后散开再合拢，而不是永远四散。
+          const ripple = Math.max(0, 1 - (time - groupThreatAt) / 1200);
+          if (ripple > 0) {
+            for (let p = 0; p < P; p++) {
+              const q = p * 3;
+              const gdx = groupX - predPos[q], gdy = groupY - predPos[q + 1];
+              const gdz = D2 ? 0 : groupZ - predPos[q + 2];
+              const gl = Math.hypot(gdx, gdy, gdz);
+              if (gl < 1e-6) continue;
+              const dx = px - predPos[q], dy = py - predPos[q + 1], dz = pz - predPos[q + 2];
+              const d = Math.hypot(dx, dy, dz);
+              if (d > fleeR * 2.5) continue;
+              const w = Math.max(0, 1 - d / (fleeR * 2.5));
+              const strength = params.fleeWeight * w * ripple * 1.6;
+              efx += gdx / gl * strength;
+              efy += gdy / gl * strength;
+              efz += D2 ? 0 : gdz / gl * strength;
+            }
+          }
           // 信息级联：邻居上一帧的逃逸方向传播过来，形成波状逃逸
           if (params.infoCascade && cascadeCount > 0) {
-            const s = 0.55 / cascadeCount;
+            const s = 0.80 / cascadeCount;
             efx += cfx * s; efy += cfy * s; efz += cfz * s;
           }
           const mag = Math.hypot(efx, efy, efz);
@@ -1571,6 +1647,7 @@
 
         acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = D2 ? 0 : fz;
       }
+      if (n > 0) { groupX = cx / n; groupY = cy / n; groupZ = cz / n; }
 
       let speedSum = 0, keSum = 0;
       for (let i = 0; i < n; i++) {
@@ -1759,7 +1836,7 @@
           ring.visible = true;
           // 扑击瞬间箭头放大脉冲，与冲击波同步。
           const pulse = Math.max(0, 1 - (now - predPulseAt[p]) / 280);
-          predSiz[p] = params.arrowSize * 2.2 * (1 + 0.45 * pulse);
+          predSiz[p] = Math.max(4.5, params.arrowSize * 24) * (1 + 0.45 * pulse);
         }
       } else {
         for (const ring of threatRings) ring.visible = false;
@@ -1886,7 +1963,9 @@
       get muted() { return audio.muted; },
       get audioState() { return audio.ctx ? audio.ctx.state : null; },
       get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
+      get audioOutputConnected() { return audio.outputConnected; },
       get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },
+      get groupCenter() { return { x: +groupX.toFixed(2), y: +groupY.toFixed(2), z: +groupZ.toFixed(2) }; },
       get avgPredDist() {
         if (!params.predatorOn) return 0;
         let sum = 0;
