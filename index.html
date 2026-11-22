@@ -59,11 +59,18 @@
     -webkit-background-clip: text; background-clip: text; color: transparent;
   }
 
-  /* 右上角一排图标按钮：场景操作 + 声音 + 隐藏界面 */
+  /* 右上角一排图标按钮，按「操作频率 + 影响范围」从左到右：
+     暂停 → 重置视角 → 重新初始化 ｜ 隐藏界面 → 声音。
+     左三件改变模拟状态，右两件只改变呈现方式，中间用一条细分隔线分开。 */
   #topbar {
     position: fixed; right: 18px; top: 18px; z-index: 8;
     display: flex; align-items: center; gap: 8px;
   }
+  #topbar .sep {
+    width: 1px; height: 22px; flex: 0 0 1px;
+    background: linear-gradient(180deg, transparent, rgba(99, 230, 255, 0.32), transparent);
+  }
+  body.ui-hidden #topbar .sep { visibility: hidden; }
   .ico {
     width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
     cursor: pointer; color: var(--ink); border-radius: 50%;
@@ -301,6 +308,13 @@
   </button>
 
   <div id="topbar">
+    <button id="pauseBtn" class="ico scene-btn" type="button" title="暂停模拟" aria-label="暂停模拟">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect class="fl pauseIcon" x="7" y="5" width="3.4" height="14" rx="1.2" />
+        <rect class="fl pauseIcon" x="13.6" y="5" width="3.4" height="14" rx="1.2" />
+        <path class="fl playIcon" d="M8 5.4 19 12 8 18.6z" style="display:none" />
+      </svg>
+    </button>
     <button id="viewBtn" class="ico scene-btn" type="button" title="重置视角" aria-label="重置视角">
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path class="st" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
@@ -313,13 +327,8 @@
         <path class="st" d="M20 4v4.2h-4.2" />
       </svg>
     </button>
-    <button id="pauseBtn" class="ico scene-btn" type="button" title="暂停模拟" aria-label="暂停模拟">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <rect class="fl pauseIcon" x="7" y="5" width="3.4" height="14" rx="1.2" />
-        <rect class="fl pauseIcon" x="13.6" y="5" width="3.4" height="14" rx="1.2" />
-        <path class="fl playIcon" d="M8 5.4 19 12 8 18.6z" style="display:none" />
-      </svg>
-    </button>
+
+    <span class="sep" aria-hidden="true"></span>
 
     <button id="uiBtn" class="ico" type="button" title="隐藏所有界面" aria-label="隐藏所有界面">
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -346,6 +355,7 @@
       <ul>
         <li><b>传送门边界</b>撞到边界的鸟有 5% 概率从对侧穿出，出入点关于中心对称。</li>
         <li><b>捕食者</b>锐角三角形，接触即捕食；进食后减速随机巡游。</li>
+        <li><b>两种爆发</b>被逼近时冲刺逃命；掉队太久也会冲刺追赶大部队，共用同一份体力。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
       </ul>
       <p class="about-foot">Three.js · WebGL · 单文件实现</p>
@@ -357,7 +367,7 @@
       <span class="card-title">实时状态</span><span class="chev">▾</span>
     </button>
     <div class="card-body">
-      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">600</span> <span style="color:#ff8a5c">◆<span id="hPred">2</span></span></span></div>
+      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">1000</span> <span style="color:#ff8a5c">◆<span id="hPred">2</span></span></span></div>
       <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
       <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
       <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
@@ -427,12 +437,12 @@
     // ---------------------------------------------------------------- 参数
     // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
     const BOUND = 40;
-    const MAX_N = 1200;
+    const MAX_N = 10000;
     const MAX_P = 10;
 
     // 出厂默认值：只有点击「重新初始化」才会回到这里。
     const DEFAULTS = {
-      count: 600,
+      count: 1000,
       separation: 1.39,
       alignment: 1.35,
       cohesion: 1.16,
@@ -471,7 +481,8 @@
       'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
       'sprintFactor', 'sprintDuration', 'sprintRecovery'
     ];
-    const STORE_KEY = 'flocklab.params.v2';
+    // v3：元素数量上限/默认值改为 10000 / 1000，旧存档里的 600 不再沿用。
+    const STORE_KEY = 'flocklab.params.v3';
     const PARAM_RANGE = {
       count: [50, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
       perception: [1, 14], separationRange: [0.2, 6], flow: [0, 4],
@@ -536,13 +547,23 @@
     const stamina = new Float32Array(MAX_N);
     stamina.fill(1);
     const sprintUntil = new Float64Array(MAX_N);   // 爆发到期时间（ms）
+    const lagSince = new Float64Array(MAX_N);      // 开始「掉队」的时间戳，0 表示没掉队
+
+    // 追赶大部队的判据：离群体质心超过 LAG_DIST_K 倍群体半径、且身边同伴数
+    // 不足平均值的 LAG_LONELY_K，并且连续保持 LAG_HOLD_MS 毫秒才允许起爆——
+    // 这样不会因为一帧的邻域抖动就触发，也不会让整个群体同时冲刺。
+    const LAG_DIST_K = 1.55;
+    const LAG_LONELY_K = 0.55;
+    const LAG_HOLD_MS = 380;
+    let lastCatchupSound = -Infinity;
     // 速度上限本身也做成受加速度限制的状态量：
     // 起步/收速都要经过若干帧，从加速度积分出速度曲线，而不是一帧内跳变。
-    const capNow = new Float32Array(MAX_N);
+    const capNow = new Float32Array(MAX_N);        // 每只鸟当前生效的速度上限（只用于调试采样）
     capNow.fill(params.maxSpeed * 0.78);
-    const PREY_ACCEL = 40;                         // 加速上限（单位/秒²），约 0.35 秒从静止到巡航
-    const PREY_DECEL = 24;                         // 减速更柔和，像滑翔收速
     let sprintCount = 0, sprintingCount = 0;
+    let catchupCount = 0, laggingCount = 0, cohesion01 = 0;   // cohesion01：0=散开 1=紧团
+    // 上一帧的群体半径（RMS），追赶判定用它来区分「掉队」和「在队形内部」
+    let groupRms = 12;
 
     // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
     const predPos = new Float32Array(MAX_P * 3);
@@ -620,6 +641,7 @@
         rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
         birthAt[i] = isBirth ? performance.now() : -Infinity;
         stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
+        lagSince[i] = 0;
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
     }
@@ -654,6 +676,7 @@
       rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
       birthAt[i] = now;
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
+      lagSince[i] = 0;
     }
 
     function initPredators(from, to) {
@@ -680,8 +703,8 @@
       initBoids(0, activeCount);
       initPredators(0, activeP);
       predCatches = 0;
-      sprintCount = 0;
-      caught.fill(0); respawnAt.fill(0);
+      sprintCount = 0; catchupCount = 0;
+      caught.fill(0); respawnAt.fill(0); lagSince.fill(0);
       predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
       clearBursts();
     };
@@ -1363,7 +1386,7 @@
 
     const fMotion = gui.addFolder('飞行与视野');
     bindNum(fMotion, 'count', 50, MAX_N, 10, '元素数量',
-      '元素总数｜调多：画面更壮观、群体感更强，但帧率会下降。调少：更容易看清单只的行为。',
+      '元素总数（默认 1000，上限 10000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域，万级时约 20 FPS 上下）。调少：更容易看清单只的行为。',
       (v) => setCount(v));
     bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
       '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
@@ -1401,9 +1424,9 @@
     bindNum(fPred, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
       '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
     bindNum(fPred, 'sprintDuration', 0.2, 3, 0.1, '爆发持续(秒)',
-      '爆发持续时间｜一次冲刺能维持几秒。调长：逃得更远。调短：更像瞬间闪避。结束后速度回到巡航上限。');
+      '爆发持续时间｜一次冲刺能维持几秒。调长：逃得更远。调短：更像瞬间闪避。结束后速度回到巡航上限。逃命和「掉队追赶」共用这个时长。');
     bindNum(fPred, 'sprintRecovery', 1, 12, 0.5, '体力恢复(秒)',
-      '体力恢复时间｜爆发后要几秒才能再次爆发。调大：几乎不能连续爆发，鸟更容易被抓。调小：可以频繁逃生。');
+      '体力恢复时间｜爆发后要几秒才能再次爆发（逃命和归队追赶共用）。调大：几乎不能连续爆发，鸟更容易被抓、也更容易掉队。调小：可以频繁逃生。');
     bindBool(fPred, 'infoCascade', '警报传递',
       '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
     fPred.open();
@@ -1465,6 +1488,7 @@
       const paceSpeed = maxSpeed * 0.78;
       currentPace = paceSpeed;
       sprintingCount = 0;
+      laggingCount = 0;
 
       // 群体惊吓检测：捕食者接近鱼群质心时触发一次波纹，离开后再进入才重新触发。
       if (P > 0) {
@@ -1636,9 +1660,11 @@
         const k = i * 3;
         const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
         let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
-        // 安全时按群体节奏控速；受惊或爆发时恢复满速规则。
-        const calm = !fleeing[i] && time >= sprintUntil[i];
-        const desiredSpeed = calm ? paceSpeed : maxSpeed;
+        // 安全时按群体节奏控速；受惊时恢复满速；爆发（逃命或归队）时直接用爆发速度作为
+        // 转向目标速度——否则「追赶」只会把速度上限抬高，方向却仍按巡航速度算，容易冲过头。
+        const isDashing = time < sprintUntil[i];
+        const calm = !fleeing[i] && !isDashing;
+        const desiredSpeed = isDashing ? sprintSpeed : (calm ? paceSpeed : maxSpeed);
         let count = 0;
         let sx = 0, sy = 0, sz = 0;
         let ax = 0, ay = 0, az = 0;
@@ -1731,8 +1757,7 @@
             stamina[i] = 0;
             sprintCount++;
             audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
-            // 不再瞬间拉满速度：爆发只提高「速度上限」，实际提速由下方
-            // 受加速度限制的 capNow 逐帧积分，形成可见的加速曲线。
+            // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
           }
           sprinting = time < sprintUntil[i];
 
@@ -1798,6 +1823,36 @@
           fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
           fleeing[i] = 0;
         }
+
+        // ---- 追赶大部队：没有威胁、但被队伍甩下时，同样允许一次爆发 ----
+        // 触发条件与「被追」共用同一套体力/冷却（stamina、sprintUntil、sprintDuration），
+        // 所以爆发时长、倍率、恢复时间完全一致，只是动机从「逃命」换成「归队」。
+        // 判据强调「真的掉队」：离质心超过 1.55 倍群体半径，且身边同伴数不到平均的 55%，
+        // 还要连续保持 380ms——避免队形正常呼吸就把全群点燃。
+        if (!sprinting && stamina[i] >= 1 && time >= sprintUntil[i]) {
+          const gdx = px - groupX, gdy = py - groupY;
+          const lonely = count < Math.max(3, avgNeighbors * LAG_LONELY_K);
+          if (lonely && gdx * gdx + gdy * gdy > (groupRms * LAG_DIST_K) * (groupRms * LAG_DIST_K)) {
+            laggingCount++;
+            if (lagSince[i] === 0) lagSince[i] = time;
+            else if (time - lagSince[i] >= LAG_HOLD_MS) {
+              sprintUntil[i] = time + params.sprintDuration * 1000;
+              stamina[i] = 0;
+              catchupCount++;   // 归队爆发单独计数，sprintCount 仍只统计「被追逃命」
+              // 归队爆发比逃命爆发更轻、更稀：只偶尔出声，避免大群同时冲刺时糊成一片嗡嗡声。
+              if (time - lastCatchupSound > 600 && Math.random() < 0.12) {
+                lastCatchupSound = time;
+                audio.sprint(0.22);
+              }
+            }
+          } else {
+            lagSince[i] = 0;
+          }
+        } else if (sprinting || stamina[i] < 1) {
+          lagSince[i] = 0;
+        }
+
+        sprinting = time < sprintUntil[i];
         if (sprinting) sprintingCount++;
         else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
 
@@ -1821,19 +1876,12 @@
         let vy = vel[k + 1] + acc[k + 1] * dt;
         let sp = Math.hypot(vx, vy);
         const sprinting = time < sprintUntil[i];
-        // 目标速度：爆发 > 受惊 > 巡航节奏。速度上限本身按加速度积分变化，
-        // 因此起爆与收速都是平滑曲线，不会在一帧内突然变快或变慢。
+        // 速度上限：爆发 > 受惊 > 巡航节奏，直接取目标值（不做加速度积分），
+        // 起爆即可提速、威胁解除即刻降到巡航。
         const capTarget = sprinting ? sprintSpeed : (fleeing[i] ? maxSpeed : paceSpeed);
-        const dCap = capTarget - capNow[i];
-        const capStep = (dCap > 0 ? PREY_ACCEL : PREY_DECEL) * dt;
-        capNow[i] += Math.max(-capStep, Math.min(capStep, dCap));
-        const cap = Math.max(params.minSpeed, Math.min(sprintSpeed, capNow[i]));
+        const cap = Math.max(params.minSpeed, Math.min(sprintSpeed, capTarget));
+        capNow[i] = cap;   // 仅作为调试采样保留
         if (sp > cap) { const q = cap / sp; vx *= q; vy *= q; sp = cap; }
-        else if (sp < cap && sp > 1e-4) {
-          // 速度不足时也按加速度上限追上去：起步是斜坡，而不是一帧拉满
-          const ns = Math.min(cap, sp + PREY_ACCEL * dt);
-          const q = ns / sp; vx *= q; vy *= q; sp = ns;
-        }
         else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; sp = params.minSpeed; }
         vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = 0;
         speedSum += sp;
@@ -1888,7 +1936,7 @@
             caught[i] = 1;
             respawnAt[i] = time + 1000;   // 1 秒后重新出生
             birthAt[i] = -Infinity;
-            stamina[i] = 0; sprintUntil[i] = 0;
+            stamina[i] = 0; sprintUntil[i] = 0; lagSince[i] = 0;
             break;
           }
         }
@@ -1908,14 +1956,20 @@
       for (let i = 0; i < n; i++) {
         if (caught[i]) continue;
         const k = i * 3;
-        const dx = pos[k] - cx, dy = pos[k + 1] - cy;
+        // 参考点必须是用质心（cx 此时还是坐标总和，需要除以 aliveN），
+        // 之前直接用总和对减，算出来的半径大了一个数量级，相干度永远是 0。
+        const dx = pos[k] - groupX, dy = pos[k + 1] - groupY;
         spread += dx * dx + dy * dy;
       }
 
       // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
       avgNeighbors = sumNeighbors / aliveN;
       const neighborDensity = Math.min(1, avgNeighbors / 45);
-      const coherence = Math.max(0, 1 - Math.sqrt(spread / aliveN) / (B * 0.62));
+      // 群体半径（RMS）：既用于相干度，也用于「掉队」判定（追赶爆发）。
+      groupRms = Math.max(0.5, Math.sqrt(spread / aliveN));
+      // 半径尺度取「整屏对角的一半」左右，让紧团≈1、铺满全屏≈0，指标才有分辨力。
+      const coherence = Math.max(0, Math.min(1, 1 - groupRms / (B * 1.15)));
+      cohesion01 = coherence;
       density = Math.min(1, neighborDensity * 0.72 + coherence * 0.28);
       avgSpeed = speedSum / aliveN;
       const vRef = THERMAL_REF;
@@ -2191,6 +2245,13 @@
         return sum / activeCount;
       },
       get density() { return density; },
+      get cohesion() { return +cohesion01.toFixed(3); },
+      get groupRms() { return +groupRms.toFixed(2); },
+      get laggingCount() { return laggingCount; },
+      get catchupCount() { return catchupCount; },
+      get laggingFlags() {
+        return Array.from({ length: activeCount }, (_, i) => (lagSince[i] > 0 ? 1 : 0));
+      },
       get temperature() { return temperature; },
       get pressure() { return pressure; },
       get impulse() { return collisionImpulse; },
