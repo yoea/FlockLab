@@ -114,6 +114,13 @@
   /* 隐藏全部界面后，小眼睛自身也会淡出；晃动鼠标或按键再显现 */
   #uiBtn.faded { opacity: 0; pointer-events: none; }
 
+  /* 进入主页先沉浸：连图钉钉住的状态卡、小眼睛一起隐藏，画面里只有模拟。
+     任意一次交互后由 main.js 移除该 class，完整界面随即出现；刷新会重新沉浸。 */
+  body.ui-immersive #brand,
+  body.ui-immersive #hud,
+  body.ui-immersive #topbar,
+  body.ui-immersive .lil-gui.root { display: none !important; }
+
   /* 演示模式：只保留「小眼睛」，其余界面全部隐藏。
      场景按钮与声音用 visibility 隐藏，保留占位，避免小眼睛位置跳动。 */
   body.ui-hidden #brand,

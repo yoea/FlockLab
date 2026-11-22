@@ -55,11 +55,11 @@ const MAX_P = 10;
 
 // 出厂默认值：只有点击「重新初始化」才会回到这里。
 const DEFAULTS = {
-  count: 1000,
+  count: 800,
   separation: 2.3,
-  alignment: 2.44,
+  alignment: 1.8,
   cohesion: 1.16,
-  perception: 14,
+  perception: 7,
   separationRange: 1.9,
   flow: 2.05,
   maxSpeed: 15,
@@ -82,10 +82,10 @@ const DEFAULTS = {
   sprintFactor: 1.7,
   sprintDuration: 1.0,
   sprintRecovery: 3.0,
-  // 音量统一用 0~100 的百分比刻度（内部再换算成增益）：
-  // 默认音乐 30%（能听见但不会压住画面），音效 100%（与旧版 1.0 增益等价）。
-  musicLevel: 30,
-  fxLevel: 100,
+  // 音量直接就是增益（0~1.5，1.0 为标准响度），面板上看到的数字就是它：
+  // 默认音乐 0.4（能听见但不会压住画面），音效 1.0。
+  musicLevel: 0.4,
+  fxLevel: 1.0,
   // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
   grassOn: true
 };
@@ -101,9 +101,9 @@ const PERSIST_KEYS = [
   'sprintFactor', 'sprintDuration', 'sprintRecovery',
   'musicLevel', 'fxLevel', 'grassOn'
 ];
-// v5：出厂默认值改为 巡航 15 / 捕食者 25 / 音乐 30%，并把音量刻度统一成百分比，
-// 旧存档不再沿用，只有点「重新初始化」或首次访问才会拿到这组新默认值。
-const STORE_KEY = 'flocklab.params.v5';
+// v6：出厂默认值改为 对齐 1.8 / 视野 7 / 元素 800，音乐音量改回 0~1.5 增益刻度（默认 0.4）；
+// 音量刻度与默认值都变了，旧存档不能沿用，否则刷新后仍是旧数值。
+const STORE_KEY = 'flocklab.params.v6';
 const PARAM_RANGE = {
   count: [10, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
   perception: [1, 14], separationRange: [0.2, 6], flow: [0, 4],
@@ -112,7 +112,7 @@ const PARAM_RANGE = {
   predict: [0, 1.5], chaseWeight: [0, 4], predSpeed: [2, 36],
   lockTime: [0, 5], feedCooldown: [0.3, 60],
   sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12],
-  musicLevel: [0, 100], fxLevel: [0, 150]
+  musicLevel: [0, 1.5], fxLevel: [0, 1.5]
 };
 const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function loadParams() {
@@ -218,10 +218,11 @@ const REST_NUDGE_MIN = 0.45, REST_NUDGE_MAX = 1.25;
 // 软错峰：每帧最多放行 2 只鸟「出发去草地」、1 只鸟「站定」。
 // 不取消需求也不减少总次数，只把成群的同步动作摊成一条细流。
 const REST_START_SOFT_CAP = 2, REST_SETTLE_SOFT_CAP = 1;
-// 边界通行判定：靠近墙时先掷一次骰子决定「这次当墙不存在」还是「提前避开」。
-// 只有掷中的人才真的会穿出去，其余会提前转弯，所以不会贴着墙反复撞。
+// 边界通行判定：靠近墙时先掷一次骰子决定「这次当墙不存在」还是「贴边掉头」。
+// 只有掷中的人才真的会穿出去，其余会一直飞到边界旁再拐弯，不提前造软边界。
 const wallPass = new Uint8Array(MAX_N);             // 1 = 这次撞墙当作没有墙（会穿出去）
 const wallNear = new Uint8Array(MAX_N);             // 是否已进入「靠近墙」的判定区
+const wallTurn = new Float32Array(MAX_N);           // 本次贴边往哪一侧沿墙拐（±1，进判定带时抽）
 // ---------------------------------------------------------------- 个体差异
 // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
 // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
@@ -278,6 +279,7 @@ let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即�
 // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
 const predSpdJit = new Float32Array(MAX_P);
 const predWobble = new Float32Array(MAX_P);
+const predWallTurn = new Float32Array(MAX_P);  // 贴边掉头时往哪一侧沿墙拐（±1）
 const predPrev = new Float32Array(MAX_P * 3);  // 上一帧位置，用于「扫掠」碰撞检测
 
 const MAX_FORCE = 14;
@@ -299,9 +301,9 @@ function segDist2(px, py, ax, ay, bx, by) {
   const qx = ax + dx * t - px, qy = ay + dy * t - py;
   return qx * qx + qy * qy;
 }
-// 传送门：靠近墙时先按 5% 判定该个体本次是否可穿墙；可穿者当墙不存在，
-// 越界后按中心对称从对侧穿出；不可穿者用二次曲线提前绕开，不再弹珠式反弹。
-const PORTAL_P = 0.05;
+// 传送门：靠近墙时先按 10% 判定该个体本次是否可穿墙；可穿者当墙不存在，
+// 越界后按中心对称从对侧穿出；不可穿者一路飞到墙边再急转掉头，不在内侧另造软边界。
+const PORTAL_P = 0.10;
 let teleportCount = 0;
 const PRED_FORCE = 24;
 const PRED_SEP_RANGE2 = 6 * 6;
@@ -410,6 +412,7 @@ function initPredators(from, to) {
     predTrailTail[p * 2] = predPos[k]; predTrailTail[p * 2 + 1] = predPos[k + 1];
     predSpdJit[p] = 0.9 + Math.random() * 0.2;
     predWobble[p] = Math.random() * Math.PI * 2;
+    predWallTurn[p] = Math.random() < 0.5 ? -1 : 1;
   }
 }
 initPredators(0, activeP);
@@ -1256,15 +1259,31 @@ addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAbout(); });
 
 // 演示模式：一次点击隐藏控制台、卡片、提示等所有 UI，只留这个图标用于恢复。
 const uiBtn = document.getElementById('uiBtn');
-uiBtn.addEventListener('click', () => {
-  const hidden = document.body.classList.toggle('ui-hidden');
+function syncUiBtn() {
+  const hidden = document.body.classList.contains('ui-hidden');
   uiBtn.classList.toggle('off', hidden);
   const label = hidden ? '显示所有界面' : '隐藏所有界面';
   uiBtn.title = label;
   uiBtn.setAttribute('aria-label', label);
-  if (hidden) scheduleEyeFade();
+}
+uiBtn.addEventListener('click', () => {
+  document.body.classList.toggle('ui-hidden');
+  syncUiBtn();
+  if (document.body.classList.contains('ui-hidden')) scheduleEyeFade();
   else { clearTimeout(eyeTimer); uiBtn.classList.remove('faded'); }
 });
+syncUiBtn();
+
+// 进入主页先「沉浸」：body 自带 ui-immersive，连小眼睛和图钉钉住的状态卡都不显示，
+// 画面里只有模拟。任意一次真实交互就唤出完整界面；此后不再自动回到沉浸，
+// 隐藏/显示完全交给右下角按钮。每次刷新都会重新沉浸。
+let immersive = document.body.classList.contains('ui-immersive');
+function leaveImmersive() {
+  if (!immersive) return;
+  immersive = false;
+  document.body.classList.remove('ui-immersive');
+  syncUiBtn();
+}
 
 // 闲置自动隐藏：光标 3 秒无操作后消失；演示模式里小眼睛也一样淡出。
 // 晃动鼠标、按键、触摸或滚轮都会立刻恢复，并重新计时。
@@ -1284,16 +1303,17 @@ function wake() {
     scheduleEyeFade();
   }
 }
-addEventListener('mousemove', wake, { passive: true });
-addEventListener('mousedown', wake, { passive: true });
-addEventListener('keydown', wake, { passive: true });
-addEventListener('wheel', wake, { passive: true });
-addEventListener('touchstart', wake, { passive: true });
-addEventListener('pointerdown', wake, { passive: true });
+const onActivity = () => { leaveImmersive(); wake(); };
+addEventListener('mousemove', onActivity, { passive: true });
+addEventListener('mousedown', onActivity, { passive: true });
+addEventListener('keydown', onActivity, { passive: true });
+addEventListener('wheel', onActivity, { passive: true });
+addEventListener('touchstart', onActivity, { passive: true });
+addEventListener('pointerdown', onActivity, { passive: true });
 wake();
 
 // 状态卡「钉住」：钉住后一键隐藏界面时它仍留在屏幕上（CSS 用 :not(.pinned) 排除）。
-// 单独存一个 key，不进参数存档，所以与 v5 参数版本无关；刷新后保持上次选择。
+// 单独存一个 key，不进参数存档，所以与 v6 参数版本无关；刷新后保持上次选择。
 const hudEl = document.getElementById('hud');
 const pinBtn = document.getElementById('pinBtn');
 const PIN_KEY = 'flocklab.hud.pinned';
@@ -1354,7 +1374,7 @@ fRules.open();
 
 const fMotion = gui.addFolder('飞行与视野');
 bindNum(fMotion, 'count', 10, MAX_N, 10, '元素数量',
-  '元素总数（默认 1000，范围 10~3000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域，3000 只时约 30 FPS）。调少：更容易看清单只的行为。',
+  '元素总数（默认 800，范围 10~3000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域，3000 只时约 30 FPS）。调少：更容易看清单只的行为。',
   (v) => setCount(v));
 bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
   '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
@@ -1412,17 +1432,17 @@ fAdv.close();
 
 const fGrass = gui.addFolder('草地');
 bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
-  '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 15%，可以压到边界上）。每只鸟每隔二三十秒必须去一次，挑一片最近、没满的降落，只要没有危险就一直待着（最长 50~60 秒）；被惊到会立刻飞走并重新计时，没待够 5 秒的下次很快会再来。草地上的个体会保持间距、各朝各的方向；有新鸟落下时，已经休息 5~60 秒的老住客有 10% 概率往旁边挪（每只最多挪 2 次）。掠过草地的鸟还有 10% 概率顺势落下来。不休息的鸟会主动绕开草地。关掉后草地隐藏，正在休息的鸟马上起飞。',
+  '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 15%，可以压到边界上）。每只鸟每隔二三十秒必须去一次，挑一片最近、没满的降落，只要没有危险就一直待着（最长 28~60 秒，逐只错开）；被惊到会立刻飞走并重新计时，没待够 5 秒的下次很快会再来。草地上的个体会保持间距、各朝各的方向；有新鸟落下时，已经休息 5~60 秒的老住客有 10% 概率往旁边挪（每只最多挪 2 次）。掠过草地的鸟还有 5%~13%（按个体浮动）概率顺势落下来。不休息的鸟会主动绕开草地。关掉后草地隐藏，正在休息的鸟马上起飞。',
   (v) => { syncGrassVisibility(); if (!v) liftAllResting(); });
 fGrass.open();
 
 const fSound = gui.addFolder('声音');
-bindNum(fSound, 'musicLevel', 0, 100, 1, '音乐音量(%)',
-  '音乐音量｜0~100% 的四层生成式音景总音量，默认 30%。嫌低频嗡嗡就往下调，0 完全关掉音乐（提示音仍保留）。',
+bindNum(fSound, 'musicLevel', 0, 1.5, 0.01, '音乐音量',
+  '音乐音量｜0~1.5 的增益刻度，四层生成式音景总音量，默认 0.4（1.0 为标准响度）。嫌低频嗡嗡就往下调，0 完全关掉音乐（提示音仍保留）。',
   (v) => music.setLevel(v));
-bindNum(fSound, 'fxLevel', 0, 150, 1, '音效音量(%)',
-  '音效音量｜0~150% 的事件提示音音量，100% 为标准响度，与音乐互不影响。',
-  (v) => { if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(v / 100, audio.ctx.currentTime, 0.08); });
+bindNum(fSound, 'fxLevel', 0, 1.5, 0.01, '音效音量',
+  '音效音量｜0~1.5 的增益刻度，事件提示音音量，默认 1.0 为标准响度，与音乐互不影响。',
+  (v) => { if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(v, audio.ctx.currentTime, 0.08); });
 fSound.close();
 
 // 恢复出厂参数：点右下角「重新初始化」才会走到这里，平时刷新都沿用存档。
@@ -1441,7 +1461,7 @@ function applyDefaults() {
   syncGrassVisibility();
   liftAllResting();
   music.setLevel(params.musicLevel);
-  if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel / 100, audio.ctx.currentTime, 0.08);
+  if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel, audio.ctx.currentTime, 0.08);
   for (const [, ctrl] of guiCtrls) ctrl.updateDisplay();
   saveParams();
   resetBoids();
@@ -1628,13 +1648,33 @@ function step(dt, time) {
       ax += (-pvy / vlen) * weave;
       ay += (pvx / vlen) * weave;
 
-      // 软边界：提前 9 个单位开始往回压。捕食者速度高，原来只在 2 个单位内
-      // 才推一把，来不及转弯，会一头撞上去反复弹。
-      const wm = 9;
-      if (ppx > hx - wm) ax -= (ppx - (hx - wm)) * 4.5;
-      if (ppx < -hx + wm) ax += (-hx + wm - ppx) * 4.5;
-      if (ppy > hy - wm) ay -= (ppy - (hy - wm)) * 4.5;
-      if (ppy < -hy + wm) ay += (-hy + wm - ppy) * 4.5;
+      // 贴边掉头：和鸟群一致，只在最后 3.2 个单位介入，不再提前 9 个单位往回压
+      // （那样等于在真边界内侧又造了一条软边界）。捕食者默认 25 的速度很快，
+      // 所以法向修正更强，保证 5~6 帧内把朝外分量折回来并转成沿墙切向。
+      const wm = 3.2;
+      const pspeed = vlen;
+      const psgn = predWallTurn[p] || 1;
+      const pband = (d) => Math.min(1, Math.max(0, d) / wm);
+      if (ppx > hx - wm && pvx > 0) {
+        const s = pband(ppx - (hx - wm));
+        ax -= pvx * (4 + 9 * s) * s + 8 * s;
+        ay += psgn * pspeed * (2 + 5 * s) * s;
+      }
+      if (ppx < -hx + wm && pvx < 0) {
+        const s = pband(-hx + wm - ppx);
+        ax += (-pvx) * (4 + 9 * s) * s + 8 * s;
+        ay += psgn * pspeed * (2 + 5 * s) * s;
+      }
+      if (ppy > hy - wm && pvy > 0) {
+        const s = pband(ppy - (hy - wm));
+        ay -= pvy * (4 + 9 * s) * s + 8 * s;
+        ax += psgn * pspeed * (2 + 5 * s) * s;
+      }
+      if (ppy < -hy + wm && pvy < 0) {
+        const s = pband(-hy + wm - ppy);
+        ay += (-pvy) * (4 + 9 * s) * s + 8 * s;
+        ax += psgn * pspeed * (2 + 5 * s) * s;
+      }
       az = 0;
 
       // 记下这一帧施加的加速度模长：拖尾的长度与显隐都由它决定。
@@ -1966,23 +2006,47 @@ function step(dt, time) {
     else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
 
     // 边界：先判定这次要不要穿墙。
-    //   进入 8 个单位的「判定带」时掷一次骰子：5% 的人这次当作没有墙（飞出去后
-    //   从对侧对称点出现），其余 95% 的人提前 6 个单位就开始往回拐，所以基本撞不到。
-    //   离开 10 个单位后判定重置，下一次靠近再掷。
+    //   进入 8 个单位的「判定带」时只掷一次骰子：10% 这次当作没有墙（越界后
+    //   从中心对称点穿出）；离开 10 个单位才重置，避免贴边徘徊时反复掷。
     const wallM = Math.min(px > 0 ? hx - px : px + hx, py > 0 ? hy - py : py + hy);
     if (!wallNear[i]) {
-      if (wallM < 8) { wallNear[i] = 1; wallPass[i] = Math.random() < PORTAL_P ? 1 : 0; }
+      if (wallM < 8) {
+        wallNear[i] = 1;
+        wallPass[i] = Math.random() < PORTAL_P ? 1 : 0;
+        wallTurn[i] = Math.random() < 0.5 ? -1 : 1;   // 这次贴边往哪一侧拐，避免整群同向
+      }
     } else if (wallM > 10) {
       wallNear[i] = 0; wallPass[i] = 0;
     }
     if (!wallPass[i]) {
-      // 提前 9 个单位开始往回拐，并且用二次曲线——越靠近墙推得越狠，
-      // 这样整群一起往墙冲的时候也拉得住，不会贴着边反复弹。
-      const m = 9;
-      if (px > hx - m) { const d = px - (hx - m); fx -= d * d * 0.9 + d * 3; }
-      if (px < -hx + m) { const d = (-hx + m) - px; fx += d * d * 0.9 + d * 3; }
-      if (py > hy - m) { const d = py - (hy - m); fy -= d * d * 0.9 + d * 3; }
-      if (py < -hy + m) { const d = (-hy + m) - py; fy += d * d * 0.9 + d * 3; }
+      // 贴边掉头：只在最后 2.6 个单位介入，鸟可以一路冲到边界旁。
+      // 关键是「转」而不是「刹」——把朝外的速度分量折回来，同时转成沿墙的切向，
+      // 速率交给后面的限速器保持，所以看到的是一次急转弯，而不是离墙一大截就停住。
+      // 旧版提前 9 个单位用二次曲线猛推，等于在真边界内侧又造了一条软边界。
+      const m = 2.6;
+      const turn = Math.max(4, Math.hypot(vx, vy));   // 用速率做转向幅度，转向过程中不衰减
+      const sgn = wallTurn[i] || 1;
+      const band = (d) => Math.min(1, Math.max(0, d) / m);
+      if (px > hx - m && vx > 0) {
+        const s = band(px - (hx - m));
+        fx -= vx * (3 + 7 * s) * s + (2 + 6 * s) * s;   // 折回法向 + 一点持续内向推力
+        fy += sgn * turn * (3 + 6 * s) * s;              // 转成沿墙切向
+      }
+      if (px < -hx + m && vx < 0) {
+        const s = band((-hx + m) - px);
+        fx += (-vx) * (3 + 7 * s) * s + (2 + 6 * s) * s;
+        fy += sgn * turn * (3 + 6 * s) * s;
+      }
+      if (py > hy - m && vy > 0) {
+        const s = band(py - (hy - m));
+        fy -= vy * (3 + 7 * s) * s + (2 + 6 * s) * s;
+        fx += sgn * turn * (3 + 6 * s) * s;
+      }
+      if (py < -hy + m && vy < 0) {
+        const s = band((-hy + m) - py);
+        fy += (-vy) * (3 + 7 * s) * s + (2 + 6 * s) * s;
+        fx += sgn * turn * (3 + 6 * s) * s;
+      }
     }
     // 绕开草地：不休息的鸟会主动沿着草地边缘滑过去，而不是直接从草地上方穿过去。
     // 做法是「法向推开 + 沿当前运动方向的切向」——只推法向的话看起来像撞到墙弹开。
@@ -2107,7 +2171,8 @@ function step(dt, time) {
 
     pos[k] += vx * dt; pos[k + 1] += vy * dt;
 
-    // 边界：默认弹性反射；每次撞墙都有 5% 概率变成「传送门」——
+    // 边界兜底：上面贴边转向没拉住的少数个体才走这里，弹性反射 + 随机散射；
+    // 进入判定带时掷中的 10% 则变成「传送门」——
     // 从对侧穿出，且出入点关于场地中心对称（左边偏下飞出 → 右边偏上飞进）。
     // 速度方向保持不变，所以刚进场的个体一定是朝场内飞的。
     const outX = pos[k] > hx ? 1 : (pos[k] < -hx ? -1 : 0);
@@ -2854,6 +2919,7 @@ window.FlockLab = {
   get audioOutputConnected() { return audio.outputConnected; },
   get soundEvents() { return { ...audio.total }; },
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
+  get immersive() { return document.body.classList.contains('ui-immersive'); },
   get cursorHidden() { return document.body.classList.contains('cursor-idle'); },
   get eyeFaded() { return uiBtn.classList.contains('faded'); },
   get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },

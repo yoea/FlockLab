@@ -8,7 +8,10 @@
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml" />
 <link rel="stylesheet" href="css/style.css" />
 </head>
-<body>
+<!-- ui-immersive：进入主页先只显示模拟，所有界面都藏起来；
+     任意一次交互后由 main.js 移除，完整界面出现（刷新会重新沉浸）。 -->
+<body class="ui-immersive">
+  <noscript><div style="position:fixed;inset:0;z-index:40;display:grid;place-items:center;background:#05070f;color:#dce9ff;font:14px/1.8 sans-serif;text-align:center">需要启用 JavaScript 才能运行 FlockLab 模拟并显示界面。</div></noscript>
   <div id="scene"></div>
 
   <button id="brand" type="button" title="关于 FlockLab" aria-label="关于 FlockLab">
@@ -75,13 +78,13 @@
       <p class="about-sec">机制一览</p>
       <ul>
         <li><b>随机性</b>每只鸟各有速度系数与缓慢游走；撞墙会随机散射，猛禽也会摆尾。</li>
-        <li><b>传送门边界</b>靠近墙时先按 5% 判定是否可穿过；可穿者当墙不存在、按中心对称从对侧穿出，其余个体用二次曲线提前绕开墙角，不再弹珠式反弹。</li>
+        <li><b>贴边掉头 + 10% 传送门</b>鸟和猛禽都能一路冲到边界旁，只在最后两三个单位才把朝外的速度转成沿墙切向并拐回场内，不会离墙一大截就停住（那等于又造了一条边界）；每次靠近另有 10% 概率判定为可穿墙，可穿者当墙不存在、按中心对称从对侧穿出。</li>
         <li><b>大型猛禽</b>锐角等腰三角形，带扫掠碰撞，接触即捕食；吃到后进入冷却巡游。警戒圈永远在：饱食是暗色圈，捕食阶段是亮色圈。</li>
         <li><b>爆发</b>只有被猛禽逼近时才冲刺逃命（洋红发光 + 渐隐拖尾 + 一串清脆振翅声）；体力耗尽后必须恢复，不能连续爆发。</li>
         <li><b>反应延迟</b>看到猛禽不会立刻爆发：贴身约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像涟漪从捕食者身边扩散开。</li>
         <li><b>草地</b>2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 1 分钟）；落地变苔绿色、彼此保持间距，飞行中的鸟会绕开草地，并有轻微的起降音效。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时几乎无声，抱团后和声变厚、节拍渐起。与提示音共用右下角声音开关。</li>
-        <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。左下角状态卡可折叠，点右上角图钉「钉住」后，一键隐藏界面时它会继续留在屏幕上。</li>
+        <li><b>操作</b>进入页面默认隐藏全部界面、直接显示模拟，动一下鼠标或按任意键即唤出完整界面；刷新会重新沉浸。拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。左下角状态卡可折叠，点右上角图钉「钉住」后，一键隐藏界面时它会继续留在屏幕上（沉浸模式例外）。</li>
       </ul>
       <p class="about-foot">Three.js · WebGL · HTML / CSS / JS / SVG 模块化</p>
     </div>
@@ -127,7 +130,7 @@
       </div>
 
       <div class="hud-foot">
-        <span class="v"><span id="hCount">1000</span> <span class="pred-n">◆<span id="hPred">1</span></span></span>
+        <span class="v"><span id="hCount">800</span> <span class="pred-n">◆<span id="hPred">1</span></span></span>
         <span class="dots"><span class="dot" id="hSprintFx"></span><span class="dot" id="hPredFx"></span><span class="dot" id="hBirthFx"></span></span>
         <span class="v" id="hFps">— FPS</span>
       </div>

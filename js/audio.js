@@ -34,8 +34,8 @@ export class FlockAudio {
       // 音效总线：所有事件音先进这里，再进 master。
       // 这样「音效音量」只影响提示音，不会把音乐一起推大。
       this.fxBus = ctx.createGain();
-      // 面板用 0~150 的百分比刻度，100% 对应单位增益
-      this.fxBus.gain.value = this.p.fxLevel / 100;
+      // 面板刻度直接就是增益：1.0 对应单位响度
+      this.fxBus.gain.value = this.p.fxLevel;
       this.fxBus.connect(this.master);
 
       // 短噪声缓冲：逃逸气流声与被吃掉的咬合声共用
@@ -346,8 +346,8 @@ export class FlockMusic {
     this.nodes = null;
     this.running = false;
     this.bpm = 72;
-    // 面板「音乐音量」是 0~100 的百分比（默认 30），这里换算成 0~1 的增益
-    this.level = Math.max(0, Math.min(100, this.p.musicLevel)) / 100;
+    // 面板「音乐音量」就是增益本身（0~1.5，默认 0.4）
+    this.level = Math.max(0, Math.min(1.5, this.p.musicLevel));
     this.smooth = 0;         // 平滑后的聚集度
     this.applied = -1;       // 上次写入音频参数时的聚集度
     this.tension = 0;        // 受惊程度 → 和声整体下沉半音以内
@@ -444,9 +444,9 @@ export class FlockMusic {
     if (!m) { this.nextTime = ctx.currentTime + 0.08; this.step = 0; }
   }
 
-  // 音乐整体音量（调试接口可实时调：FlockLab.music.setLevel(0~100)，与面板同一刻度）
+  // 音乐整体音量（调试接口可实时调：FlockLab.music.setLevel(0~1.5)，与面板同一刻度）
   setLevel(v) {
-    this.level = Math.max(0, Math.min(100, v)) / 100;
+    this.level = Math.max(0, Math.min(1.5, v));
     if (this.nodes && this.a.ctx && this.running) {
       this.nodes.bus.gain.setTargetAtTime(this.a.muted ? 0 : this.level, this.a.ctx.currentTime, 0.2);
     }
@@ -472,7 +472,7 @@ export class FlockMusic {
   tick() {
     const ctx = this.a.ctx;
     if (!this.running || !ctx || ctx.state !== 'running') return;
-    // 音乐音量拉到 0 时不再排音符，省掉没必要的振荡器创建（默认 30% 会正常演奏）
+    // 音乐音量拉到 0 时不再排音符，省掉没必要的振荡器创建（默认 0.4 会正常演奏）
     if (this.level < 0.001) { this.nextTime = ctx.currentTime + 0.1; return; }
     const eighth = 30 / this.bpm;          // 八分音符时长 = (60/bpm)/2
     const now = ctx.currentTime;
