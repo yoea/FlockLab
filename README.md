@@ -1,6 +1,6 @@
 # FlockLab
 
-二维平面上的 Boids 涌现模拟：1000 个箭头个体只遵循「分离 / 对齐 / 聚合」三条规则，配合捕食者、两种爆发（逃命 / 归队）和程序化音效，观察群体行为如何自发形成。
+二维平面上的 Boids 涌现模拟：1000 个箭头个体只遵循「分离 / 对齐 / 聚合」三条规则，配合捕食者、两种爆发（逃命 / 归队）、程序化音效与随聚集度变化的生成式音乐，观察群体行为如何自发形成。
 
 - 在线体验：<https://show.ewing.top/flocklab/>
 - 单文件实现：全部逻辑在 `index.html` 里，无构建步骤
@@ -17,8 +17,10 @@
 - **进食冷却巡游**：捕食成功后进入冷却，期间不再追击，只以四成速度随机巡游保存体力；冷却时长最多可调到 60 秒。
 - **延迟重生**：被吃掉的个体隐藏 1 秒后再出生，重生点从 32 个候选位置里挑离所有捕食者最远、且离边界留有余量的位置。
 - **事件音效**：只有加速逃逸、被吃掉、新生三类声音，均由 Web Audio 实时合成；爆发音时长随爆发持续时间变化。静音时增益归零、断开输出并挂起音频上下文。
+- **生成式音乐**：四层音景由**聚集度**驱动——① 低频 drone（基音 + 五度 + 低八度，低通随聚集度打开）② 和声 pad（开放五度 → 小三和弦 → 加九度音簇，每两小节换一次，带滞回不会来回跳）③ 低频 pulse（八分音符按聚集度稀疏化，散开时几乎不出声）④ 高音 shimmer（只有抱团到一定程度才出现）。音高全部锁在 A 小调五声音阶里，程序化合成、无采样文件；爆发比例高时和声整体下沉（最多一个半音）。音乐与事件音共用右上角同一个声音开关，默认开启。
 - **界面克制**：左上角只留 LOGO（点击打开「关于」），操作收进右上角图标按钮，顺序为「暂停 → 重置视角 → 重新初始化 ｜ 隐藏界面 → 声音」——左三件改变模拟状态、右两件只改变呈现方式，中间以细分隔线分开，全部带悬浮说明；所有卡片可折叠，可一键隐藏全部 UI；光标与眼睛图标闲置 3 秒自动淡出，晃动鼠标或按键即恢复。
 - **参数持久化**：调过的参数写入 `localStorage`，刷新页面继续沿用；只有点「重新初始化」才恢复出厂默认值。
+- **默认有声**：页面加载即尝试建立音频上下文；浏览器若因自动播放策略挂起，第一次操作（进入模拟、点击、按键）会自动恢复，不需要额外去点声音按钮。
 
 ## 参数默认值
 
@@ -75,5 +77,7 @@ flocklab/
 ```
 
 ## 调试接口
+
+音乐状态可用 `FlockLab.musicState`（`running` / `c` / `tension` / `gain` / `chord` / `pulse` / `shimmer`）读取，音量用 `FlockLab.music.setLevel(0~2)` 实时调。
 
 页面暴露 `window.FlockLab` 便于自动化验证：`params`、`defaults`、`saveParams`、`resetAll`、`setCount`、`setPredCount`、`positions`、`predatorPositions`、`predatorSpeeds`、`predatorCaps`、`predatorCooling`、`capSample`、`catches`、`deadCount`、`respawnDelays`、`catchRadius`、`predShape`、`portalChance`、`teleports`、`cohesion`、`groupRms`、`laggingCount`、`catchupCount`、`laggingFlags`、`soundEvents`、`bound` 等。

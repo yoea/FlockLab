@@ -338,7 +338,7 @@
       </svg>
     </button>
 
-    <button id="audioBtn" class="ico muted" type="button" title="开启声音" aria-label="开启声音">
+    <button id="audioBtn" class="ico muted" type="button" title="开启声音与音乐" aria-label="开启声音与音乐">
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path class="spk" d="M4 9h4l5-4v14l-5-4H4z" />
         <path class="waves" d="M16.5 9.2c1.1 1.1 1.1 4.5 0 5.6M19.4 6.6c2.4 2.8 2.4 8 0 10.8" />
@@ -357,6 +357,7 @@
         <li><b>传送门边界</b>撞到边界的鸟有 1% 概率从对侧穿出，出入点关于中心对称。</li>
         <li><b>捕食者</b>锐角三角形，接触即捕食；进食后减速随机巡游。</li>
         <li><b>两种爆发</b>被逼近时冲刺逃命；掉队太久也会冲刺追赶大部队，共用同一份体力。</li>
+        <li><b>音乐</b>四层生成式音景随聚集度变化：散开时只有低频嗡鸣，抱团后和声变厚、节拍渐起。与提示音共用右上角声音开关。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
       </ul>
       <p class="about-foot">Three.js · WebGL · 单文件实现</p>
@@ -372,6 +373,7 @@
       <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
       <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
       <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
+      <div class="hud-row"><span class="k">音乐 聚集度驱动</span><span class="bar"><i id="hMusicBar"></i></span></div>
       <div class="hud-row"><span class="k">音效 逃逸 / 被吃 / 新生</span><span class="v"><span class="dot" id="hSprintFx"></span><span class="dot" id="hPredFx"></span><span class="dot" id="hBirthFx"></span></span></div>
       <div class="hud-row"><span class="k">爆发中 / 恢复中</span><span class="v" id="hSprint">0 / 0</span></div>
       <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
@@ -382,7 +384,7 @@
     <div class="card glass">
       <h2>FLOCKLAB</h2>
       <p class="sub">二维平面 · 涌现行为 · 交互模拟</p>
-      <p>每个箭头只遵循<em>分离 · 对齐 · 聚合</em>三条规则。开启声音后，加速逃逸、被吃掉与新生时会有提示音。</p>
+      <p>每个箭头只遵循<em>分离 · 对齐 · 聚合</em>三条规则。声音默认开启：加速逃逸、被吃掉与新生时会有提示音，背景音乐的音色会随着鸟群的聚集程度变化。</p>
       <button id="startBtn">进入模拟</button>
     </div>
   </div>
@@ -1106,6 +1108,7 @@
         this.enabled = true;
         this.muted = false;
         params.enabled = true;
+        music.start();          // 音乐跟着声音一起开，默认就是开的
         this.refreshButton();
       }
 
@@ -1113,7 +1116,8 @@
         const btn = document.getElementById('audioBtn');
         const live = this.enabled && !this.muted;
         btn.classList.toggle('live', live);
-        const label = !this.enabled ? '开启声音' : (this.muted ? '声音已关闭，点击开启' : '声音已开启，点击静音');
+        const label = !this.enabled ? '开启声音与音乐'
+          : (this.muted ? '声音与音乐已关闭，点击开启' : '声音与音乐已开启，点击静音');
         btn.title = label;
         btn.setAttribute('aria-label', label);
       }
@@ -1139,6 +1143,7 @@
           if (m) this.ctx.suspend().catch(() => {});
           else this.ctx.resume().catch(() => {});
         }
+        music.mute(m);          // 事件音与音乐共用这一个开关
         this.refreshButton();
       }
 
@@ -1273,13 +1278,263 @@
         }
       }
     }
+    // ---------------------------------------------------------------- 音乐
+    // 四层生成式音景，全部由「聚集度」C 驱动（0 = 铺满全屏，1 = 紧密成团）：
+    //   ① drone   低频嗡鸣：基音 + 五度 + 低八度，低通截止随 C 慢慢打开
+    //   ② pad     和声：开放五度 → 小三和弦 → 加九度音簇，每两小节换一次
+    //   ③ pulse   低频心跳：C 越高越密，散开时几乎不出声
+    //   ④ shimmer 高频泛音点：只有抱团到一定程度才零星出现
+    // 全部程序化合成，没有采样文件；音高固定锁在五声音阶里，所以怎么随机都不会跑调。
+    // 调度用 25ms lookahead 提前排未来一小段，和鸟的数量完全无关（一万只也不多花 CPU）。
+    const PENTA = [0, 3, 5, 7, 10];        // A 小调五声音阶（相对根音的半音数）
+    const MUSIC_ROOT = 110;                // A2
+    const pentaFreq = (deg, oct = 0) => {
+      const i = ((deg % PENTA.length) + PENTA.length) % PENTA.length;
+      const o = Math.floor(deg / PENTA.length) + oct;
+      return MUSIC_ROOT * Math.pow(2, (PENTA[i] + 12 * o) / 12);
+    };
+    // 三档和声（五声音阶的度数索引：0=A 1=C 2=D 3=E 4=G，5 起为高八度）
+    const CHORDS = [[0, 3], [0, 2, 3], [0, 2, 3, 4, 5]];
+
+    class FlockMusic {
+      constructor(audio) {
+        this.a = audio;
+        this.nodes = null;
+        this.running = false;
+        this.bpm = 72;
+        this.level = 1.0;        // 音乐总线音量（调试接口可实时调）
+        this.smooth = 0;         // 平滑后的聚集度
+        this.applied = -1;       // 上次写入音频参数时的聚集度
+        this.tension = 0;        // 受惊程度 → 和声整体下沉半音以内
+        this.nextTime = 0;
+        this.step = 0;
+        this.timer = 0;
+        this.counts = { chord: 0, pulse: 0, shimmer: 0 };
+      }
+
+      // 建图：四层都汇到 bus，bus 再进 audio.master——于是右上角那个声音开关
+      // 一动，事件音和音乐一起静音，不需要第二个开关。
+      build() {
+        const ctx = this.a.ctx;
+        const bus = ctx.createGain();
+        bus.gain.value = 0;
+        bus.connect(this.a.master);
+
+        // 极轻的空间感：短反馈延迟，只给 pad 与 shimmer 送一点
+        const send = ctx.createGain(); send.gain.value = 0.45;
+        const delay = ctx.createDelay(1.2); delay.delayTime.value = 0.36;
+        const fb = ctx.createGain(); fb.gain.value = 0.28;
+        const damp = ctx.createBiquadFilter();
+        damp.type = 'lowpass'; damp.frequency.value = 2400;
+        const wet = ctx.createGain(); wet.gain.value = 0.3;
+        send.connect(delay); delay.connect(damp);
+        damp.connect(fb); fb.connect(delay);
+        damp.connect(wet); wet.connect(bus);
+
+        // ① drone：三个正弦，轻微失谐避免呆板
+        const droneGain = ctx.createGain(); droneGain.gain.value = 0;
+        const droneLp = ctx.createBiquadFilter();
+        droneLp.type = 'lowpass'; droneLp.frequency.value = 200; droneLp.Q.value = 0.9;
+        droneLp.connect(droneGain); droneGain.connect(bus);
+        for (const [f, g, det] of [[55, 0.55, -7], [82.5, 0.32, 6], [110, 0.2, 11]]) {
+          const o = ctx.createOscillator();
+          o.type = 'sine'; o.frequency.value = f; o.detune.value = det;
+          const gg = ctx.createGain(); gg.gain.value = g;
+          o.connect(gg); gg.connect(droneLp); o.start();
+        }
+
+        // ② pad：和弦音簇，长包络互相交叠
+        const padGain = ctx.createGain(); padGain.gain.value = 0;
+        const padLp = ctx.createBiquadFilter();
+        padLp.type = 'lowpass'; padLp.frequency.value = 900; padLp.Q.value = 0.6;
+        padLp.connect(padGain); padGain.connect(bus);
+
+        // ③ pulse：低频短击，唯一有节拍的层
+        const pulseGain = ctx.createGain(); pulseGain.gain.value = 0;
+        pulseGain.connect(bus);
+
+        // ④ shimmer：高音泛音点
+        const shimmerGain = ctx.createGain(); shimmerGain.gain.value = 0;
+        shimmerGain.connect(bus);
+
+        this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, shimmerGain };
+      }
+
+      start() {
+        if (!this.a.enabled || !this.a.ctx || this.running) return;
+        if (!this.nodes) this.build();
+        const ctx = this.a.ctx;
+        this.running = true;
+        this.step = 0;
+        this.chordIdx = 0;
+        this.smooth = 0; this.applied = -1;
+        this.nextTime = ctx.currentTime + 0.12;
+        this.nodes.bus.gain.cancelScheduledValues(ctx.currentTime);
+        this.nodes.bus.gain.setTargetAtTime(this.level, ctx.currentTime, 0.9);
+        if (!this.timer) this.timer = setInterval(() => this.tick(), 25);
+      }
+
+      stop() {
+        this.running = false;
+        if (this.timer) { clearInterval(this.timer); this.timer = 0; }
+        if (this.nodes) this.nodes.bus.gain.setTargetAtTime(0, this.a.ctx.currentTime, 0.12);
+      }
+
+      // 与声音总开关联动：静音时整个音乐总线归零，恢复时把调度指针拉回当前时刻，
+      // 否则会把暂停期间「欠下」的音符一次性补排出来。
+      mute(m) {
+        if (!this.nodes || !this.a.ctx) return;
+        const ctx = this.a.ctx;
+        this.nodes.bus.gain.setTargetAtTime(m ? 0 : this.level, ctx.currentTime, 0.12);
+        if (!m) { this.nextTime = ctx.currentTime + 0.08; this.step = 0; }
+      }
+
+      // 音乐整体音量（调试接口可实时调：FlockLab.music.setLevel(0.6)）
+      setLevel(v) {
+        this.level = Math.max(0, Math.min(2, v));
+        if (this.nodes && this.a.ctx && this.running) {
+          this.nodes.bus.gain.setTargetAtTime(this.a.muted ? 0 : this.level, this.a.ctx.currentTime, 0.2);
+        }
+      }
+
+      // 每帧调一次：把聚集度做一阶低通（约 0.45s），再以 10Hz 左右的频率写进音频参数。
+      // 绝不逐帧直连音高/音量，否则听起来是抖动而不是呼吸。
+      update(C, tension, dt) {
+        if (!this.nodes) return;
+        this.smooth += (C - this.smooth) * (1 - Math.exp(-dt / 0.45));
+        this.tension += (tension - this.tension) * (1 - Math.exp(-dt / 1.4));
+        if (Math.abs(this.smooth - this.applied) < 0.004) return;
+        this.applied = this.smooth;
+        const c = this.smooth, n = this.nodes, ctx = this.a.ctx, t = ctx.currentTime;
+        n.droneGain.gain.setTargetAtTime(0.010 + 0.020 * c, t, 0.35);
+        n.droneLp.frequency.setTargetAtTime(180 + 760 * c * c, t, 0.45);
+        n.padGain.gain.setTargetAtTime(0.005 + 0.014 * c, t, 0.5);
+        n.padLp.frequency.setTargetAtTime(760 + 2400 * c, t, 0.5);
+        n.pulseGain.gain.setTargetAtTime(0.003 + 0.010 * c, t, 0.4);
+        n.shimmerGain.gain.setTargetAtTime(0.0012 + 0.012 * Math.max(0, c - 0.28), t, 0.6);
+      }
+
+      tick() {
+        const ctx = this.a.ctx;
+        if (!this.running || !ctx || ctx.state !== 'running') return;
+        const eighth = 30 / this.bpm;          // 八分音符时长 = (60/bpm)/2
+        const now = ctx.currentTime;
+        if (this.nextTime < now) this.nextTime = now + 0.03;   // 切后台回来不补排
+        let guard = 0;
+        while (this.nextTime < now + 0.12 && guard++ < 24) {
+          this.schedule(this.nextTime, this.step);
+          this.step++;
+          this.nextTime += eighth;
+        }
+      }
+
+      schedule(t, step) {
+        const c = this.smooth;
+        const bar = Math.floor(step / 8);      // 4/4 拍，每小节 8 个八分音符
+        const pos = step % 8;
+        // 和声每两小节评估一次档位：带滞回，避免在阈值附近来回跳
+        if (pos === 0 && bar % 2 === 0) {
+          const cur = this.chordIdx;
+          let idx = cur;
+          if (cur === 0 && c > 0.42) idx = 1;
+          else if (cur === 1 && c < 0.30) idx = 0;
+          else if (cur === 1 && c > 0.68) idx = 2;
+          else if (cur === 2 && c < 0.58) idx = 1;
+          this.chordIdx = idx;
+          this.chord(t, idx, 16 * (30 / this.bpm));
+        }
+        // 节奏：八分音符按聚集度稀疏化。散开时 dens≈0，几乎完全静音
+        const dens = Math.max(0, Math.min(1, (c - 0.1) / 0.62));
+        const accent = pos === 0 || pos === 4;
+        if (Math.random() < dens * (accent ? 0.85 : 0.4)) this.pulse(t, accent);
+        // 泛音点：只在抱团到一定程度后才出现，密度限幅，避免过于叮当
+        if (c > 0.28) {
+          const p = Math.min(0.32, (c - 0.28) * 1.4);
+          if (Math.random() < p) this.shimmer(t);
+        }
+      }
+
+      chord(t, idx, dur) {
+        const ctx = this.a.ctx, n = this.nodes;
+        const degs = CHORDS[idx];
+        const atk = Math.min(1.8, dur * 0.34);
+        const rel = Math.min(2.0, dur * 0.42);
+        // 受惊时整体下沉：最多一个半音，像乐队被压了一下
+        const pitch = Math.pow(2, -this.tension / 12);
+        this.counts.chord++;
+        for (const deg of degs) {
+          const o = ctx.createOscillator();
+          o.type = 'sine';
+          o.frequency.value = pentaFreq(deg, 1) * pitch;
+          o.detune.value = (Math.random() - 0.5) * 9;
+          const g = ctx.createGain();
+          const peak = 0.9 / degs.length;
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.linearRampToValueAtTime(peak, t + atk);
+          g.gain.setValueAtTime(peak, t + Math.max(atk, dur - rel));
+          g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+          o.connect(g); g.connect(n.padLp); g.connect(n.send);
+          o.start(t); o.stop(t + dur + 0.05);
+        }
+      }
+
+      pulse(t, accent) {
+        const ctx = this.a.ctx, n = this.nodes;
+        const o = ctx.createOscillator();
+        o.type = 'sine';
+        const f0 = accent ? 88 : 146;
+        o.frequency.setValueAtTime(f0, t);
+        o.frequency.exponentialRampToValueAtTime(f0 * 0.5, t + (accent ? 0.26 : 0.16));
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(accent ? 0.95 : 0.5, t + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + (accent ? 0.36 : 0.22));
+        o.connect(g); g.connect(n.pulseGain);
+        o.start(t); o.stop(t + 0.45);
+        this.counts.pulse++;
+      }
+
+      shimmer(t) {
+        const ctx = this.a.ctx, n = this.nodes;
+        const o = ctx.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = pentaFreq(2 + Math.floor(Math.random() * 3), 2 + (Math.random() < 0.45 ? 1 : 0));
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.8, t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 1.5);
+        o.connect(g); g.connect(n.shimmerGain); g.connect(n.send);
+        o.start(t); o.stop(t + 1.6);
+        this.counts.shimmer++;
+      }
+    }
+
     const audio = new FlockAudio();
+    const music = new FlockMusic(audio);
     audio.refreshButton();
 
     document.getElementById('startBtn').addEventListener('click', () => {
       audio.enable().then(() => document.getElementById('intro').classList.add('hidden'))
         .catch((e) => fail('声音开启失败：' + e.message));
     });
+
+    // 默认开：页面加载就尝试建立音频上下文。浏览器通常会把自动播放挂起（不算错误），
+    // 这时只要用户第一次操作（点画布、滚轮、按键）就自动恢复——不用再去点声音按钮。
+    // 这两个按钮自己会处理手势，跳过以免「刚点开启又被 toggle 静音」。
+    function unlockAudio(e) {
+      const t = e && e.target;
+      if (t && t.closest && t.closest('#audioBtn, #startBtn')) return;
+      if (audio.enabled) {
+        if (audio.ctx && audio.ctx.state !== 'running' && !audio.muted) audio.ctx.resume().catch(() => {});
+        for (const ev of ['pointerdown', 'keydown', 'touchstart']) removeEventListener(ev, unlockAudio);
+        return;
+      }
+      audio.enable().catch(() => {});
+    }
+    for (const ev of ['pointerdown', 'keydown', 'touchstart']) {
+      addEventListener(ev, unlockAudio, { passive: true });
+    }
+    audio.enable().catch(() => {});
     // 顶部按钮 = 真正的声音总开关：静音时主增益归零，不再弹出引导页。
     document.getElementById('audioBtn').addEventListener('click', () => {
       audio.toggle().catch((e) => fail('声音切换失败：' + e.message));
@@ -2046,6 +2301,17 @@
 
       if (!params.paused) step(dt, now);
 
+      // 音乐跟着群体状态走：聚集度决定和声厚度与节奏密度，
+      // 正在爆发的比例决定和声是否被「压」下去一点（最多一个半音）。
+      // 尺度说明：实测群体 RMS 半径在 28（极端抱团）~ 48（铺满全屏）之间，
+      // 就以这个区间当满量程，中间才有分辨力；用 HUD 上那个相干度会挤在 0 附近。
+      if (music.running) {
+        // 0.18 的下限让「最散」时也有极稀疏的心跳，不会变成一片死寂的嗡鸣
+        const cMusic = 0.18 + 0.82 * Math.max(0, Math.min(1, (BOUND * 1.2 - groupRms) / (BOUND * 0.55)));
+        const tension = Math.min(1, sprintingCount / Math.max(24, activeCount * 0.04));
+        music.update(cMusic, tension, dt);
+      }
+
       view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
       updateOrthoFrustum();
       camera.position.set(view2D.x, view2D.y, 40);
@@ -2185,6 +2451,8 @@
         document.getElementById('hSprint').textContent = sprintingCount + ' / ' + recovering;
         document.getElementById('hFps').textContent = Math.round(fps) + ' FPS';
         const fxOn = audio.enabled && !audio.muted;
+        document.getElementById('hMusicBar').style.width =
+          ((fxOn && music.running ? music.smooth : 0) * 100).toFixed(0) + '%';
         document.getElementById('hSprintFx').className = 'dot' + (fxOn && sprintFlash > 0.35 ? ' sprint' : '');
         document.getElementById('hPredFx').className = 'dot' + (fxOn && predFlash > 0.35 ? ' pred' : '');
         document.getElementById('hBirthFx').className = 'dot' + (fxOn && birthFlash > 0.35 ? ' birth' : '');
@@ -2272,6 +2540,13 @@
       },
       get predatorDrawCount() { return predGeo.instanceCount; },
       get muted() { return audio.muted; },
+      music,
+      get musicState() {
+        return {
+          running: music.running, c: +music.smooth.toFixed(3), tension: +music.tension.toFixed(3),
+          gain: music.nodes ? +music.nodes.bus.gain.value.toFixed(4) : 0, ...music.counts
+        };
+      },
       get audioState() { return audio.ctx ? audio.ctx.state : null; },
       get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
       get audioOutputConnected() { return audio.outputConnected; },
