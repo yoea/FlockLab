@@ -46,7 +46,7 @@
   }
   #brand .card-body p { margin: 5px 0 0; font-size: 11px; color: var(--dim); letter-spacing: 0.08em; }
 
-  #audioBtn {
+  #audioBtn, #uiBtn {
     position: fixed; right: 18px; top: 18px; z-index: 8;
     width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
     cursor: pointer; color: var(--ink); border-radius: 50%;
@@ -63,6 +63,28 @@
     stroke-linecap: round; stroke-linejoin: round;
   }
   #audioBtn.live .cross, #audioBtn:not(.live) .waves { display: none; }
+
+  #uiBtn { right: 62px; z-index: 9; }
+  #uiBtn svg { width: 18px; height: 18px; }
+  #uiBtn .eye, #uiBtn .pupil {
+    fill: none; stroke: currentColor; stroke-width: 1.7;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  #uiBtn .pupil { fill: currentColor; stroke: none; }
+  #uiBtn .slash {
+    fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round;
+    display: none;
+  }
+  #uiBtn.off .eye, #uiBtn.off .pupil { opacity: 0.35; }
+  #uiBtn.off .slash { display: block; }
+
+  /* 演示模式：只保留切换按钮，其余界面全部隐藏 */
+  body.ui-hidden #brand,
+  body.ui-hidden #hud,
+  body.ui-hidden #hint,
+  body.ui-hidden #dimBtn,
+  body.ui-hidden #audioBtn,
+  body.ui-hidden .lil-gui.root { display: none !important; }
 
   #dimBtn {
     position: fixed; left: 22px; top: 92px; z-index: 6;
@@ -170,7 +192,8 @@
   .lil-gui.root { margin-top: 76px; margin-right: 18px; }
 
   /* 触控屏：放大所有可点区域，面板限高可滚动，避免挡住群体 */
-  body.touch #audioBtn { width: 44px; height: 44px; }
+  body.touch #audioBtn, body.touch #uiBtn { width: 44px; height: 44px; }
+  body.touch #uiBtn { right: 70px; }
   body.touch #dimBtn { min-height: 40px; padding: 10px 18px; }
   body.touch #startBtn { min-height: 48px; padding: 14px 34px; }
   body.touch .card-head { min-height: 44px; }
@@ -198,6 +221,8 @@
     #hud { left: 12px; bottom: 12px; min-width: 0; }
     #hint { right: 12px; bottom: 12px; }
     #audioBtn { right: 10px; top: 10px; }
+    #uiBtn { right: 54px; top: 10px; }
+    body.touch #uiBtn { right: 62px; }
     .lil-gui.root { margin-top: 58px; margin-right: 6px; }
   }
 </style>
@@ -219,6 +244,14 @@
       <path class="spk" d="M4 9h4l5-4v14l-5-4H4z" />
       <path class="waves" d="M16.5 9.2c1.1 1.1 1.1 4.5 0 5.6M19.4 6.6c2.4 2.8 2.4 8 0 10.8" />
       <path class="cross" d="M17 9.5l5 5M22 9.5l-5 5" />
+    </svg>
+  </button>
+
+  <button id="uiBtn" type="button" title="隐藏所有界面" aria-label="隐藏所有界面">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path class="eye" d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z" />
+      <circle class="pupil" cx="12" cy="12" r="2.4" />
+      <path class="slash" d="M4.5 4.5l15 15" />
     </svg>
   </button>
 
@@ -256,7 +289,7 @@
         右侧控制台可开启<em>捕食者</em>：橙红箭头锁定目标并预判拦截，群体预测逃逸并沿邻居传递警报；捕获瞬间有冲击闪光与音效，新生个体以亮绿色标注，几秒后渐变为普通色。
       </p>
       <button id="startBtn">开启声音并进入</button>
-      <div class="foot">右上角小图标随时开关声音 · 各卡片标题可折叠 · 邻域用空间哈希查询</div>
+      <div class="foot">右上角小图标开关声音 / 一键隐藏界面 · 各卡片标题可折叠 · 邻域用空间哈希查询</div>
     </div>
   </div>
 
@@ -351,6 +384,8 @@
     // 高速缓存：位置/速度数组直接作为 GPU 实例属性，CPU 只更新数值，不再算矩阵。
     const pos = new Float32Array(MAX_N * 3);
     const vel = new Float32Array(MAX_N * 3);
+    // 渲染用速度：对物理速度做低通滤波，只影响箭头朝向，不改变 Boids 动力学。
+    const rVel = new Float32Array(MAX_N * 3);
     const acc = new Float32Array(MAX_N * 3);
     const col = new Float32Array(MAX_N * 3);
     const siz = new Float32Array(MAX_N);
@@ -365,6 +400,7 @@
     // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
     const predPos = new Float32Array(MAX_P * 3);
     const predVel = new Float32Array(MAX_P * 3);
+    const rPredVel = new Float32Array(MAX_P * 3);   // 捕食者渲染速度，同样做低通
     const predCol = new Float32Array(MAX_P * 3);
     const predSiz = new Float32Array(MAX_P);
     const predFeedAt = new Float64Array(MAX_P);    // 饱腹冷却时间戳
@@ -412,6 +448,7 @@
         vel[k] = (Math.random() * 2 - 1) * vs;
         vel[k + 1] = (Math.random() * 2 - 1) * vs;
         vel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
+        rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = vel[k + 2];
         birthAt[i] = isBirth ? performance.now() : -Infinity;
       }
     }
@@ -435,6 +472,7 @@
         predVel[k] = (Math.random() * 2 - 1) * vs;
         predVel[k + 1] = (Math.random() * 2 - 1) * vs;
         predVel[k + 2] = params.dim2D ? 0 : (Math.random() * 2 - 1) * vs;
+        rPredVel[k] = predVel[k]; rPredVel[k + 1] = predVel[k + 1]; rPredVel[k + 2] = predVel[k + 2];
         predFeedAt[p] = 0;
       }
     }
@@ -478,6 +516,11 @@
     let camera = params.dim2D ? orthoCam : perspCam;
     // 2D 视图：平移中心 + 缩放
     const view2D = { x: 0, y: 0, zoom: 1, tZoom: 1 };
+    // 2D 相机视野固定：只由 zoom 决定，不随「活动边界」滑块变化。
+    // 否则调边界时画面会跟着缩放，看起来像动画错乱。
+    const VIEW2D_HALF_H = 22.2;
+    // 边界不超过默认 20 时视野固定；超过后自动拉远，保证整个边界框可见。
+    function view2DFitHalfH() { return Math.max(VIEW2D_HALF_H, params.boundary + 2.2); }
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
     renderer.setSize(innerWidth, innerHeight);
@@ -487,7 +530,7 @@
     // 2D 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
     function updateOrthoFrustum() {
       const aspect = innerWidth / innerHeight;
-      const halfH = (params.boundary + 2.2) / view2D.zoom;
+      const halfH = view2DFitHalfH() / view2D.zoom;
       const halfW = halfH * aspect;
       orthoCam.left = -halfW; orthoCam.right = halfW;
       orthoCam.top = halfH; orthoCam.bottom = -halfH;
@@ -553,7 +596,7 @@
       if (params.dim2D) {
         if (pointers.size === 1) {
           // 2D：拖拽平移视图（屏幕像素 → 世界坐标）
-          const scale = (2 * (params.boundary + 2.2) / view2D.zoom) / innerHeight;
+          const scale = (2 * view2DFitHalfH() / view2D.zoom) / innerHeight;
           view2D.x -= dx * scale;
           view2D.y += dy * scale;
         } else if (pointers.size === 2) {
@@ -664,7 +707,7 @@
     ], 2));
     arrowGeo.setIndex([0, 1, 2, 0, 2, 3]);
     const aPos = new THREE.InstancedBufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage);
-    const aVel = new THREE.InstancedBufferAttribute(vel, 3).setUsage(THREE.DynamicDrawUsage);
+    const aVel = new THREE.InstancedBufferAttribute(rVel, 3).setUsage(THREE.DynamicDrawUsage);
     const aCol = new THREE.InstancedBufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage);
     const aSiz = new THREE.InstancedBufferAttribute(siz, 1).setUsage(THREE.DynamicDrawUsage);
     arrowGeo.setAttribute('aPosition', aPos);
@@ -741,7 +784,7 @@
     predGeo.setAttribute('aLocal', arrowGeo.getAttribute('aLocal'));
     predGeo.setIndex([0, 1, 2, 0, 2, 3]);
     const pPos = new THREE.InstancedBufferAttribute(predPos, 3).setUsage(THREE.DynamicDrawUsage);
-    const pVel = new THREE.InstancedBufferAttribute(predVel, 3).setUsage(THREE.DynamicDrawUsage);
+    const pVel = new THREE.InstancedBufferAttribute(rPredVel, 3).setUsage(THREE.DynamicDrawUsage);
     const pCol = new THREE.InstancedBufferAttribute(predCol, 3).setUsage(THREE.DynamicDrawUsage);
     const pSiz = new THREE.InstancedBufferAttribute(predSiz, 1).setUsage(THREE.DynamicDrawUsage);
     predGeo.setAttribute('aPosition', pPos);
@@ -880,11 +923,19 @@
         btn.setAttribute('aria-label', label);
       }
 
-      // 真正的静音开关：把主增益平滑降到 0，振荡器仍在运行但听不到声音。
+      // 真正的总静音：主增益立即归零 + 暂停整个 AudioContext。
+      // 仅靠 setTargetAtTime(0) 会有短暂残余，且琶音仍会调度节点；暂停后所有声源彻底停摆。
       setMuted(m) {
         this.muted = m;
         if (this.master) {
-          this.master.gain.setTargetAtTime(m ? 0 : params.master, this.ctx.currentTime, 0.04);
+          const t = this.ctx.currentTime;
+          this.master.gain.cancelScheduledValues(t);
+          // 直接赋值，避免 suspend 时音频线程还没处理 setValueAtTime 而读到旧增益。
+          this.master.gain.value = m ? 0 : params.master;
+        }
+        if (this.ctx) {
+          if (m) this.ctx.suspend().catch(() => {});
+          else this.ctx.resume().catch(() => {});
         }
         this.refreshButton();
       }
@@ -902,7 +953,7 @@
       }
 
       update() {
-        if (!this.enabled) return;
+        if (!this.enabled || this.muted) return;   // 静音时连琶音/HUD 闪光都不再触发
         const T = Math.max(0, Math.min(1, temperature));
         const P = Math.max(0, Math.min(1, pressure));
         const t = this.ctx.currentTime;
@@ -928,6 +979,7 @@
 
       // 上行琶音 = 泛音列 1,2,3...n：频率整数倍，幅度 1/n（自然衰减的泛音结构）
       arp(f0) {
+        if (!this.enabled || this.muted) return;
         const ctx = this.ctx;
         const t0 = ctx.currentTime + 0.02;
         for (let n = 1; n <= 7; n++) {
@@ -1050,6 +1102,16 @@
     });
     document.getElementById('dimBtn').addEventListener('click', () => setMode2D(!params.dim2D));
 
+    // 演示模式：一次点击隐藏控制台、卡片、提示等所有 UI，只留这个图标用于恢复。
+    const uiBtn = document.getElementById('uiBtn');
+    uiBtn.addEventListener('click', () => {
+      const hidden = document.body.classList.toggle('ui-hidden');
+      uiBtn.classList.toggle('off', hidden);
+      const label = hidden ? '显示所有界面' : '隐藏所有界面';
+      uiBtn.title = label;
+      uiBtn.setAttribute('aria-label', label);
+    });
+
     // ---------------------------------------------------------------- GUI
     const gui = new GUI({ title: 'FlockLab 控制台', width: 300 });
     const fRules = gui.addFolder('Boids 三规则');
@@ -1067,7 +1129,11 @@
       arrowMat.uniforms.uMaxSpeed.value = v;
     });
     fMotion.add(params, 'minSpeed', 0.5, 8, 0.1).name('最小速度');
-    fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动边界').onChange((v) => cage.scale.setScalar(v));
+    fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动边界').onChange((v) => {
+      cage.scale.setScalar(v);
+      // 2D 的显示矩形必须跟着模拟边界一起变；相机视野保持固定，画面不会跟着缩放。
+      if (params.dim2D) { updateRectFrame(); updateOrthoFrustum(); }
+    });
     fMotion.add(params, 'arrowSize', 0.18, 0.9, 0.01).name('箭头大小');
     fMotion.open();
 
@@ -1567,6 +1633,10 @@
         }
         siz[i] = size;
       }
+      // 箭头朝向低通滤波：Boids 力在拥挤处会逐帧改变方向，直接画瞬时速度会抖动。
+      // 只平滑用于渲染的速度，物理仿真仍使用原始 vel，行为不变。
+      const SMOOTH = 0.18;   // 30 FPS 下时间常数约 0.15s，抖动明显降低且方向仍跟手
+      for (let i = 0; i < n * 3; i++) rVel[i] += (vel[i] - rVel[i]) * SMOOTH;
       aPos.needsUpdate = true;
       aVel.needsUpdate = true;
       aCol.needsUpdate = true;
@@ -1575,6 +1645,7 @@
       // 捕食者：GPU 属性更新 + 威胁圈跟随相机
       predMesh.visible = params.predatorOn;
       if (params.predatorOn) {
+        for (let i = 0; i < activeP * 3; i++) rPredVel[i] += (predVel[i] - rPredVel[i]) * SMOOTH;
         pPos.needsUpdate = true;
         pVel.needsUpdate = true;
         pCol.needsUpdate = true;
@@ -1626,7 +1697,7 @@
         document.getElementById('hDensityBar').style.width = (density * 100).toFixed(0) + '%';
         document.getElementById('hTemp').textContent = temperature.toFixed(3);
         document.getElementById('hPress').textContent = pressure.toFixed(3);
-        document.getElementById('hPitch').textContent = audio.enabled ? Math.round(audio.f0) + ' Hz' : '— Hz';
+        document.getElementById('hPitch').textContent = (audio.enabled && !audio.muted) ? Math.round(audio.f0) + ' Hz' : '— Hz';
         document.getElementById('hFps').textContent = Math.round(fps) + ' FPS';
         document.getElementById('hHit').className = 'dot' + (collisionFlash > 0.35 ? ' on' : '');
         document.getElementById('hArp').className = 'dot' + (arpFlash > 0.35 ? ' arp' : '');
@@ -1664,7 +1735,15 @@
         return { x: [+mnx.toFixed(1), +mxx.toFixed(1)], y: [+mny.toFixed(1), +mxy.toFixed(1)] };
       },
       get view() { return { x: view2D.x, y: view2D.y, zoom: view2D.zoom }; },
+      get displayRect() {
+        const a = rectFrameGeo.attributes.position.array;
+        return { hx: +a[3].toFixed(2), hy: +a[7].toFixed(2) };
+      },
+      get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
+      get cageScale() { return +cage.scale.x.toFixed(2); },
       get count() { return activeCount; },
+      get velocities() { return Array.from(vel.slice(0, activeCount * 3)); },
+      get renderVelocities() { return Array.from(rVel.slice(0, activeCount * 3)); },
       get predatorCount() { return params.predatorOn ? activeP : 0; },
       get predatorPositions() {
         return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
@@ -1684,6 +1763,7 @@
       },
       get predatorDrawCount() { return predGeo.instanceCount; },
       get muted() { return audio.muted; },
+      get audioState() { return audio.ctx ? audio.ctx.state : null; },
       get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
       get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },
       get avgPredDist() {
