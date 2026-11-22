@@ -614,6 +614,13 @@
     // 朝它滑过去，到点或超时再换——这样吃饱后不会一头扎到墙上反复弹。
     const predWp = new Float32Array(MAX_P * 2);      // 巡逻目标点（世界坐标）
     const predWpUntil = new Float64Array(MAX_P);     // 目标点过期时间
+    // 捕食者拖尾：由「加速度」驱动——加速度越大，尾巴越长越亮；
+    // 几乎不加速（匀速直线）时完全不出拖尾，所以它只在扑击、急转时闪现。
+    const predAccel = new Float32Array(MAX_P);       // 当帧加速度大小（转向力模长）
+    const predTrailP = new Float32Array(MAX_P);      // 平滑后的加速度强度 0~1
+    const predTrailAmt = new Float32Array(MAX_P);    // 拖尾强度 0~1
+    const predTrailTail = new Float32Array(MAX_P * 2);
+    const PRED_TRAIL_REF = 45;                       // 加速度达到这个值即视为「全力冲刺」（实测中位数约 12、峰值约 64）
     // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
     const predSpdJit = new Float32Array(MAX_P);
     const predWobble = new Float32Array(MAX_P);
@@ -711,6 +718,7 @@
       birthAt[i] = now;
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
       alertMs[i] = 0; trailAmt[i] = 0;
+      trailTail[i * 2] = pos[k]; trailTail[i * 2 + 1] = pos[k + 1];
       rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
     }
 
@@ -730,6 +738,8 @@
         predCap[p] = params.predSpeed;
         predWp[p * 2] = 0; predWp[p * 2 + 1] = 0;
         predWpUntil[p] = 0;
+        predTrailAmt[p] = 0; predTrailP[p] = 0;
+        predTrailTail[p * 2] = predPos[k]; predTrailTail[p * 2 + 1] = predPos[k + 1];
         predSpdJit[p] = 0.9 + Math.random() * 0.2;
         predWobble[p] = Math.random() * Math.PI * 2;
       }
@@ -1170,6 +1180,7 @@
     const tmpBirth = new THREE.Color(0x7dff9a);
     const tmpSprint = new THREE.Color(0xff9ad4);   // 爆发：在自身色相上烧向粉白（每帧按个体重算）
     const tmpTrail = new THREE.Color(0xff9ad4);    // 拖尾：与爆发同一身份色
+    const tmpTrailPred = new THREE.Color(0xff8a4c); // 捕食者拖尾：橙红，和本体一致
 
     // ---------------------------------------------------------------- 声音
     // 只保留三种事件音：加速逃逸 / 被吃掉 / 新生。
@@ -2057,6 +2068,9 @@
           if (ppy < -hy + wm) ay += (-hy + wm - ppy) * 4.5;
           az = 0;
 
+          // 记下这一帧施加的加速度模长：拖尾的长度与显隐都由它决定。
+          predAccel[p] = Math.hypot(ax, ay);
+
           let nvx = pvx + ax * dt, nvy = pvy + ay * dt;
           let sp = Math.hypot(nvx, nvy);
           if (sp > curSpeed) { const k = curSpeed / sp; nvx *= k; nvy *= k; }
@@ -2340,6 +2354,11 @@
             if (pos[k] > hx) pos[k] = hx; else if (pos[k] < -hx) pos[k] = -hx;
             if (pos[k + 1] > hy) pos[k + 1] = hy; else if (pos[k + 1] < -hy) pos[k + 1] = -hy;
             teleportCount++;
+            // 传送是瞬移：拖尾必须当场清掉，否则会从旧位置拉出一条横穿全屏的线。
+            // 把尾巴重置到落点，下次爆发时从零重新拉开。
+            trailAmt[i] = 0;
+            trailTail[i * 2] = pos[k];
+            trailTail[i * 2 + 1] = pos[k + 1];
           } else {
             if (outX) {
               pos[k] = outX * hx;
@@ -2387,6 +2406,8 @@
             respawnAt[i] = time + 1000;   // 1 秒后重新出生
             birthAt[i] = -Infinity;
             stamina[i] = 0; sprintUntil[i] = 0;
+            // 被吃掉 → 拖尾立即消失。否则「死亡点 → 1 秒后的重生点」之间会留一条长线。
+            trailAmt[i] = 0;
             break;
           }
         }
@@ -2516,7 +2537,7 @@
       // 起爆时尾巴贴住身体、从零开始拉开，结束后自然淡出（不再瞬移）。
       tmpTrail.setHSL(0.928, 0.9, 0.62);
       const tailK = 1 - Math.exp(-dt / TRAIL_TAU);
-      const fadeDown = Math.exp(-dt / 0.10);
+      const fadeDown = Math.exp(-dt / 0.08);
       const riseUp = Math.min(1, dt * 14);
       const arrowW = params.arrowSize;
       let tc = 0;
@@ -2534,6 +2555,11 @@
           trailTail[i * 2 + 1] = ty + (pos[k + 1] - ty) * tailK;
         } else if (trailAmt[i] > 0.002) {
           trailAmt[i] *= fadeDown;
+          // 收尾时尾巴也往回缩：否则鸟继续飞、尾巴钉在原地，会拖出一条越拉越长的残留线
+          const bx = trailTail[i * 2], by = trailTail[i * 2 + 1];
+          const kk = 1 - Math.exp(-dt / 0.12);
+          trailTail[i * 2] = bx + (pos[k] - bx) * kk;
+          trailTail[i * 2 + 1] = by + (pos[k + 1] - by) * kk;
         } else {
           trailAmt[i] = 0;
           continue;
@@ -2543,9 +2569,42 @@
         trHead[o] = pos[k]; trHead[o + 1] = pos[k + 1]; trHead[o + 2] = 0;
         trTail[o] = trailTail[i * 2]; trTail[o + 1] = trailTail[i * 2 + 1]; trTail[o + 2] = 0;
         trCol[o] = tmpTrail.r; trCol[o + 1] = tmpTrail.g; trCol[o + 2] = tmpTrail.b;
-        trWid[tc] = arrowW * 0.92;
-        trAlp[tc] = trailAmt[i] * 0.95;
+        // 常态会有十几到上百只同时爆发，拖尾不能抢戏：细一点、淡一点，
+        // 只做「速度感」的暗示，不画成一条实线。
+        trWid[tc] = arrowW * 0.72;
+        trAlp[tc] = trailAmt[i] * 0.62;
         tc++;
+      }
+
+      // ---- 捕食者拖尾：由加速度驱动 ----
+      // 加速度越大 → 尾巴越长、越亮；几乎匀速时完全不出现。
+      // 这样它只在扑击起步、急转、从巡游切回追击这几下「闪现」，平时是干净的。
+      if (params.predatorOn) {
+        for (let p = 0; p < activeP && tc < MAX_TRAILS; p++) {
+          const target = Math.min(1, predAccel[p] / PRED_TRAIL_REF);
+          predTrailP[p] += (target - predTrailP[p]) * (1 - Math.exp(-dt / 0.10));
+          const power = predTrailP[p];
+          const on = power > 0.2;    // 约等于加速度 > 11：匀速直线与普通转向都不出拖尾
+          const want = on ? Math.min(1, (power - 0.2) / 0.55) : 0;
+          const wasOff = predTrailAmt[p] < 0.02;   // 上一帧还没拖尾 → 本次从身体重新拉起
+          predTrailAmt[p] += (want - predTrailAmt[p]) * (1 - Math.exp(-dt / 0.12));
+          if (predTrailAmt[p] <= 0.02) { predTrailAmt[p] = 0; continue; }
+          const hx2 = predPos[p * 3], hy2 = predPos[p * 3 + 1];
+          if (wasOff) {   // 尾巴贴住身体，否则会用上一次拖尾的旧尾巴点，瞬间拉出一条长线
+            predTrailTail[p * 2] = hx2; predTrailTail[p * 2 + 1] = hy2;
+          }
+          // 尾巴的长度也随加速度变化：加速越猛，跟随时间常数越大 → 尾巴越长
+          const tk = 1 - Math.exp(-dt / (0.02 + 0.15 * power));
+          predTrailTail[p * 2] += (hx2 - predTrailTail[p * 2]) * tk;
+          predTrailTail[p * 2 + 1] += (hy2 - predTrailTail[p * 2 + 1]) * tk;
+          const o = tc * 3;
+          trHead[o] = hx2; trHead[o + 1] = hy2; trHead[o + 2] = 0;
+          trTail[o] = predTrailTail[p * 2]; trTail[o + 1] = predTrailTail[p * 2 + 1]; trTail[o + 2] = 0;
+          trCol[o] = tmpTrailPred.r; trCol[o + 1] = tmpTrailPred.g; trCol[o + 2] = tmpTrailPred.b;
+          trWid[tc] = predLeg() * 0.55;
+          trAlp[tc] = predTrailAmt[p] * 0.85;
+          tc++;
+        }
       }
       trailGeo.instanceCount = tc;
       if (tc > 0) {
@@ -2723,6 +2782,19 @@
       get sprintCount() { return sprintCount; },
       get sprintingCount() { return sprintingCount; },
       get trailCount() { return trailGeo.instanceCount; },
+      get maxTrailSpan() {
+        let m = 0;
+        for (let i = 0; i < trailGeo.instanceCount; i++) {
+          const dx = trHead[i * 3] - trTail[i * 3], dy = trHead[i * 3 + 1] - trTail[i * 3 + 1];
+          m = Math.max(m, Math.hypot(dx, dy));
+        }
+        return +m.toFixed(2);
+      },
+      get predatorTrail() {
+        return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
+          accel: +predAccel[p].toFixed(1), power: +predTrailP[p].toFixed(2), amt: +predTrailAmt[p].toFixed(2)
+        }));
+      },
       get trailSample() {
         const out = [];
         for (let i = 0; i < Math.min(3, trailGeo.instanceCount); i++) {
