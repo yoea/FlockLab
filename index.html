@@ -353,7 +353,8 @@
       <p class="about-logo">FLOCKLAB</p>
       <p class="about-lead" id="aboutLead">二维 Boids 涌现模拟：每个个体只遵循分离、对齐、聚合三条规则，整体的群飞行为由局部规则自发产生。</p>
       <ul>
-        <li><b>传送门边界</b>撞到边界的鸟有 5% 概率从对侧穿出，出入点关于中心对称。</li>
+        <li><b>随机性</b>每只鸟各有速度系数与缓慢游走；撞墙会随机散射，捕食者也会摆尾。</li>
+        <li><b>传送门边界</b>撞到边界的鸟有 1% 概率从对侧穿出，出入点关于中心对称。</li>
         <li><b>捕食者</b>锐角三角形，接触即捕食；进食后减速随机巡游。</li>
         <li><b>两种爆发</b>被逼近时冲刺逃命；掉队太久也会冲刺追赶大部队，共用同一份体力。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
@@ -556,8 +557,20 @@
     const LAG_LONELY_K = 0.55;
     const LAG_HOLD_MS = 380;
     let lastCatchupSound = -Infinity;
-    // 速度上限本身也做成受加速度限制的状态量：
-    // 起步/收速都要经过若干帧，从加速度积分出速度曲线，而不是一帧内跳变。
+    // ---------------------------------------------------------------- 个体差异
+    // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
+    // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
+    // 不改变三条规则，所以群体的涌现结构不受影响，只是多了一层自然抖动。
+    const spdJit = new Float32Array(MAX_N);   // 个体速度系数 0.86 ~ 1.14
+    const wAng = new Float32Array(MAX_N);     // 个体游走航向（每帧小幅随机漂移）
+    const wAmp = new Float32Array(MAX_N);     // 个体游走强度 0.55 ~ 1.65
+    let WANDER_BASE = 1.6;                    // 游走基础力度（调试接口可改，用于对比手感）
+    function rollTraits(i) {
+      spdJit[i] = 0.86 + Math.random() * 0.28;
+      wAng[i] = Math.random() * Math.PI * 2;
+      wAmp[i] = 0.55 + Math.random() * 1.1;
+    }
+
     const capNow = new Float32Array(MAX_N);        // 每只鸟当前生效的速度上限（只用于调试采样）
     capNow.fill(params.maxSpeed * 0.78);
     let sprintCount = 0, sprintingCount = 0;
@@ -577,14 +590,15 @@
     const predLockUntil = new Float64Array(MAX_P); // 锁定到期时间（ms）
     const predPulseAt = new Float64Array(MAX_P);   // 扑击瞬间，用于箭头脉冲
     predPulseAt.fill(-Infinity);
-    // 捕食者也受加速度限制：进食冷却切换速度时不会瞬间变速。
+    // 捕食者当前生效的速度上限（追击 / 冷却巡游切换时直接生效）
     const predCap = new Float32Array(MAX_P);
     predCap.fill(params.predSpeed);
-    const PRED_ACCEL = 70;
-    const PRED_DECEL = 45;
     // 冷却期随机巡游的航向与下一次改向时间
     const predWanderAng = new Float32Array(MAX_P);
     const predWanderUntil = new Float64Array(MAX_P);
+    // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
+    const predSpdJit = new Float32Array(MAX_P);
+    const predWobble = new Float32Array(MAX_P);
     const predPrev = new Float32Array(MAX_P * 3);  // 上一帧位置，用于「扫掠」碰撞检测
 
     const MAX_FORCE = 14;
@@ -605,8 +619,8 @@
       const qx = ax + dx * t - px, qy = ay + dy * t - py;
       return qx * qx + qy * qy;
     }
-    // 传送门：撞到边界的个体有 5% 概率从对侧穿出（出入点关于场地中心对称）
-    const PORTAL_P = 0.05;
+    // 传送门：撞到边界的个体有 1% 概率从对侧穿出（出入点关于场地中心对称）
+    const PORTAL_P = 0.01;
     let teleportCount = 0;
     const PRED_FORCE = 24;
     const PRED_SEP_RANGE2 = 6 * 6;
@@ -642,6 +656,7 @@
         birthAt[i] = isBirth ? performance.now() : -Infinity;
         stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
         lagSince[i] = 0;
+        rollTraits(i);
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
     }
@@ -677,6 +692,7 @@
       birthAt[i] = now;
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
       lagSince[i] = 0;
+      rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
     }
 
     function initPredators(from, to) {
@@ -695,6 +711,8 @@
         predCap[p] = params.predSpeed;
         predWanderAng[p] = Math.random() * Math.PI * 2;
         predWanderUntil[p] = 0;
+        predSpdJit[p] = 0.9 + Math.random() * 0.2;
+        predWobble[p] = Math.random() * Math.PI * 2;
       }
     }
     initPredators(0, activeP);
@@ -1521,13 +1539,13 @@
           predPrev[q] = ppx; predPrev[q + 1] = ppy; predPrev[q + 2] = 0;
           const pvx = predVel[q], pvy = predVel[q + 1], pvz = predVel[q + 2];
           // 进食冷却：吃饱后不再追击，只以四成左右的速度随机巡游保存体力。
-          // 速度上限本身按加速度积分变化，所以「追击 ↔ 巡游」之间是平滑过渡。
+          // 速度上限直接生效（不做加速度积分）；再乘个体速度系数，避免几只捕食者同步前进。
           const cooling = time - predFeedAt[p] < params.feedCooldown * 1000;
-          const capTarget = cooling ? predSpeed * 0.42 : predSpeed;
-          const dCap = capTarget - predCap[p];
-          const capStep = (dCap > 0 ? PRED_ACCEL : PRED_DECEL) * dt;
-          predCap[p] += Math.max(-capStep, Math.min(capStep, dCap));
+          predCap[p] = (cooling ? predSpeed * 0.42 : predSpeed) * predSpdJit[p];
           const curSpeed = Math.max(1.5, predCap[p]);
+          // 摆尾：航向做连续随机游走，追击时幅度小（不丢目标）、巡游时幅度大（像在闲逛）。
+          predWobble[p] += (Math.random() - 0.5) * 9 * dt;
+          const wobbleAmp = cooling ? 3.2 : 2.0;
           const chase = params.chaseWeight;
 
           let ax = 0, ay = 0, az = 0;
@@ -1617,6 +1635,12 @@
             }
           }
 
+          // 摆尾力：垂直于当前速度方向施加，让追击轨迹是轻微的蛇形而不是一条直线
+          const vlen = Math.hypot(pvx, pvy) || 1;
+          const weave = Math.cos(predWobble[p]) * wobbleAmp;
+          ax += (-pvy / vlen) * weave;
+          ay += (pvx / vlen) * weave;
+
           // 软边界：靠近边缘时往回推
           const m = 2;
           if (ppx > hx - m) ax -= (ppx - (hx - m)) * 3;
@@ -1629,21 +1653,30 @@
           let sp = Math.hypot(nvx, nvy);
           if (sp > curSpeed) { const k = curSpeed / sp; nvx *= k; nvy *= k; }
           else if (sp < curSpeed * 0.35 && sp > 1e-6) {
-            // 起步同样受加速度限制，不在一帧里从静止弹到目标速度
-            const want = Math.min(curSpeed * 0.35, sp + PRED_ACCEL * dt);
+            const want = curSpeed * 0.35;
             const k = want / sp; nvx *= k; nvy *= k;
           }
           predVel[q] = nvx; predVel[q + 1] = nvy; predVel[q + 2] = 0;
           predPos[q] = ppx + nvx * dt;
           predPos[q + 1] = ppy + nvy * dt;
           predPos[q + 2] = 0;
-          // 矩形硬边界：逐轴夹紧并弹性反射
-          if (predPos[q] > hx) { predPos[q] = hx; predVel[q] = -Math.abs(nvx) * 0.9; }
-          else if (predPos[q] < -hx) { predPos[q] = -hx; predVel[q] = Math.abs(nvx) * 0.9; }
-          if (predPos[q + 1] > hy) { predPos[q + 1] = hy; predVel[q + 1] = -Math.abs(nvy) * 0.9; }
-          else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; predVel[q + 1] = Math.abs(nvy) * 0.9; }
-          // 撞墙后随机巡游的航向也跟着掉头，避免一直顶在边上
-          if (cooling) predWanderAng[p] = Math.atan2(predVel[q + 1], predVel[q]);
+          // 矩形硬边界：逐轴夹紧后弹性反射，再叠加一个随机偏转角——
+          // 真实撞击不是镜面反射，同一条路线上不会来回弹成弹珠。
+          let bounced = false;
+          if (predPos[q] > hx) { predPos[q] = hx; nvx = -Math.abs(nvx) * 0.9; bounced = true; }
+          else if (predPos[q] < -hx) { predPos[q] = -hx; nvx = Math.abs(nvx) * 0.9; bounced = true; }
+          if (predPos[q + 1] > hy) { predPos[q + 1] = hy; nvy = -Math.abs(nvy) * 0.9; bounced = true; }
+          else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; nvy = Math.abs(nvy) * 0.9; bounced = true; }
+          if (bounced) {
+            const sc = (Math.random() - 0.5) * 0.7;          // ±20°
+            const cs = Math.cos(sc), sn = Math.sin(sc);
+            const bx = nvx * cs - nvy * sn;
+            const by = nvx * sn + nvy * cs;
+            nvx = bx; nvy = by;
+            predVel[q] = nvx; predVel[q + 1] = nvy;
+            // 撞墙后随机巡游的航向也跟着掉头，避免一直顶在边上
+            if (cooling) predWanderAng[p] = Math.atan2(nvy, nvx);
+          }
         }
       }
 
@@ -1864,6 +1897,12 @@
         if (py < -hy + m) fy += (-hy + m - py) * 2.2;
         fx += Math.sin(py * 0.11 + flowT) * params.flow;
         fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
+        // 个体游走：每只鸟带一条缓慢漂移的私人航向。邻居越多，群体把它「稳住」的力度越大，
+        // 所以队形仍由三条规则决定，只是落单的个体会自己晃——这正是弹珠感消失的来源。
+        wAng[i] += (Math.random() - 0.5) * 6 * dt;
+        const wanderMag = WANDER_BASE * wAmp[i] / (1 + count * 0.06);
+        fx += Math.cos(wAng[i]) * wanderMag;
+        fy += Math.sin(wAng[i]) * wanderMag;
         acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = 0;
       }
       if (aliveN > 0) { groupX = cx / aliveN; groupY = cy / aliveN; groupZ = 0; }
@@ -1878,8 +1917,9 @@
         const sprinting = time < sprintUntil[i];
         // 速度上限：爆发 > 受惊 > 巡航节奏，直接取目标值（不做加速度积分），
         // 起爆即可提速、威胁解除即刻降到巡航。
-        const capTarget = sprinting ? sprintSpeed : (fleeing[i] ? maxSpeed : paceSpeed);
-        const cap = Math.max(params.minSpeed, Math.min(sprintSpeed, capTarget));
+        // 每只鸟的巡航/受惊/爆发速度再乘自己的系数，整群不会以同一速度像刚体一样平移。
+        const capTarget = (sprinting ? sprintSpeed : (fleeing[i] ? maxSpeed : paceSpeed)) * spdJit[i];
+        const cap = Math.max(params.minSpeed, Math.min(sprintSpeed * 1.15, capTarget));
         capNow[i] = cap;   // 仅作为调试采样保留
         if (sp > cap) { const q = cap / sp; vx *= q; vy *= q; sp = cap; }
         else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; sp = params.minSpeed; }
@@ -1905,14 +1945,26 @@
           } else {
             if (outX) {
               pos[k] = outX * hx;
-              vel[k] = -outX * Math.abs(vx) * 0.92;
+              vx = -outX * Math.abs(vx) * 0.92;
               boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2));
             }
             if (outY) {
               pos[k + 1] = outY * hy;
-              vel[k + 1] = -outY * Math.abs(vy) * 0.92;
+              vy = -outY * Math.abs(vy) * 0.92;
               boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2));
             }
+            // 反弹再加随机散射：偏转 ±23°、速度乘 0.82~1.08。
+            // 这样撞墙既不会沿原路精确返回，整群也不会排着队同步弹开。
+            const scat = (Math.random() - 0.5) * 0.8;
+            const cs = Math.cos(scat), sn = Math.sin(scat);
+            const bx = vx * cs - vy * sn;
+            const by = vx * sn + vy * cs;
+            const sb = 0.82 + Math.random() * 0.26;
+            vx = bx * sb; vy = by * sb;
+            // 散射后若仍在往墙外飞，把法向分量纠正回场内
+            if (outX && vx * outX > 0) vx = -vx;
+            if (outY && vy * outY > 0) vy = -vy;
+            vel[k] = vx; vel[k + 1] = vy;
           }
         }
         pos[k + 2] = 0; vel[k + 2] = 0;
@@ -2246,6 +2298,8 @@
       },
       get density() { return density; },
       get cohesion() { return +cohesion01.toFixed(3); },
+      get wanderBase() { return WANDER_BASE; },
+      set wanderBase(v) { WANDER_BASE = Math.max(0, Math.min(4, +v || 0)); },
       get groupRms() { return +groupRms.toFixed(2); },
       get laggingCount() { return laggingCount; },
       get catchupCount() { return catchupCount; },
