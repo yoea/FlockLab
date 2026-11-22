@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#05070f" />
+<title>FlockLab · 涌现模拟</title>
+<style>
+  :root {
+    --ink: #dce9ff;
+    --dim: #7e93b5;
+    --line: rgba(126, 170, 235, 0.18);
+    --glass: rgba(9, 15, 29, 0.66);
+    --accent: #63e6ff;
+    --hot: #ff6fae;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #05070f; color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  #scene { position: fixed; inset: 0; }
+  #scene canvas { display: block; }
+
+  .glass {
+    background: var(--glass);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+  }
+
+  #brand {
+    position: fixed; left: 22px; top: 20px; z-index: 5;
+    padding: 13px 18px 12px; pointer-events: none;
+  }
+  #brand h1 {
+    margin: 0; font-size: 20px; font-weight: 650; letter-spacing: 0.06em;
+    background: linear-gradient(92deg, #8ff3ff 0%, #a6b4ff 48%, #ff8dc2 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #brand p { margin: 5px 0 0; font-size: 11px; color: var(--dim); letter-spacing: 0.08em; }
+
+  #audioBtn {
+    position: fixed; left: 50%; top: 20px; transform: translateX(-50%);
+    z-index: 6; cursor: pointer; user-select: none;
+    padding: 10px 20px; font-size: 13px; letter-spacing: 0.04em;
+    color: var(--ink); border-radius: 999px;
+    border: 1px solid rgba(99, 230, 255, 0.45);
+    background: rgba(11, 26, 43, 0.78);
+    transition: transform .18s ease, box-shadow .25s ease, border-color .25s ease;
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  #audioBtn:hover { transform: translateX(-50%) translateY(-1px); }
+  #audioBtn.live {
+    animation: none; border-color: rgba(120, 255, 190, 0.4);
+    box-shadow: 0 0 22px rgba(70, 230, 175, 0.14) inset;
+  }
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 0 rgba(99, 230, 255, 0); }
+    50% { box-shadow: 0 0 22px rgba(99, 230, 255, 0.28); }
+  }
+
+  #hud {
+    position: fixed; left: 22px; bottom: 22px; z-index: 5;
+    padding: 14px 17px; min-width: 244px; pointer-events: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .hud-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 18px; font-size: 11px; line-height: 2.05;
+  }
+  .hud-row .k { color: var(--dim); letter-spacing: 0.08em; }
+  .hud-row .v { color: var(--ink); font-weight: 600; }
+  .bar {
+    position: relative; width: 92px; height: 4px; border-radius: 4px;
+    background: rgba(150, 180, 230, 0.16); overflow: hidden;
+  }
+  .bar > i {
+    position: absolute; inset: 0 auto 0 0; width: 0%; border-radius: 4px;
+    background: linear-gradient(90deg, #4fd8ff, #a78bfa, #ff77b5);
+    transition: width .12s linear;
+  }
+  .dot {
+    display: inline-block; width: 7px; height: 7px; margin-right: 6px;
+    border-radius: 50%; background: #4a5c78; transition: background .12s, box-shadow .12s;
+  }
+  .dot.on { background: #ff8e70; box-shadow: 0 0 10px #ff8e70; }
+  .dot.arp { background: #ffe17a; box-shadow: 0 0 10px #ffe17a; }
+
+  #hint {
+    position: fixed; right: 22px; bottom: 22px; z-index: 5;
+    padding: 9px 14px; font-size: 11px; color: var(--dim);
+    letter-spacing: 0.05em; pointer-events: none;
+  }
+
+  #intro {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at center, rgba(5, 7, 15, 0.35) 0%, rgba(5, 7, 15, 0.86) 75%);
+    transition: opacity .55s ease, visibility .55s ease;
+  }
+  #intro.hidden { opacity: 0; visibility: hidden; }
+  #intro .card { max-width: 460px; padding: 34px 38px 30px; text-align: center; }
+  #intro h2 {
+    margin: 0 0 10px; font-size: 26px; font-weight: 650; letter-spacing: 0.1em;
+    background: linear-gradient(92deg, #8ff3ff, #ff8dc2);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #intro .sub { margin: 0 0 22px; font-size: 12px; color: var(--dim); letter-spacing: 0.14em; }
+  #intro p { margin: 0 0 24px; font-size: 13px; line-height: 1.9; color: #b8c8e2; }
+  #intro em { color: var(--accent); font-style: normal; }
+  #startBtn {
+    cursor: pointer; padding: 12px 30px; font-size: 14px; letter-spacing: 0.12em;
+    color: #06121c; font-weight: 650; border: 0; border-radius: 999px;
+    background: linear-gradient(96deg, #7cf0ff, #b6a8ff 60%, #ff9ccb);
+    box-shadow: 0 8px 30px rgba(120, 200, 255, 0.24);
+    transition: transform .18s ease, filter .18s ease;
+  }
+  #startBtn:hover { transform: translateY(-2px); filter: brightness(1.08); }
+  #intro .foot { margin-top: 18px; font-size: 10px; color: #5d7090; letter-spacing: 0.08em; }
+
+  #error {
+    position: fixed; inset: 0; z-index: 30; display: none;
+    align-items: center; justify-content: center; padding: 24px;
+    background: #05070f; color: #ffb4b4; font-size: 14px; text-align: center; line-height: 1.8;
+  }
+
+  .lil-gui {
+    --background-color: rgba(9, 15, 29, 0.82);
+    --widget-color: rgba(46, 66, 100, 0.85);
+    --hover-color: rgba(64, 92, 138, 0.95);
+    --focus-color: rgba(78, 118, 174, 0.95);
+    --number-color: #7fe9ff;
+    --string-color: #ffb3d4;
+    --font-size: 11px;
+    --title-background-color: rgba(16, 26, 45, 0.92);
+    --text-color: #dce9ff;
+    z-index: 7 !important;
+  }
+  .lil-gui.root { margin-top: 76px; margin-right: 18px; }
+  @media (max-width: 720px) {
+    #brand { left: 12px; top: 12px; }
+    #hud { left: 12px; bottom: 12px; min-width: 0; }
+    #hint { display: none; }
+    #audioBtn { top: auto; bottom: 18px; left: auto; right: 12px; transform: none; }
+    #audioBtn:hover { transform: translateY(-1px); }
+    .lil-gui.root { margin-top: 12px; margin-right: 6px; }
+  }
+</style>
+</head>
+<body>
+  <div id="scene"></div>
+
+  <div id="brand" class="glass">
+    <h1>FLOCKLAB</h1>
+    <p>300 AGENTS · EMERGENT BOIDS · SONIFIED</p>
+  </div>
+
+  <div id="audioBtn" title="浏览器要求用户手势才能播放声音">🔇 点击开启声音</div>
+
+  <div id="hud" class="glass">
+    <div class="hud-row"><span class="k">个体数量</span><span class="v" id="hCount">300</span></div>
+    <div class="hud-row"><span class="k">聚集密度</span><span class="bar"><i id="hDensityBar"></i></span></div>
+    <div class="hud-row"><span class="k">平均速度</span><span class="v" id="hSpeed">0.00</span></div>
+    <div class="hud-row"><span class="k">集体音高</span><span class="v" id="hPitch">— Hz</span></div>
+    <div class="hud-row"><span class="k">碰撞 / 琶音</span><span class="v"><span class="dot" id="hHit"></span><span class="dot" id="hArp"></span></span></div>
+    <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
+  </div>
+
+  <div id="hint" class="glass">拖拽旋转 · 滚轮缩放 · 右上角滑块实时调参</div>
+
+  <div id="intro">
+    <div class="card glass">
+      <h2>FLOCKLAB</h2>
+      <p class="sub">涌现行为 · 声音化实验</p>
+      <p>
+        300 个发光个体只遵循三条简单规则：<em>分离</em>、<em>对齐</em>、<em>聚合</em>。<br />
+        它们的集体密度会改变音高与音量；<br />
+        密度越过阈值触发<em>上行琶音</em>，近距离碰撞触发<em>短促打击音</em>。
+      </p>
+      <button id="startBtn">开启声音并进入</button>
+      <div class="foot">声音由 Web Audio API 实时合成 · 带冷却保护</div>
+    </div>
+  </div>
+
+  <div id="error"></div>
+
+  <script type="module">
+    const fail = (msg) => {
+      const el = document.getElementById('error');
+      el.style.display = 'flex';
+      el.textContent = msg;
+    };
+
+    // 多 CDN 回退：三个库全部来自公共 CDN，业务代码仍只有这一个文件。
+    async function loadModule(urls) {
+      let last;
+      for (const url of urls) {
+        try { return await import(/* @vite-ignore */ url); }
+        catch (e) { last = e; }
+      }
+      throw last;
+    }
+
+    let THREE, GUI;
+    try {
+      THREE = await loadModule([
+        'https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js',
+        'https://unpkg.com/three@0.160.1/build/three.module.js'
+      ]);
+      const guiMod = await loadModule([
+        'https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js',
+        'https://unpkg.com/lil-gui@0.19.2/dist/lil-gui.esm.js'
+      ]);
+      GUI = guiMod.GUI || guiMod.default;
+    } catch (e) {
+      fail('依赖加载失败，请检查网络后刷新页面。\n' + (e && e.message ? e.message : e));
+      throw e;
+    }
+
+    // ---------------------------------------------------------------- 参数
+    const params = {
+      separation: 2.05,
+      alignment: 1.1,
+      cohesion: 0.7,
+      perception: 6.0,
+      separationRange: 2.9,
+      flow: 1.3,
+      maxSpeed: 9.0,
+      minSpeed: 2.2,
+      boundary: 20,
+      densityThreshold: 0.56,
+      master: 0.38,
+      enabled: false,
+      paused: false
+    };
+
+    const N = 300;
+    const pos = new Float32Array(N * 3);
+    const vel = new Float32Array(N * 3);
+    const acc = new Float32Array(N * 3);
+    const neighbors = new Uint16Array(N);
+    const COLLIDE_DIST = 0.55;
+    const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
+    const MAX_FORCE = 14;
+
+    let density = 0, avgSpeed = 0, avgNeighbors = 0, collisionFlash = 0, arpFlash = 0;
+
+    function resetBoids() {
+      for (let i = 0; i < N; i++) {
+        const r = 12 * Math.cbrt(Math.random());
+        const u = Math.random() * 2 - 1;
+        const t = Math.random() * Math.PI * 2;
+        const s = Math.sqrt(1 - u * u);
+        const k = i * 3;
+        pos[k] = r * s * Math.cos(t);
+        pos[k + 1] = r * s * Math.sin(t);
+        pos[k + 2] = r * u;
+        const vs = 3 + Math.random() * 4;
+        vel[k] = (Math.random() * 2 - 1) * vs;
+        vel[k + 1] = (Math.random() * 2 - 1) * vs;
+        vel[k + 2] = (Math.random() * 2 - 1) * vs;
+      }
+    }
+    resetBoids();
+
+    // ---------------------------------------------------------------- 场景
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x05070f);
+    scene.fog = new THREE.FogExp2(0x05070f, 0.0105);
+
+    const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.1, 600);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.getElementById('scene').appendChild(renderer.domElement);
+
+    const orbit = {
+      theta: 0.72, phi: 1.13, radius: 55,
+      tTheta: 0.72, tPhi: 1.13, tRadius: 55,
+      dragging: false, x: 0, y: 0
+    };
+    const cv = renderer.domElement;
+    cv.addEventListener('pointerdown', (e) => {
+      orbit.dragging = true; orbit.x = e.clientX; orbit.y = e.clientY;
+      cv.setPointerCapture(e.pointerId);
+    });
+    cv.addEventListener('pointermove', (e) => {
+      if (!orbit.dragging) return;
+      orbit.tTheta -= (e.clientX - orbit.x) * 0.005;
+      orbit.tPhi = Math.max(0.18, Math.min(Math.PI - 0.18, orbit.tPhi - (e.clientY - orbit.y) * 0.005));
+      orbit.x = e.clientX; orbit.y = e.clientY;
+    });
+    cv.addEventListener('pointerup', (e) => {
+      orbit.dragging = false;
+      if (cv.hasPointerCapture(e.pointerId)) cv.releasePointerCapture(e.pointerId);
+    });
+    cv.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      orbit.tRadius = Math.max(16, Math.min(130, orbit.tRadius + e.deltaY * 0.045));
+    }, { passive: false });
+
+    // 星空背景
+    const starGeo = new THREE.BufferGeometry();
+    const starPos = new Float32Array(900 * 3);
+    for (let i = 0; i < 900; i++) {
+      const r = 70 + Math.random() * 110;
+      const u = Math.random() * 2 - 1;
+      const t = Math.random() * Math.PI * 2;
+      const s = Math.sqrt(1 - u * u);
+      starPos[i * 3] = r * s * Math.cos(t);
+      starPos[i * 3 + 1] = r * s * Math.sin(t);
+      starPos[i * 3 + 2] = r * u;
+    }
+    starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+    const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
+      color: 0x7b9bd4, size: 0.42, transparent: true, opacity: 0.55,
+      depthWrite: false, sizeAttenuation: true
+    }));
+    scene.add(stars);
+
+    // 活动边界（可透视的笼子）
+    const cage = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 28, 16),
+      new THREE.MeshBasicMaterial({
+        color: 0x2a5d8c, wireframe: true, transparent: true,
+        opacity: 0.10, depthWrite: false
+      })
+    );
+    cage.scale.setScalar(params.boundary);
+    scene.add(cage);
+
+    // 两层 InstancedMesh：实心核 + 柔光晕
+    const sphere = new THREE.SphereGeometry(1, 10, 8);
+    const coreMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.98,
+      blending: THREE.AdditiveBlending, depthWrite: false
+    });
+    const haloMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.085,
+      blending: THREE.AdditiveBlending, depthWrite: false
+    });
+    const coreMesh = new THREE.InstancedMesh(sphere, coreMat, N);
+    const haloMesh = new THREE.InstancedMesh(sphere, haloMat, N);
+    coreMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    haloMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    coreMesh.frustumCulled = false;
+    haloMesh.frustumCulled = false;
+    scene.add(haloMesh, coreMesh);
+
+    const dummy = new THREE.Object3D();
+    const tmpColor = new THREE.Color();
+
+    // ---------------------------------------------------------------- 声音
+    class FlockAudio {
+      constructor() {
+        this.ctx = null;
+        this.enabled = false;
+        this.lastHit = 0;
+        this.lastArp = 0;
+        this.hitCount = 0;
+        this.hitWindow = 0;
+        this.arpArmed = true;
+      }
+
+      async enable() {
+        if (!this.ctx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) throw new Error('当前浏览器不支持 Web Audio API');
+          const ctx = this.ctx = new AC();
+
+          this.master = ctx.createGain();
+          this.master.gain.value = params.master;
+          this.master.connect(ctx.destination);
+
+          const filter = this.filter = ctx.createBiquadFilter();
+          filter.type = 'lowpass';
+          filter.frequency.value = 500;
+          filter.Q.value = 0.7;
+          filter.connect(this.master);
+
+          this.droneGain = ctx.createGain();
+          this.droneGain.gain.value = 0;
+          this.droneGain.connect(filter);
+
+          this.osc1 = ctx.createOscillator();
+          this.osc1.type = 'sawtooth';
+          this.osc1.frequency.value = 80;
+          this.osc1.connect(this.droneGain);
+
+          const subGain = ctx.createGain();
+          subGain.gain.value = 0.45;
+          subGain.connect(this.droneGain);
+          this.osc2 = ctx.createOscillator();
+          this.osc2.type = 'sine';
+          this.osc2.frequency.value = 80.4;
+          this.osc2.connect(subGain);
+
+          this.osc1.start();
+          this.osc2.start();
+
+          const len = Math.floor(ctx.sampleRate * 0.22);
+          this.noise = ctx.createBuffer(1, len, ctx.sampleRate);
+          const data = this.noise.getChannelData(0);
+          for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+        }
+        await this.ctx.resume();
+        this.enabled = true;
+        params.enabled = true;
+        document.getElementById('audioBtn').classList.add('live');
+        document.getElementById('audioBtn').textContent = '🔊 声音已开启';
+      }
+
+      setMaster(v) {
+        if (this.master) this.master.gain.setTargetAtTime(v, this.ctx.currentTime, 0.04);
+      }
+
+      update(d) {
+        if (!this.enabled) return;
+        const t = this.ctx.currentTime;
+        // 集体密度 → 基频（55Hz 起，跨两个八度）与音色亮度
+        const f = 55 * Math.pow(2, d * 2.15);
+        this.osc1.frequency.setTargetAtTime(f, t, 0.16);
+        this.osc2.frequency.setTargetAtTime(f * 1.006, t, 0.16);
+        this.filter.frequency.setTargetAtTime(280 + d * 1900, t, 0.18);
+        this.droneGain.gain.setTargetAtTime(0.010 + d * 0.055, t, 0.22);
+
+        const now = performance.now();
+        if (d > params.densityThreshold && this.arpArmed && now - this.lastArp > 2600) {
+          this.arp(d);
+          this.lastArp = now;
+          this.arpArmed = false;
+          arpFlash = 1;
+        }
+        if (d < params.densityThreshold - 0.045) this.arpArmed = true;
+      }
+
+      arp(d) {
+        const ctx = this.ctx;
+        const t0 = ctx.currentTime + 0.02;
+        const root = 57 + Math.round(d * 7);           // A3 起，密度越高整体越高
+        const scale = [0, 3, 5, 7, 10, 12, 15];        // 小调五声音阶上行
+        for (let k = 0; k < scale.length; k++) {
+          const midi = root + scale[k];
+          const freq = 440 * Math.pow(2, (midi - 69) / 12);
+          const t = t0 + k * 0.072;
+          const osc = ctx.createOscillator();
+          osc.type = k % 2 ? 'sine' : 'triangle';
+          osc.frequency.value = freq;
+          const g = ctx.createGain();
+          const peak = 0.085 * (1 - k * 0.07);
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(peak, t + 0.012);
+          g.gain.exponentialRampToValueAtTime(0.0001, t + 0.30);
+          osc.connect(g);
+          g.connect(this.master);
+          osc.start(t);
+          osc.stop(t + 0.34);
+        }
+      }
+
+      hit(intensity) {
+        if (!this.enabled) return;
+        const now = performance.now();
+        // 双重冷却：单次的 80ms 间隔 + 每秒最多 10 次，防止连锁碰撞爆音
+        if (now - this.lastHit < 80) return;
+        if (now > this.hitWindow) { this.hitWindow = now + 1000; this.hitCount = 0; }
+        if (this.hitCount >= 10) return;
+        this.lastHit = now;
+        this.hitCount++;
+        collisionFlash = 1;
+
+        const ctx = this.ctx;
+        const t = ctx.currentTime;
+        const src = ctx.createBufferSource();
+        src.buffer = this.noise;
+        const bp = ctx.createBiquadFilter();
+        bp.type = 'bandpass';
+        bp.frequency.value = 650 + intensity * 1900;
+        bp.Q.value = 1.1;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.035 + 0.10 * intensity, t + 0.004);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.085);
+        src.connect(bp); bp.connect(g); g.connect(this.master);
+        src.start(t); src.stop(t + 0.12);
+
+        const o = ctx.createOscillator();
+        o.type = 'triangle';
+        o.frequency.setValueAtTime(880 + intensity * 760, t);
+        o.frequency.exponentialRampToValueAtTime(180, t + 0.07);
+        const g2 = ctx.createGain();
+        g2.gain.setValueAtTime(0.0001, t);
+        g2.gain.exponentialRampToValueAtTime(0.03 + 0.06 * intensity, t + 0.005);
+        g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.075);
+        o.connect(g2); g2.connect(this.master);
+        o.start(t); o.stop(t + 0.09);
+      }
+    }
+    const audio = new FlockAudio();
+
+    document.getElementById('startBtn').addEventListener('click', () => {
+      audio.enable().then(() => {
+        const intro = document.getElementById('intro');
+        intro.classList.add('hidden');
+      }).catch((e) => fail('声音开启失败：' + e.message));
+    });
+    document.getElementById('audioBtn').addEventListener('click', () => {
+      if (!audio.enabled) {
+        audio.enable().catch((e) => fail('声音开启失败：' + e.message));
+      } else {
+        document.getElementById('intro').classList.remove('hidden');
+      }
+    });
+
+    // ---------------------------------------------------------------- GUI
+    const gui = new GUI({ title: 'FlockLab 控制台', width: 294 });
+    const fRules = gui.addFolder('Boids 三规则');
+    fRules.add(params, 'separation', 0, 4, 0.01).name('分离 Separation');
+    fRules.add(params, 'alignment', 0, 4, 0.01).name('对齐 Alignment');
+    fRules.add(params, 'cohesion', 0, 4, 0.01).name('聚合 Cohesion');
+
+    const fMotion = gui.addFolder('感知与运动');
+    fMotion.add(params, 'perception', 1, 14, 0.1).name('感知半径');
+    fMotion.add(params, 'separationRange', 0.2, 6, 0.1).name('分离半径');
+    fMotion.add(params, 'flow', 0, 4, 0.05).name('流场扰动');
+    fMotion.add(params, 'maxSpeed', 2, 18, 0.1).name('最大速度');
+    fMotion.add(params, 'minSpeed', 0.5, 8, 0.1).name('最小速度');
+    fMotion.add(params, 'boundary', 8, 35, 0.5).name('活动边界').onChange((v) => cage.scale.setScalar(v));
+    fMotion.close();
+
+    const fSound = gui.addFolder('声音映射');
+    fSound.add(params, 'master', 0, 1, 0.01).name('总音量').onChange((v) => audio.setMaster(v));
+    fSound.add(params, 'densityThreshold', 0.05, 0.95, 0.01).name('琶音密度阈值');
+    fSound.add({ toggle: () => document.getElementById('audioBtn').click() }, 'toggle').name('开启 / 关闭声音');
+    fSound.close();
+
+    const fScene = gui.addFolder('场景');
+    fScene.add(params, 'paused').name('暂停模拟');
+    fScene.add({ reset: resetBoids }, 'reset').name('重新初始化');
+    fScene.close();
+
+    // ---------------------------------------------------------------- 模拟
+    function step(dt, time) {
+      const per2 = params.perception * params.perception;
+      const flowT = time * 0.00022;
+      const sep2 = params.separationRange * params.separationRange;
+      const maxSpeed = params.maxSpeed;
+      const maxForce = MAX_FORCE;
+      const B = params.boundary;
+      let sumNeighbors = 0;
+      let cx = 0, cy = 0, cz = 0;
+      let collisions = 0, impact = 0;
+
+      for (let i = 0; i < N; i++) {
+        const k = i * 3;
+        const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
+        const vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
+        let count = 0;
+        let sx = 0, sy = 0, sz = 0;   // 位置累加（聚合）
+        let ax = 0, ay = 0, az = 0;   // 速度累加（对齐）
+        let dxs = 0, dys = 0, dzs = 0; // 分离向量
+
+        for (let j = 0; j < N; j++) {
+          if (j === i) continue;
+          const m = j * 3;
+          const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 > per2 || d2 < 1e-8) continue;
+
+          count++;
+          sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
+          ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
+          if (d2 < sep2) {
+            const inv = 1 / d2;
+            dxs += dx * inv; dys += dy * inv; dzs += dz * inv;
+          }
+          if (d2 < COLLIDE_DIST2) {
+            collisions++;
+            const rvx = vx - vel[m], rvy = vy - vel[m + 1], rvz = vz - vel[m + 2];
+            impact += Math.sqrt(rvx * rvx + rvy * rvy + rvz * rvz);
+          }
+        }
+        neighbors[i] = count;
+        sumNeighbors += count;
+        cx += px; cy += py; cz += pz;
+
+        let fx = 0, fy = 0, fz = 0;
+
+        if (count > 0) {
+          // 对齐：朝邻居平均速度转向
+          let len = Math.hypot(ax, ay, az);
+          if (len > 1e-6) {
+            const s = maxSpeed / len;
+            let tx = ax * s - vx, ty = ay * s - vy, tz = az * s - vz;
+            const tl = Math.hypot(tx, ty, tz);
+            if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
+            fx += tx * params.alignment; fy += ty * params.alignment; fz += tz * params.alignment;
+          }
+          // 聚合：朝邻居质心转向
+          let tx = sx / count - px, ty = sy / count - py, tz = sz / count - pz;
+          len = Math.hypot(tx, ty, tz);
+          if (len > 1e-6) {
+            const s = maxSpeed / len;
+            tx = tx * s - vx; ty = ty * s - vy; tz = tz * s - vz;
+            const tl = Math.hypot(tx, ty, tz);
+            if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
+            fx += tx * params.cohesion; fy += ty * params.cohesion; fz += tz * params.cohesion;
+          }
+        }
+        // 分离：距离越近推力越强
+        const sl = Math.hypot(dxs, dys, dzs);
+        if (sl > 1e-6) {
+          const s = maxSpeed / sl;
+          let tx = dxs * s - vx, ty = dys * s - vy, tz = dzs * s - vz;
+          const tl = Math.hypot(tx, ty, tz);
+          if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
+          fx += tx * params.separation; fy += ty * params.separation; fz += tz * params.separation;
+        }
+        // 柔性边界：越界前就往回拉
+        const dist = Math.hypot(px, py, pz);
+        if (dist > B - 3) {
+          const push = (dist - (B - 3)) * 2.2;
+          fx -= px / dist * push; fy -= py / dist * push; fz -= pz / dist * push;
+        }
+        // 缓慢变化的流场：让群体持续游走，密度有起伏，声音才有对比
+        fx += Math.sin(py * 0.11 + flowT) * params.flow;
+        fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
+        fz += Math.sin(px * 0.08 + pz * 0.10 + flowT * 0.6) * params.flow;
+
+        acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = fz;
+      }
+
+      let speedSum = 0;
+      for (let i = 0; i < N; i++) {
+        const k = i * 3;
+        let vx = vel[k] + acc[k] * dt;
+        let vy = vel[k + 1] + acc[k + 1] * dt;
+        let vz = vel[k + 2] + acc[k + 2] * dt;
+        let sp = Math.hypot(vx, vy, vz);
+        if (sp > maxSpeed) { const q = maxSpeed / sp; vx *= q; vy *= q; vz *= q; sp = maxSpeed; }
+        else if (sp < params.minSpeed && sp > 1e-6) { const q = params.minSpeed / sp; vx *= q; vy *= q; vz *= q; sp = params.minSpeed; }
+        vel[k] = vx; vel[k + 1] = vy; vel[k + 2] = vz;
+        speedSum += sp;
+
+        pos[k] += vx * dt; pos[k + 1] += vy * dt; pos[k + 2] += vz * dt;
+        const d = Math.hypot(pos[k], pos[k + 1], pos[k + 2]);
+        if (d > B) {
+          const nx = pos[k] / d, ny = pos[k + 1] / d, nz = pos[k + 2] / d;
+          pos[k] = nx * B; pos[k + 1] = ny * B; pos[k + 2] = nz * B;
+          const dot = vx * nx + vy * ny + vz * nz;
+          vel[k] = (vx - 2 * dot * nx) * 0.92;
+          vel[k + 1] = (vy - 2 * dot * ny) * 0.92;
+          vel[k + 2] = (vz - 2 * dot * nz) * 0.92;
+          audio.hit(0.45);
+        }
+      }
+
+      cx /= N; cy /= N; cz /= N;
+      let spread = 0;
+      for (let i = 0; i < N; i++) {
+        const k = i * 3;
+        const dx = pos[k] - cx, dy = pos[k + 1] - cy, dz = pos[k + 2] - cz;
+        spread += dx * dx + dy * dy + dz * dz;
+      }
+      avgNeighbors = sumNeighbors / N;
+      const neighborDensity = Math.min(1, avgNeighbors / 45);
+      const coherence = Math.max(0, 1 - Math.sqrt(spread / N) / (B * 0.62));
+      density = Math.min(1, neighborDensity * 0.72 + coherence * 0.28);
+      avgSpeed = speedSum / N;
+
+      if (collisions > 0) {
+        audio.hit(Math.min(1, (impact / collisions) / maxSpeed));
+      }
+    }
+
+    // ---------------------------------------------------------------- 渲染
+    let last = performance.now();
+    let fps = 60, fpsAcc = 0, fpsFrames = 0, hudTimer = 0;
+
+    function render(now) {
+      requestAnimationFrame(render);
+      const rawDt = (now - last) / 1000;
+      last = now;
+      const dt = Math.min(rawDt, 0.035);
+      fpsAcc += rawDt; fpsFrames++;
+      if (fpsAcc > 0.5) { fps = fpsFrames / fpsAcc; fpsAcc = 0; fpsFrames = 0; }
+
+      if (!params.paused) step(dt, now);
+      audio.update(density);
+
+      // 相机阻尼
+      orbit.theta += (orbit.tTheta - orbit.theta) * 0.08;
+      orbit.phi += (orbit.tPhi - orbit.phi) * 0.08;
+      orbit.radius += (orbit.tRadius - orbit.radius) * 0.08;
+      const sp = Math.sin(orbit.phi);
+      camera.position.set(
+        orbit.radius * sp * Math.sin(orbit.theta),
+        orbit.radius * Math.cos(orbit.phi),
+        orbit.radius * sp * Math.cos(orbit.theta)
+      );
+      camera.lookAt(0, 0, 0);
+      stars.rotation.y += dt * 0.008;
+
+      // 个体颜色：局部邻居数决定色相，速度决定亮度
+      for (let i = 0; i < N; i++) {
+        const k = i * 3;
+        const local = Math.min(1, neighbors[i] / 24);
+        const speedRatio = Math.min(1, avgSpeed > 0 ? Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed : 0);
+        tmpColor.setHSL(0.52 + local * 0.40, 0.92, 0.42 + speedRatio * 0.22);
+        coreMesh.setColorAt(i, tmpColor);
+        haloMesh.setColorAt(i, tmpColor);
+
+        const r = 0.17 + local * 0.07;
+        dummy.position.set(pos[k], pos[k + 1], pos[k + 2]);
+        dummy.scale.setScalar(r);
+        dummy.rotation.set(0, 0, 0);
+        dummy.updateMatrix();
+        coreMesh.setMatrixAt(i, dummy.matrix);
+        dummy.scale.setScalar(r * 3.1);
+        dummy.updateMatrix();
+        haloMesh.setMatrixAt(i, dummy.matrix);
+      }
+      coreMesh.instanceMatrix.needsUpdate = true;
+      haloMesh.instanceMatrix.needsUpdate = true;
+      if (coreMesh.instanceColor) coreMesh.instanceColor.needsUpdate = true;
+      if (haloMesh.instanceColor) haloMesh.instanceColor.needsUpdate = true;
+
+      renderer.render(scene, camera);
+
+      collisionFlash = Math.max(0, collisionFlash - dt * 5);
+      arpFlash = Math.max(0, arpFlash - dt * 2);
+      hudTimer += dt;
+      if (hudTimer > 0.1) {
+        hudTimer = 0;
+        document.getElementById('hDensityBar').style.width = (density * 100).toFixed(0) + '%';
+        document.getElementById('hSpeed').textContent = avgSpeed.toFixed(2);
+        document.getElementById('hPitch').textContent =
+          audio.enabled ? Math.round(55 * Math.pow(2, density * 2.15)) + ' Hz' : '— Hz';
+        document.getElementById('hFps').textContent = Math.round(fps) + ' FPS';
+        document.getElementById('hHit').className = 'dot' + (collisionFlash > 0.35 ? ' on' : '');
+        document.getElementById('hArp').className = 'dot' + (arpFlash > 0.35 ? ' arp' : '');
+      }
+    }
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    requestAnimationFrame(render);
+
+    // 便于在控制台里调试
+    window.FlockLab = {
+      params, resetBoids,
+      get density() { return density; },
+      get avgNeighbors() { return avgNeighbors; }
+    };
+  </script>
+</body>
+</html>
