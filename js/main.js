@@ -62,7 +62,7 @@ const DEFAULTS = {
   perception: 14,
   separationRange: 1.9,
   flow: 2.05,
-  maxSpeed: 12.3,
+  maxSpeed: 15,
   minSpeed: 0.5,
   boundary: BOUND,
   arrowSize: 0.25,
@@ -74,7 +74,7 @@ const DEFAULTS = {
   fleeRange: 9.5,       // 危险感知距离
   predict: 0.6,
   chaseWeight: 1.55,    // 追击力度
-  predSpeed: 12.2,
+  predSpeed: 25,
   lockTime: 1.0,
   feedCooldown: 8.0,
   infoCascade: true,
@@ -82,9 +82,10 @@ const DEFAULTS = {
   sprintFactor: 1.7,
   sprintDuration: 1.0,
   sprintRecovery: 3.0,
-  // 音量：音乐与音效分开，默认音乐明显更轻，避免低频一直嗡嗡地压着
-  musicLevel: 0.0,
-  fxLevel: 1.0,
+  // 音量统一用 0~100 的百分比刻度（内部再换算成增益）：
+  // 默认音乐 30%（能听见但不会压住画面），音效 100%（与旧版 1.0 增益等价）。
+  musicLevel: 30,
+  fxLevel: 100,
   // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
   grassOn: true
 };
@@ -100,8 +101,9 @@ const PERSIST_KEYS = [
   'sprintFactor', 'sprintDuration', 'sprintRecovery',
   'musicLevel', 'fxLevel', 'grassOn'
 ];
-// v3：元素数量上限/默认值改为 10000 / 1000，旧存档里的 600 不再沿用。
-const STORE_KEY = 'flocklab.params.v4';
+// v5：出厂默认值改为 巡航 15 / 捕食者 25 / 音乐 30%，并把音量刻度统一成百分比，
+// 旧存档不再沿用，只有点「重新初始化」或首次访问才会拿到这组新默认值。
+const STORE_KEY = 'flocklab.params.v5';
 const PARAM_RANGE = {
   count: [10, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
   perception: [1, 14], separationRange: [0.2, 6], flow: [0, 4],
@@ -110,7 +112,7 @@ const PARAM_RANGE = {
   predict: [0, 1.5], chaseWeight: [0, 4], predSpeed: [2, 36],
   lockTime: [0, 5], feedCooldown: [0.3, 60],
   sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12],
-  musicLevel: [0, 1.5], fxLevel: [0, 1.5]
+  musicLevel: [0, 100], fxLevel: [0, 150]
 };
 const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function loadParams() {
@@ -199,9 +201,23 @@ const settled = new Uint8Array(MAX_N);
 const restApproachUntil = new Float64Array(MAX_N);  // 前往草地的截止时间，飞太久就放弃
 const restMoves = new Uint8Array(MAX_N);            // 已在草地上换过几次位置（最多 2 次）
 const restTries = new Uint8Array(MAX_N);            // 为了找空位而重新选点的次数
+const restAng = new Float32Array(MAX_N);            // 站定时保持的朝向 = 落地瞬间的飞行方向（避免朝向跳变）
+const restPhase = new Float32Array(MAX_N);          // 个体作息相位 0~1：把出发 / 离场时间天然错开
+const restSwapAt = new Float64Array(MAX_N).fill(Infinity);  // 老住客换位的错峰起步时刻
+const restFleeAt = new Float64Array(MAX_N).fill(Infinity);  // 受惊后的错峰起飞时刻
+let restSessions = 0;   // 累计完成的草地休憩次数（状态卡用）
 let flyLandings = 0;   // 「掠过草地顺手落下」的次数（调试用）
 const overGrass = new Uint8Array(MAX_N);            // 上一帧是否正在草地正上方（用于「掠过」判定）
 const REST_SPACING = 1.5;                           // 草地上个体之间要保持的最小距离（≈6 个身位）
+// 单次停留上限 60 秒：基础 28~50 秒 + 个体作息相位 0~10 秒。
+// 相位让同批落地的鸟不会在同一秒集体起飞（拆分后这两个常量曾漏定义，务必保留）。
+const REST_MAX_MIN = 28000, REST_MAX_SPAN = 22000, REST_PHASE_SPAN = 10000;
+// 落点微调只用「速度积分走过去」，绝不直接写 pos——那一下就是肉眼可见的瞬移。
+// 半径放大到 1.25 仍能保持连续：鸟会花 1~2 秒慢慢走过去，而不是一帧跳过去。
+const REST_NUDGE_MIN = 0.45, REST_NUDGE_MAX = 1.25;
+// 软错峰：每帧最多放行 2 只鸟「出发去草地」、1 只鸟「站定」。
+// 不取消需求也不减少总次数，只把成群的同步动作摊成一条细流。
+const REST_START_SOFT_CAP = 2, REST_SETTLE_SOFT_CAP = 1;
 // 边界通行判定：靠近墙时先掷一次骰子决定「这次当墙不存在」还是「提前避开」。
 // 只有掷中的人才真的会穿出去，其余会提前转弯，所以不会贴着墙反复撞。
 const wallPass = new Uint8Array(MAX_N);             // 1 = 这次撞墙当作没有墙（会穿出去）
@@ -219,6 +235,9 @@ function rollTraits(i) {
   wAng[i] = Math.random() * Math.PI * 2;
   wAmp[i] = 0.55 + Math.random() * 1.1;
   reactJit[i] = 0.78 + Math.random() * 0.54;
+  // 作息相位是「性格」的一部分：出生时抽一次，之后每次重排休息/离场时间都带上它，
+  // 于是同一波落地的鸟天然分散在不同的时刻出发与起飞。
+  restPhase[i] = Math.random();
 }
 
 const capNow = new Float32Array(MAX_N);        // 每只鸟当前生效的速度上限（只用于调试采样）
@@ -295,6 +314,11 @@ const BURST_MS = 820;                           // 捕杀动画时长，三段�
 const THERMAL_REF = 5.0;                        // 统计用的参考速度，与声音无关
 
 let density = 0, avgSpeed = 0, avgNeighbors = 0;
+// Vicsek 有序参量 φ = |Σ(vᵢ/|vᵢ|)| / N：0=各飞各的，1=整群同向，是「涌现」最直观的量化
+let orderParam = 0, groupAlert = false;
+// 一帧内同时「出发去休息 / 离开草地」的数量与历史峰值，用来验证错峰是否生效
+let waveStart = 0, waveEnd = 0, waveStartMax = 0, waveEndMax = 0;
+let restStartThisFrame = 0, restSettleThisFrame = 0;
 let currentPace = 0;
 // 上一帧鱼群质心：用于群体级躲避，让整群像鱼群一样一起绕开捕食者。
 let groupX = 0, groupY = 0, groupZ = 0;
@@ -320,8 +344,10 @@ function initBoids(from, to, isBirth = false) {
     stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
     alertMs[i] = 0; trailAmt[i] = 0;
     resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
-    restDue[i] = performance.now() + 4000 + Math.random() * 26000;
+    restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
     rollTraits(i);
+    // 首次「想休息」的时刻铺到 3~35 秒（含个体相位），避免开局一波同时出发
+    restDue[i] = performance.now() + 3000 + Math.random() * 22000 + restPhase[i] * 10000;
     caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
   }
 }
@@ -359,8 +385,9 @@ function spawnFar(i, now) {
   alertMs[i] = 0; trailAmt[i] = 0;
   trailTail[i * 2] = pos[k]; trailTail[i * 2 + 1] = pos[k + 1];
   resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
-  restDue[i] = now + 5000 + Math.random() * 20000;
-  rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
+  restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
+  rollTraits(i);   // 重生等于换一只新个体：速度脾气、游走相位和作息相位都重新抽
+  restDue[i] = now + 4000 + Math.random() * 20000 + restPhase[i] * 8000;
 }
 
 function initPredators(from, to) {
@@ -395,6 +422,8 @@ const resetBoids = () => {
   initPredators(0, activeP);
   predCatches = 0;
   sprintCount = 0;
+  restSessions = 0;
+  waveStartMax = 0; waveEndMax = 0;
   caught.fill(0); respawnAt.fill(0);
   predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
   clearBursts();
@@ -640,7 +669,7 @@ function pickRestPoint(gp, skipI) {
   const bd = bounds2D();
   const cl = (v, h) => Math.max(-h + 1.2, Math.min(h - 1.2, v));
   // 草地越挤，允许的间距越小；实在放不下就选「最空」的那个点，而不是统统堆到中心
-  const minSep = REST_SPACING * (gp.members.size > gp.cap * 0.75 ? 0.7 : 1);
+  const minSep = REST_SPACING * (gp.members.size > gp.cap * 0.75 ? 0.85 : 1);
   const ms2 = minSep * minSep;
   let bx = gp.x, by = gp.y, bestScore = -Infinity;
   for (let t = 0; t < 34; t++) {
@@ -684,6 +713,29 @@ function pickRestPointBest(gp, skipI) {
   return [bx, by];
 }
 
+// 「挪半步」：只在当前位置周围 0.42~0.78 个单位内找一个离邻居更远的点。
+// 存在意义就是不直接写 pos——落点改成这里之后，位移仍由下一帧的速度积分产生，
+// 所以肉眼看到的是连续的小步移动，而不是一帧跳到草地另一头。
+function nearbyRestPoint(gp, i, px, py) {
+  const bd = bounds2D();
+  let bx = px, by = py, best = -1;
+  for (let t = 0; t < 18; t++) {
+    const ang = Math.random() * Math.PI * 2;
+    const rad = REST_NUDGE_MIN + Math.random() * (REST_NUDGE_MAX - REST_NUDGE_MIN);
+    const x = px + Math.cos(ang) * rad, y = py + Math.sin(ang) * rad;
+    if (Math.abs(x) > bd.hx - 1.0 || Math.abs(y) > bd.hy - 1.0) continue;
+    let nearest = Infinity;
+    for (const j of gp.members) {
+      if (j === i || !settled[j]) continue;
+      const dx = x - pos[j * 3], dy = y - pos[j * 3 + 1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 < nearest) nearest = d2;
+    }
+    if (nearest > best) { best = nearest; bx = x; by = y; }
+  }
+  return [bx, by];
+}
+
 function startRest(i, time) {
   const k = i * 3;
   let best = -1, bestD2 = Infinity;
@@ -694,31 +746,44 @@ function startRest(i, time) {
     const d2 = dx * dx + dy * dy;
     if (d2 < bestD2) { bestD2 = d2; best = g; }
   }
-  if (best < 0) { restDue[i] = time + 2500; return; }   // 都满了，过会儿再试
+  // 都满了：重试时间必须带随机抖动，否则所有被挡住的鸟会在同一秒再冲一次
+  if (best < 0) {
+    restDue[i] = time + 1800 + Math.random() * 4200 + restPhase[i] * 5000;
+    return;
+  }
   const gp = grass[best];
+  // 软错峰：本帧出发的鸟够多了就顺延 0.25~2 秒，不取消这次休息。
+  // 配合个体作息相位，把「一群鸟同时飞去草地」摊成均匀细流。
+  if (restStartThisFrame >= REST_START_SOFT_CAP) {
+    restDue[i] = time + 250 + Math.random() * 1600 + restPhase[i] * 900;
+    return;
+  }
+  restStartThisFrame++;
   const [tx, ty] = pickRestPoint(gp, i);
   restTgt[i * 2] = tx; restTgt[i * 2 + 1] = ty;
   resting[i] = 1; settled[i] = 0; restPatch[i] = best;
   restMoves[i] = 0; restTries[i] = 0;
+  restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
   gp.members.add(i); gp.count = gp.members.size;
   restSince[i] = 0;
+  waveStart++;
   // 先给一段赶路时间；真正「开始休息」要等它到点并停稳（见 settled）
   const travel = Math.hypot(tx - pos[k], ty - pos[k + 1]) / Math.max(6, params.maxSpeed * 0.6);
-  restApproachUntil[i] = time + travel * 1000 + 15000;
-  restUntil[i] = time + travel * 1000 + 15000;   // 到点后会重设成 50~60 秒
-  restDue[i] = time + 24000 + Math.random() * 22000;
-  // 有新的鸟降落到这片草地：已经休息 5~60 秒的老住客有 10% 概率往旁边挪个位置，
-  // 免得草地点位被一批「先到者」长期占死。每只鸟最多挪 2 次。
+  const approach = travel * 1000 + 15000 + restPhase[i] * 3000;
+  restApproachUntil[i] = time + approach;
+  restUntil[i] = time + approach;              // 到点后会重设成 28~60 秒
+  // 下次出发：20~53 秒 + 个体相位，绝不与同批鸟同步
+  restDue[i] = time + 20000 + Math.random() * 24000 + restPhase[i] * 9000;
+  // 有新的鸟降落到这片草地：已经休息 5~60 秒的老住客有 10% 概率往旁边挪个位置。
+  // 关键改动：只登记一个 0~4 秒内的随机「起身时刻」，不立刻 unsettle、也不改朝向，
+  // 于是一批老住客不会在同一帧齐刷刷动起来；到点后也只挪半步（见 nearbyRestPoint）。
   for (const j of gp.members) {
     if (j === i || !settled[j] || restMoves[j] >= 2) continue;
     const dwell = time - restSince[j];
     if (dwell < 5000 || dwell > 60000) continue;
     if (Math.random() >= 0.10) continue;
-    const [nx, ny] = pickRestPointBest(gp, j);
-    restTgt[j * 2] = nx; restTgt[j * 2 + 1] = ny;
-    settled[j] = 0; restTries[j] = 0;                 // 重新走一小段再停
+    if (restSwapAt[j] === Infinity) restSwapAt[j] = time + Math.random() * 4000;
     restMoves[j]++;
-    wAng[j] = Math.random() * Math.PI * 2;            // 换个朝向后重新站定
   }
 }
 
@@ -726,6 +791,9 @@ function startRest(i, time) {
 function landHere(i, g, time) {
   const gp = grass[g];
   if (gp.members.size >= gp.cap) return false;
+  // 掠过落地也走同一份出发配额，避免整群一起掠过草地时同时落下一大片
+  if (restStartThisFrame >= REST_START_SOFT_CAP) return false;
+  restStartThisFrame++;
   const k = i * 3;
   // 落点优先取当前位置附近（顺势停下），但也要和别人保持间距
   let tx = pos[k], ty = pos[k + 1];
@@ -739,10 +807,12 @@ function landHere(i, g, time) {
   restTgt[i * 2] = tx; restTgt[i * 2 + 1] = ty;
   resting[i] = 1; settled[i] = 0; restPatch[i] = g;
   restMoves[i] = 0; restTries[i] = 0; restSince[i] = 0;
+  restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
   gp.members.add(i); gp.count = gp.members.size;
+  waveStart++;
   restApproachUntil[i] = time + 2500;     // 已经在草地上方，很快就能停稳
   restUntil[i] = time + 2500;
-  restDue[i] = time + 24000 + Math.random() * 22000;
+  restDue[i] = time + 20000 + Math.random() * 24000 + restPhase[i] * 9000;
   flyLandings++;
   return true;
 }
@@ -759,15 +829,18 @@ function endRest(i, time, scared) {
   if (resting[i]) audio.takeoff();   // 离地
   const wasSettled = settled[i] === 1;
   resting[i] = 0; settled[i] = 0;
+  restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
   const g = restPatch[i];
   if (g >= 0 && grass[g]) { grass[g].members.delete(i); grass[g].count = grass[g].members.size; }
   restPatch[i] = -1;
+  waveEnd++;
   // 「必须停留至少 5 秒」：真正停稳过、且被吓走时待够了 5 秒，才算休成；
   // 没停稳（还在赶路）或没待够就被赶走，都当作这次没休成，隔几秒重来。
+  // 两种重排都叠加个体作息相位，避免一批同时被惊走的鸟又约好一起回来。
   const dwell = wasSettled ? time - restSince[i] : 0;
   restDue[i] = (scared && dwell < 5000)
-    ? time + 6000 + Math.random() * 8000
-    : time + 24000 + Math.random() * 22000;
+    ? time + 5000 + Math.random() * 9000 + restPhase[i] * 7000
+    : time + 20000 + Math.random() * 24000 + restPhase[i] * 9000;
 }
 
 // ---------------------------------------------------------------- 草地
@@ -1219,6 +1292,32 @@ addEventListener('touchstart', wake, { passive: true });
 addEventListener('pointerdown', wake, { passive: true });
 wake();
 
+// 状态卡「钉住」：钉住后一键隐藏界面时它仍留在屏幕上（CSS 用 :not(.pinned) 排除）。
+// 单独存一个 key，不进参数存档，所以与 v5 参数版本无关；刷新后保持上次选择。
+const hudEl = document.getElementById('hud');
+const pinBtn = document.getElementById('pinBtn');
+const PIN_KEY = 'flocklab.hud.pinned';
+let hudPinned = false;
+try { hudPinned = localStorage.getItem(PIN_KEY) === '1'; } catch (_) { /* 隐私模式 */ }
+function syncPin() {
+  hudEl.classList.toggle('pinned', hudPinned);
+  pinBtn.classList.toggle('on', hudPinned);
+  pinBtn.setAttribute('aria-pressed', String(hudPinned));
+  const label = hudPinned
+    ? '取消钉住（隐藏界面时状态卡一起隐藏）'
+    : '钉住状态卡（隐藏所有界面时仍保留）';
+  pinBtn.title = label;
+  pinBtn.setAttribute('aria-label', label);
+}
+pinBtn.addEventListener('click', (e) => {
+  e.stopPropagation();   // 与 card-head 是兄弟节点，仍显式阻止冒泡更保险
+  hudPinned = !hudPinned;
+  try { localStorage.setItem(PIN_KEY, hudPinned ? '1' : '0'); } catch (_) {}
+  syncPin();
+  wake();
+});
+syncPin();
+
 // ---------------------------------------------------------------- GUI
 // 每行滑块的 title 写清“调大之后会怎样”，避免用户靠猜。
 const tip = (ctrl, text) => { ctrl.domElement.setAttribute('title', text); return ctrl; };
@@ -1318,12 +1417,12 @@ bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
 fGrass.open();
 
 const fSound = gui.addFolder('声音');
-bindNum(fSound, 'musicLevel', 0, 1.5, 0.05, '音乐音量',
-  '音乐音量｜背景四层音景的总音量。嫌低频嗡嗡就往下调，0 完全关掉音乐（提示音仍保留）。',
+bindNum(fSound, 'musicLevel', 0, 100, 1, '音乐音量(%)',
+  '音乐音量｜0~100% 的四层生成式音景总音量，默认 30%。嫌低频嗡嗡就往下调，0 完全关掉音乐（提示音仍保留）。',
   (v) => music.setLevel(v));
-bindNum(fSound, 'fxLevel', 0, 1.5, 0.05, '音效音量',
-  '音效音量｜爆发、被吃、新生三类提示音的音量，与音乐互不影响。',
-  (v) => { if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(v, audio.ctx.currentTime, 0.08); });
+bindNum(fSound, 'fxLevel', 0, 150, 1, '音效音量(%)',
+  '音效音量｜0~150% 的事件提示音音量，100% 为标准响度，与音乐互不影响。',
+  (v) => { if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(v / 100, audio.ctx.currentTime, 0.08); });
 fSound.close();
 
 // 恢复出厂参数：点右下角「重新初始化」才会走到这里，平时刷新都沿用存档。
@@ -1342,7 +1441,7 @@ function applyDefaults() {
   syncGrassVisibility();
   liftAllResting();
   music.setLevel(params.musicLevel);
-  if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel, audio.ctx.currentTime, 0.08);
+  if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel / 100, audio.ctx.currentTime, 0.08);
   for (const [, ctrl] of guiCtrls) ctrl.updateDisplay();
   saveParams();
   resetBoids();
@@ -1377,6 +1476,8 @@ function step(dt, time) {
   const paceSpeed = maxSpeed * 0.78;
   currentPace = paceSpeed;
   sprintingCount = 0;
+  waveStart = 0; waveEnd = 0;   // 本帧「出发 / 离场」计数，用于验证错峰
+  restStartThisFrame = 0; restSettleThisFrame = 0;
 
   // 群体惊吓检测：捕食者接近鱼群质心时触发一次波纹，离开后再进入才重新触发。
   if (P > 0) {
@@ -1389,7 +1490,8 @@ function step(dt, time) {
     }
     if (near && !groupWasThreat) groupThreatAt = time;
     groupWasThreat = near;
-  } else groupWasThreat = false;
+    groupAlert = near;          // 状态卡「群体警戒」徽标
+  } else { groupWasThreat = false; groupAlert = false; }
 
   grid.clear();
   for (let i = 0; i < n; i++) {
@@ -1583,74 +1685,94 @@ function step(dt, time) {
     const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
     let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
 
-    // 在草地上休息：不跑三条规则，只是朝落点漂过去、站稳、偶尔挪一下。
-    // 附近有捕食者立刻起飞，到点也会自己走——所以草地是「歇脚点」而不是避难所。
+    // 在草地上休息：不跑三条规则，只是朝落点漂过去、站稳、偶尔挪半步。
+    // 附近有捕食者按距离错峰起飞，到点也会自己走——草地是「歇脚点」而不是避难所。
     if (resting[i]) {
-      const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
-      const ddx = tx - px, ddy = ty - py;
-      const dd = Math.hypot(ddx, ddy);
-      // 移动由积分分支统一处理（赶路用巡航速度直飞，停稳后才强阻尼），
-      // 这里只负责「该不该继续待着」。
       acc[k] = 0; acc[k + 1] = 0; acc[k + 2] = 0;
       fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
       fleeing[i] = 0; neighbors[i] = 0;
-      let scared = false;
+
+      // 老住客换位：到点才起身，落点只在身边半步内，位移交给速度积分（绝不瞬移）。
+      if (settled[i] && time >= restSwapAt[i]) {
+        restSwapAt[i] = Infinity;
+        const gp = grass[restPatch[i]];
+        if (gp) {
+          const [nx, ny] = nearbyRestPoint(gp, i, px, py);
+          restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
+          settled[i] = 0; restTries[i] = 0;
+          restApproachUntil[i] = Math.max(restApproachUntil[i], time + 4500);
+        }
+      }
+      // 目标点要在换位之后读取，否则换位那一帧会立刻又站回原地
+      const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
+      const dd = Math.hypot(tx - px, ty - py);
+
+      // 受惊不再让整片草地同一帧起飞：按「离猛禽多远」给 40~560ms 反应延迟，
+      // 近的先跑、远的稍后，和飞行个体的反应延迟是同一套逻辑。
+      let scared = false, predD2 = Infinity;
       const safe2 = fleeR * 1.5 * (fleeR * 1.5);
       for (let p = 0; p < P; p++) {
         const q = p * 3;
         const ex = px - predPos[q], ey = py - predPos[q + 1];
-        if (ex * ex + ey * ey < safe2) { scared = true; break; }
+        const d2 = ex * ex + ey * ey;
+        if (d2 < predD2) predD2 = d2;
+        if (d2 < safe2) scared = true;
       }
-      // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算
-      if (!settled[i] && dd < 0.55 && Math.hypot(vx, vy) < 1.6) {
-        // 站定前看一眼周围的人：离得太近就换个点再站，最多试 4 次
+      if (scared) {
+        if (restFleeAt[i] === Infinity) {
+          const near = Math.min(1, Math.sqrt(predD2) / (fleeR * 1.5));
+          restFleeAt[i] = time + 40 + near * 520;
+        }
+      } else restFleeAt[i] = Infinity;
+      const fleeNow = scared && time >= restFleeAt[i];
+
+      // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算。
+      // 每帧只放行 1 只站定：否则同帧落地的两只鸟互相都还没 settled，
+      // 各自的间距检查都会跳过对方，于是贴在一起站定（minSep 掉到 0.6 的元凶）。
+      if (!settled[i] && dd < 0.55 && Math.hypot(vx, vy) < 1.6
+          && restSettleThisFrame < REST_SETTLE_SOFT_CAP) {
         const gp = grass[restPatch[i]];
         let tooClose = false;
         if (gp) {
-          const lim = REST_SPACING * 0.8;
+          const lim = REST_SPACING * 0.95;
           for (const j of gp.members) {
             if (j === i || !settled[j]) continue;
             const ex = px - pos[j * 3], ey = py - pos[j * 3 + 1];
             if (ex * ex + ey * ey < lim * lim) { tooClose = true; break; }
           }
         }
-        if (tooClose && gp) {
-          // 位置太挤：直接挪到这片草地上最空的一点再站定（幅度只有一两个单位，
-          // 看起来就是「落地时挪了半步」），比让它再飞一趟自然得多。
-          for (let tryN = 0; tryN < 3 && tooClose; tryN++) {
-            const [nx, ny] = pickRestPointBest(gp, i);
-            let bad = false;
-            const lim = REST_SPACING * 0.8;
-            for (const j of gp.members) {
-              if (j === i || !settled[j]) continue;
-              const ex = nx - pos[j * 3], ey = ny - pos[j * 3 + 1];
-              if (ex * ex + ey * ey < lim * lim) { bad = true; break; }
-            }
-            if (!bad) {
-              pos[k] = nx; pos[k + 1] = ny;
-              restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
-              tooClose = false;
-            }
-          }
+        if (tooClose && gp && restTries[i] < 5) {
+          // 只改目标点，让下一帧靠速度积分「走」过去。旧版在这里直接写 pos，
+          // 采样点可能落在草地另一头，于是肉眼看到的就是一次瞬移。
+          const [nx, ny] = nearbyRestPoint(gp, i, px, py);
+          restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
           restTries[i]++;
+          restApproachUntil[i] = Math.max(restApproachUntil[i], time + 2600);
+        } else {
+          settled[i] = 1;
+          restSettleThisFrame++;
+          // 站定朝向 = 落地瞬间的渲染朝向：箭头不会突然转过去，也不再随机重设朝向。
+          restAng[i] = Math.hypot(rVel[k], rVel[k + 1]) > 1e-4
+            ? Math.atan2(rVel[k + 1], rVel[k]) : wAng[i];
+          // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位
+          vel[k] = 0; vel[k + 1] = 0;
+          audio.land();          // 落地的那一下
+          restSince[i] = time;
+          restSessions++;
+          // 离场时间带个体相位：28~60 秒，同批落地的鸟不会一起走
+          restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN
+                         + restPhase[i] * REST_PHASE_SPAN;
         }
-        settled[i] = 1;
-        // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位，
-        // 把刚检查好的间距又挤掉。
-        vel[k] = 0; vel[k + 1] = 0;
-        audio.land();          // 落地的那一下
-        restSince[i] = time;
-        restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN;   // 50~60 秒
       }
       // 飞太久还没停稳（草地太挤/一直被挤）就放弃，别一直算作「在路上」
       if (!settled[i] && time > restApproachUntil[i]) {
         endRest(i, time, false);
         continue;
       }
-      if (scared || time >= restUntil[i] || !params.grassOn) {
+      if (fleeNow || time >= restUntil[i] || !params.grassOn) {
         endRest(i, time, scared);
-        // 起飞：给一个朝场内偏中心的速度，别贴着草地边缘继续打转
-        const ang = Math.atan2(py - groupY, px - groupX) + (Math.random() - 0.5) * 1.2;
+        // 起飞：朝场内偏中心，再给一个大扇形随机，避免整片鸟朝同一方向齐刷刷飞出
+        const ang = Math.atan2(py - groupY, px - groupX) + (Math.random() - 0.5) * 2.4;
         const vs = paceSpeed * (0.8 + Math.random() * 0.3);
         vel[k] = Math.cos(ang) * vs; vel[k + 1] = Math.sin(ang) * vs; vel[k + 2] = 0;
       }
@@ -1895,7 +2017,9 @@ function step(dt, time) {
       if (insideG >= 0) {
         // 同样不能用 fleeing 判断有没有危险（信息级联会让全群都是 fleeing），
         // 直接看最近的捕食者有多远。
-        if (!overGrass[i] && time >= sprintUntil[i] && Math.random() < 0.10) {
+        // 概率也按个体作息相位浮动（5%~13%）：整群一起掠过草地时不会同时落下一大片
+        if (!overGrass[i] && time >= sprintUntil[i]
+            && Math.random() < 0.05 + restPhase[i] * 0.08) {
           let safe = true;
           const safe2 = fleeR * 1.6 * (fleeR * 1.6);
           for (let p = 0; p < P; p++) {
@@ -1928,7 +2052,9 @@ function step(dt, time) {
         const ex = px - predPos[q], ey = py - predPos[q + 1];
         if (ex * ex + ey * ey < safe2) { ok = false; break; }
       }
-      if (ok) startRest(i, time); else restDue[i] = time + 1500;
+      // 附近有猛禽时重试也要错峰，否则猛禽一走开，整批鸟会在同一秒一起出发
+      if (ok) startRest(i, time);
+      else restDue[i] = time + 1200 + Math.random() * 3000 + restPhase[i] * 2500;
     }
 
     acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = 0;
@@ -2065,16 +2191,25 @@ function step(dt, time) {
   }
   if (P > 0) prevFlee.set(fleeDir);   // 信息级联使用上一帧逃逸方向
 
-  let spread = 0, restN = 0;
+  let spread = 0, restN = 0, dirX = 0, dirY = 0, dirN = 0;
   for (let i = 0; i < n; i++) {
     if (caught[i]) continue;
-    if (settled[i]) restN++;
     const k = i * 3;
+    if (settled[i]) restN++;
+    else {
+      // Vicsek 有序参量：把每只飞行中的鸟的方向单位化后相加，
+      // 乱飞时互相抵消（φ→0），整群同向时叠加（φ→1）。
+      const sp = Math.hypot(vel[k], vel[k + 1]);
+      if (sp > 0.05) { dirX += vel[k] / sp; dirY += vel[k + 1] / sp; dirN++; }
+    }
     // 参考点必须是用质心（cx 此时还是坐标总和，需要除以 aliveN），
     // 之前直接用总和对减，算出来的半径大了一个数量级，相干度永远是 0。
     const dx = pos[k] - groupX, dy = pos[k + 1] - groupY;
     spread += dx * dx + dy * dy;
   }
+  orderParam = dirN > 0 ? Math.hypot(dirX, dirY) / dirN : 0;
+  waveStartMax = Math.max(waveStartMax, waveStart);
+  waveEndMax = Math.max(waveEndMax, waveEnd);
 
   // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
   restingCount = restN;
@@ -2096,6 +2231,62 @@ function step(dt, time) {
 }
 
 // ---------------------------------------------------------------- 渲染
+// 状态卡迷你趋势图：ρ 实线 + 音乐聚集度虚线，每 0.1s 采样一次，保留 9 秒历史。
+// 画在 2 倍分辨率的 canvas 上（CSS 缩到 34px 高），高分屏也不糊。
+const sparkCanvas = document.getElementById('hSpark');
+const sparkCtx = sparkCanvas.getContext('2d');
+const sparkRho = [], sparkMusic = [];
+const SPARK_N = 90;
+function sparkPush(rho, mus) {
+  sparkRho.push(rho); sparkMusic.push(mus);
+  if (sparkRho.length > SPARK_N) { sparkRho.shift(); sparkMusic.shift(); }
+}
+function drawSpark() {
+  const c = sparkCtx, W = sparkCanvas.width, H = sparkCanvas.height;
+  c.clearRect(0, 0, W, H);
+  c.strokeStyle = 'rgba(126,170,235,0.10)'; c.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = H * i / 4;
+    c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke();
+  }
+  const plot = (arr, stroke, fill, width, dash) => {
+    if (arr.length < 2) return;
+    const stepX = W / (SPARK_N - 1);
+    const x0 = W - (arr.length - 1) * stepX;
+    const path = () => {
+      c.beginPath();
+      for (let i = 0; i < arr.length; i++) {
+        const x = x0 + i * stepX, y = H - 5 - arr[i] * (H - 12);
+        if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+      }
+    };
+    if (fill) {
+      path(); c.lineTo(W, H); c.lineTo(x0, H); c.closePath();
+      const g = c.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, fill); g.addColorStop(1, 'rgba(99,230,255,0)');
+      c.fillStyle = g; c.fill();
+    }
+    path();
+    c.setLineDash(dash || []);
+    c.strokeStyle = stroke; c.lineWidth = width;
+    c.lineJoin = 'round'; c.lineCap = 'round';
+    c.stroke(); c.setLineDash([]);
+  };
+  plot(sparkMusic, 'rgba(255,156,203,0.55)', null, 2, [6, 6]);
+  plot(sparkRho, '#63e6ff', 'rgba(99,230,255,0.22)', 3);
+}
+// 事件计数只在数值变化时弹一下，避免每 0.1s 都闪
+const statLast = {};
+function setStat(id, v) {
+  if (statLast[id] === v) return;
+  statLast[id] = v;
+  const el = document.getElementById(id);
+  el.textContent = v;
+  el.classList.remove('pop');
+  void el.offsetWidth;
+  el.classList.add('pop');
+}
+
 let last = performance.now();
 let fps = 60, fpsAcc = 0, fpsFrames = 0, hudTimer = 0;
 
@@ -2152,10 +2343,11 @@ function render(now) {
     } else {
       col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
     }
-    // 停在草地上时把渲染速度固定成一个私人朝向：否则速度归零后
-    // atan(0,0)=0，整片鸟会齐刷刷指向右边，看着很假。
+    // 停在草地上时保持「落地那一刻的飞行朝向」：速度归零后 atan(0,0)=0，
+    // 若不给朝向整片鸟会齐刷刷指向右边。用落地瞬间记录的角度，方向连续、
+    // 不会再随机重设朝向，所以站定那一帧不会出现箭头突然转过去的跳变。
     if (settled[i]) {
-      rVel[k] = Math.cos(wAng[i]); rVel[k + 1] = Math.sin(wAng[i]); rVel[k + 2] = 0;
+      rVel[k] = Math.cos(restAng[i]); rVel[k + 1] = Math.sin(restAng[i]); rVel[k + 2] = 0;
     }
     // 爆发中：不换成另一种颜色（原来抹成黄色，和冷色调的群体完全打架），
     // 而是在自身色相上「烧」向粉白——色相推到紫红端、亮度抬高、边缘更亮，
@@ -2377,20 +2569,49 @@ function render(now) {
   hudTimer += dt;
   if (hudTimer > 0.1) {
     hudTimer = 0;
-    document.getElementById('hDensityBar').style.width = (density * 100).toFixed(0) + '%';
-    document.getElementById('hTemp').textContent = temperature.toFixed(3);
-    document.getElementById('hPress').textContent = pressure.toFixed(3);
-    let recovering = 0;
-    for (let i = 0; i < activeCount; i++) if (stamina[i] < 1) recovering++;
-    document.getElementById('hSprint').textContent = sprintingCount + ' / ' + recovering;
-    document.getElementById('hRest').textContent = restingCount;
-    document.getElementById('hFps').textContent = Math.round(fps) + ' FPS';
+    const $ = (id) => document.getElementById(id);
     const fxOn = audio.enabled && !audio.muted;
-    document.getElementById('hMusicBar').style.width =
-      ((fxOn && music.running ? music.smooth : 0) * 100).toFixed(0) + '%';
-    document.getElementById('hSprintFx').className = 'dot' + (fxOn && fxFlash.sprint > 0.35 ? ' sprint' : '');
-    document.getElementById('hPredFx').className = 'dot' + (fxOn && fxFlash.predate > 0.35 ? ' pred' : '');
-    document.getElementById('hBirthFx').className = 'dot' + (fxOn && fxFlash.birth > 0.35 ? ' birth' : '');
+
+    // 主导状态徽标：一眼看出「现在整群在干什么」，比九个静态数字有看点
+    let st = '自由巡航', cls = 'st-cruise';
+    let sub = 'Φ ' + orderParam.toFixed(2) + ' · 三条局部规则正在自组织';
+    if (sprintingCount > Math.max(6, activeCount * 0.02)) {
+      st = '逃逸涟漪'; cls = 'st-flee';
+      sub = sprintingCount + ' 只冲刺中 · 涟漪从猛禽身边扩散';
+    } else if (groupAlert) {
+      st = '群体警戒'; cls = 'st-alert'; sub = '猛禽进入群体感知范围';
+    } else if (restingCount > activeCount * 0.10) {
+      st = '草地休憩'; cls = 'st-rest'; sub = restingCount + ' 只在草上停稳';
+    } else if (cohesion01 > 0.42) {
+      st = '紧密成团'; cls = 'st-flock'; sub = '对齐与聚合压过了分离';
+    } else if (orderParam > 0.62) {
+      st = '同向齐飞'; cls = 'st-align'; sub = '局部对齐在整群上放大';
+    }
+    $('hState').textContent = st;
+    $('hState').className = 'state-badge ' + cls;
+    $('hStateSub').textContent = sub;
+
+    // ρ 与音乐聚集度的 9 秒曲线
+    sparkPush(density, fxOn && music.running ? music.smooth : 0);
+    drawSpark();
+    $('hDensity').textContent = density.toFixed(2);
+    $('hTemp').textContent = temperature.toFixed(2);
+    $('hPress').textContent = pressure.toFixed(2);
+    $('hOrderBar').style.width = (orderParam * 100).toFixed(0) + '%';
+    $('hOrder').textContent = orderParam.toFixed(2);
+    $('hSpeed').textContent = avgSpeed.toFixed(1);
+    $('hRadius').textContent = groupRms.toFixed(1);
+    $('hNeigh').textContent = avgNeighbors.toFixed(1);
+    $('hSprint').textContent = sprintingCount;
+    setStat('hCatch', predCatches);
+    setStat('hPort', teleportCount);
+    setStat('hBurst', sprintCount);
+    setStat('hRest', restSessions);
+    $('hRest').title = '累计 ' + restSessions + ' 次 · 当前 ' + restingCount + ' 只在草上';
+    $('hFps').textContent = Math.round(fps) + ' FPS';
+    $('hSprintFx').className = 'dot' + (fxOn && fxFlash.sprint > 0.35 ? ' sprint' : '');
+    $('hPredFx').className = 'dot' + (fxOn && fxFlash.predate > 0.35 ? ' pred' : '');
+    $('hBirthFx').className = 'dot' + (fxOn && fxFlash.birth > 0.35 ? ' birth' : '');
   }
 }
 
@@ -2471,6 +2692,35 @@ window.FlockLab = {
   get sprintingCount() { return sprintingCount; },
   get trailCount() { return trailGeo.instanceCount; },
   get restingCount() { return restingCount; },
+  get orderParam() { return +orderParam.toFixed(3); },
+  get groupAlert() { return groupAlert; },
+  get restSessions() { return restSessions; },
+  get hudPinned() { return hudEl.classList.contains('pinned'); },
+  // 作息相位分布：验证出发 / 离场时间确实被逐只打散
+  get restPhaseStats() {
+    let lo = 1, hi = 0, sum = 0;
+    for (let i = 0; i < activeCount; i++) {
+      const v = restPhase[i]; lo = Math.min(lo, v); hi = Math.max(hi, v); sum += v;
+    }
+    return { min: +lo.toFixed(3), max: +hi.toFixed(3), mean: +(sum / activeCount).toFixed(3) };
+  },
+  // 未来 10 秒内任意 0.5s 窗口里，最多有多少只鸟的「出发去休息 / 离开草地」挤在一起。
+  // 错峰生效后这个数应该是个位数，而不是几十上百。
+  get grassBunch() {
+    const now = performance.now();
+    let startMax = 0, endMax = 0;
+    for (let s = 0; s < 20; s++) {
+      const t0 = now + s * 500, t1 = t0 + 500;
+      let a = 0, b = 0;
+      for (let i = 0; i < activeCount; i++) {
+        if (caught[i]) continue;
+        if (!resting[i] && restDue[i] >= t0 && restDue[i] < t1) a++;
+        if (settled[i] && restUntil[i] >= t0 && restUntil[i] < t1) b++;
+      }
+      startMax = Math.max(startMax, a); endMax = Math.max(endMax, b);
+    }
+    return { startMax, endMax, frameStartMax: waveStartMax, frameEndMax: waveEndMax };
+  },
   // 休息质量诊断：最小间距、换过位置的个体数、最长停留
   get flyLandings() { return flyLandings; },
   get restStats() {

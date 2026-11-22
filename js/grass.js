@@ -88,8 +88,8 @@ const grassMatProto = new THREE.ShaderMaterial({
   depthWrite: false,
   depthTest: false
 });
-// 停留时长：只要没危险就一直待着，最长 100~120 秒
-const REST_MAX_MIN = 50000, REST_MAX_SPAN = 10000;    // ms（50~60 秒）
+// 停留时长的调度在 main.js（REST_MAX_MIN / REST_MAX_SPAN / REST_PHASE_SPAN），
+// 本模块只负责草地的形状与着色，不再重复定义仿真常量。
 
 // 估算一片草地上落在场地内的面积（蒙特卡洛）：用于按目标面积反推 R，
 // 这样即使草地压在边界上、被切掉一块，场地里看到的面积仍然是目标值。

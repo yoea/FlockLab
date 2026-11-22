@@ -69,6 +69,7 @@
         <li><b>等一次捕食</b>：猛禽逼近时爆发不是整群同时亮，而是一圈从它身边向外扩散的涟漪（反应延迟随距离变长）。</li>
         <li><b>盯着警戒圈</b>：刚吃饱是暗红圈，饿了转成亮红圈，体色同步由浅橙黄渐变回深橙——圈和体色就是它的「饥饿指示灯」。</li>
         <li><b>看草地</b>：每只鸟隔一阵必须落地停稳 ≥5 秒才算休息；落地的鸟变苔绿、彼此留间距，新鸟落下时老住客偶尔换位。</li>
+        <li><b>盯状态卡</b>：有序度 Φ = |Σvᵢ|/Σ|vᵢ|，散乱时接近 0、整群同向时接近 1；配合 ρ 的 9 秒曲线，能亲眼看到「相变」而不是只靠感觉。</li>
       </ol>
 
       <p class="about-sec">机制一览</p>
@@ -80,26 +81,56 @@
         <li><b>反应延迟</b>看到猛禽不会立刻爆发：贴身约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像涟漪从捕食者身边扩散开。</li>
         <li><b>草地</b>2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 1 分钟）；落地变苔绿色、彼此保持间距，飞行中的鸟会绕开草地，并有轻微的起降音效。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时几乎无声，抱团后和声变厚、节拍渐起。与提示音共用右下角声音开关。</li>
-        <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。</li>
+        <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。左下角状态卡可折叠，点右上角图钉「钉住」后，一键隐藏界面时它会继续留在屏幕上。</li>
       </ul>
       <p class="about-foot">Three.js · WebGL · HTML / CSS / JS / SVG 模块化</p>
     </div>
   </div>
 
   <div id="hud" class="glass card">
+    <button id="pinBtn" class="pin" type="button" title="钉住状态卡（隐藏界面时仍保留）"
+            aria-label="钉住状态卡" aria-pressed="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="pin-head" d="M8.4 3.2h7.2l-.8 6.4 3.0 3.0H6.2l3.0-3.0z" />
+        <path class="pin-stem" d="M12 12.6V20.4" />
+      </svg>
+    </button>
     <button class="card-head" type="button" aria-expanded="true">
       <span class="card-title">实时状态</span><span class="chev">▾</span>
     </button>
     <div class="card-body">
-      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">1000</span> <span style="color:#ff8a5c">◆<span id="hPred">1</span></span></span></div>
-      <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
-      <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
-      <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
-      <div class="hud-row"><span class="k">音乐 聚集度驱动</span><span class="bar"><i id="hMusicBar"></i></span></div>
-      <div class="hud-row"><span class="k">音效 逃逸 / 被吃 / 新生</span><span class="v"><span class="dot" id="hSprintFx"></span><span class="dot" id="hPredFx"></span><span class="dot" id="hBirthFx"></span></span></div>
-      <div class="hud-row"><span class="k">爆发中 / 恢复中</span><span class="v" id="hSprint">0 / 0</span></div>
-      <div class="hud-row"><span class="k">草地休息</span><span class="v" id="hRest">0</span></div>
-      <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
+      <div class="state-line">
+        <span class="state-badge st-cruise" id="hState">自由巡航</span>
+        <span class="state-sub" id="hStateSub">三条局部规则正在自组织</span>
+      </div>
+
+      <div class="spark-wrap">
+        <canvas id="hSpark" width="560" height="68"></canvas>
+        <span class="spark-tag">ρ 聚集密度 · 最近 9 秒</span>
+      </div>
+
+      <div class="hud-row"><span class="k">宏观量</span><span class="v">ρ <b id="hDensity">0.00</b><em>·</em> T <b id="hTemp">0.00</b><em>·</em> P <b id="hPress">0.00</b></span></div>
+      <div class="hud-row"><span class="k">有序度 Φ</span><span class="bar"><i id="hOrderBar"></i></span><span class="v mini" id="hOrder">0.00</span></div>
+
+      <div class="hud-grid">
+        <div><span class="k">平均速度</span><b id="hSpeed">0.0</b></div>
+        <div><span class="k">群半径 R</span><b id="hRadius">0.0</b></div>
+        <div><span class="k">邻居 / 只</span><b id="hNeigh">0.0</b></div>
+        <div><span class="k">爆发中</span><b id="hSprint">0</b></div>
+      </div>
+
+      <div class="event-line">
+        <span class="ev ev-pred"><i>◆</i>捕食 <b id="hCatch">0</b></span>
+        <span class="ev ev-port"><i>⇄</i>传送 <b id="hPort">0</b></span>
+        <span class="ev ev-sprint"><i>⚡</i>爆发 <b id="hBurst">0</b></span>
+        <span class="ev ev-rest"><i>❋</i>休憩 <b id="hRest">0</b></span>
+      </div>
+
+      <div class="hud-foot">
+        <span class="v"><span id="hCount">1000</span> <span class="pred-n">◆<span id="hPred">1</span></span></span>
+        <span class="dots"><span class="dot" id="hSprintFx"></span><span class="dot" id="hPredFx"></span><span class="dot" id="hBirthFx"></span></span>
+        <span class="v" id="hFps">— FPS</span>
+      </div>
     </div>
   </div>
 
