@@ -383,15 +383,6 @@
     </div>
   </div>
 
-  <div id="intro">
-    <div class="card glass">
-      <h2>FLOCKLAB</h2>
-      <p class="sub">二维平面 · 涌现行为 · 交互模拟</p>
-      <p>每个箭头只遵循<em>分离 · 对齐 · 聚合</em>三条规则。声音默认开启：加速逃逸、被吃掉与新生时会有提示音，背景音乐的音色会随着鸟群的聚集程度变化。</p>
-      <button id="startBtn">进入模拟</button>
-    </div>
-  </div>
-
   <div id="error"></div>
 
   <script type="module">
@@ -443,40 +434,40 @@
     // ---------------------------------------------------------------- 参数
     // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
     const BOUND = 40;
-    const MAX_N = 10000;
+    const MAX_N = 3000;
     const MAX_P = 10;
 
     // 出厂默认值：只有点击「重新初始化」才会回到这里。
     const DEFAULTS = {
       count: 1000,
-      separation: 1.39,
-      alignment: 1.35,
+      separation: 2.3,
+      alignment: 2.44,
       cohesion: 1.16,
-      perception: 2.7,
+      perception: 14,
       separationRange: 1.9,
       flow: 2.05,
-      maxSpeed: 15.2,
-      minSpeed: 2.2,
+      maxSpeed: 12.3,
+      minSpeed: 0.5,
       boundary: BOUND,
       arrowSize: 0.25,
       master: 0.38,
       // 捕食者：标准 Reynolds pursuit + 预测逃逸模型
       predatorOn: true,
-      predatorCount: 2,
-      fleeWeight: 1.5,      // 逃跑力度
-      fleeRange: 7.0,       // 危险感知距离
+      predatorCount: 1,
+      fleeWeight: 2.45,     // 逃跑力度
+      fleeRange: 9.5,       // 危险感知距离
       predict: 0.6,
-      chaseWeight: 2.6,     // 追击力度
-      predSpeed: 36,
+      chaseWeight: 1.55,    // 追击力度
+      predSpeed: 12.2,
       lockTime: 1.0,
-      feedCooldown: 3.0,
+      feedCooldown: 8.0,
       infoCascade: true,
       // 逃逸爆发：白肌式短时冲刺，体力耗尽后必须恢复，不能连续多次爆发
-      sprintFactor: 1.35,
-      sprintDuration: 0.8,
-      sprintRecovery: 5.0,
+      sprintFactor: 1.7,
+      sprintDuration: 1.0,
+      sprintRecovery: 3.0,
       // 音量：音乐与音效分开，默认音乐明显更轻，避免低频一直嗡嗡地压着
-      musicLevel: 0.55,
+      musicLevel: 0.0,
       fxLevel: 1.0,
       // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
       grassOn: true
@@ -494,9 +485,9 @@
       'musicLevel', 'fxLevel', 'grassOn'
     ];
     // v3：元素数量上限/默认值改为 10000 / 1000，旧存档里的 600 不再沿用。
-    const STORE_KEY = 'flocklab.params.v3';
+    const STORE_KEY = 'flocklab.params.v4';
     const PARAM_RANGE = {
-      count: [50, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
+      count: [10, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
       perception: [1, 14], separationRange: [0.2, 6], flow: [0, 4],
       maxSpeed: [2, 18], minSpeed: [0.5, 8], arrowSize: [0.18, 0.9],
       predatorCount: [1, MAX_P], fleeWeight: [0, 6], fleeRange: [3, 24],
@@ -637,6 +628,7 @@
     const predAccel = new Float32Array(MAX_P);       // 当帧加速度大小（转向力模长）
     const predTrailP = new Float32Array(MAX_P);      // 平滑后的加速度强度 0~1
     const predTrailAmt = new Float32Array(MAX_P);    // 拖尾强度 0~1
+    const predHeat = new Float32Array(MAX_P);        // 饥饿度 0~1：决定警戒圈的透明度与饱和度
     const predTrailTail = new Float32Array(MAX_P * 2);
     let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即视为「全力冲刺」（实测中位数 12、峰值 64）
     // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
@@ -760,7 +752,7 @@
         predCap[p] = params.predSpeed;
         predWp[p * 2] = 0; predWp[p * 2 + 1] = 0;
         predWpUntil[p] = 0;
-        predTrailAmt[p] = 0; predTrailP[p] = 0;
+        predTrailAmt[p] = 0; predTrailP[p] = 0; predHeat[p] = 1;
         predTrailTail[p * 2] = predPos[k]; predTrailTail[p * 2 + 1] = predPos[k + 1];
         predSpdJit[p] = 0.9 + Math.random() * 0.2;
         predWobble[p] = Math.random() * Math.PI * 2;
@@ -790,7 +782,7 @@
       document.getElementById('hPred').textContent = params.predatorOn ? next : '0';
     }
     function setCount(v) {
-      const next = Math.max(50, Math.min(MAX_N, Math.round(v)));
+      const next = Math.max(10, Math.min(MAX_N, Math.round(v)));
       if (next > activeCount) initBoids(activeCount, next);
       activeCount = next;
       params.count = next;
@@ -1463,7 +1455,7 @@
     const threatRings = [];
     for (let p = 0; p < MAX_P; p++) {
       const mat = new THREE.ShaderMaterial({
-        uniforms: { uAlpha: { value: 0 }, uPhase: { value: Math.random() * 6.283 } },
+        uniforms: { uAlpha: { value: 0 }, uPhase: { value: Math.random() * 6.283 }, uHeat: { value: 1 } },
         vertexShader: `
           varying vec2 vLocal;
           void main() {
@@ -1474,6 +1466,7 @@
         fragmentShader: `
           varying vec2 vLocal;
           uniform float uAlpha;
+          uniform float uHeat;   // 0=刚吃饱 1=饿了
           void main() {
             float r = length(vLocal);
             if (r > 1.08) discard;
@@ -1481,8 +1474,10 @@
             float band = exp(-d * d);              // 主环：很细
             float inner = exp(-pow((r - 0.965) * 10.0, 2.0)) * 0.30;   // 内侧暗红晕
             float outer = exp(-pow((r - 0.965) * 7.5, 2.0)) * 0.16;    // 外侧更淡
-            // 红 → 黑渐变：环上最亮是暗红，离开环就落到接近背景的黑
-            vec3 col = mix(vec3(0.05, 0.0, 0.0), vec3(0.75, 0.12, 0.07), clamp(band * 1.1 + inner * 0.7, 0.0, 1.0));
+            // 红 → 黑渐变：环上最亮是暗红，离开环就落到接近背景的黑。
+            // 饿了 → 高饱和的亮红；刚吃饱 → 几乎融进背景的暗栗色。
+            vec3 hot = mix(vec3(0.16, 0.03, 0.02), vec3(0.95, 0.09, 0.05), uHeat);
+            vec3 col = mix(vec3(0.03, 0.0, 0.0), hot, clamp(band * 1.1 + inner * 0.7, 0.0, 1.0));
             float a = (band * 0.45 + inner * 0.20 + outer * 0.10) * uAlpha;
             if (a < 0.002) discard;
             gl_FragColor = vec4(col, a);
@@ -1933,6 +1928,8 @@
       tick() {
         const ctx = this.a.ctx;
         if (!this.running || !ctx || ctx.state !== 'running') return;
+        // 音乐音量拉到 0 时不再排音符（默认就是 0），省掉没必要的振荡器创建
+        if (this.level < 0.001) { this.nextTime = ctx.currentTime + 0.1; return; }
         const eighth = 30 / this.bpm;          // 八分音符时长 = (60/bpm)/2
         const now = ctx.currentTime;
         if (this.nextTime < now) this.nextTime = now + 0.03;   // 切后台回来不补排
@@ -2029,17 +2026,12 @@
     const music = new FlockMusic(audio);
     audio.refreshButton();
 
-    document.getElementById('startBtn').addEventListener('click', () => {
-      audio.enable().then(() => document.getElementById('intro').classList.add('hidden'))
-        .catch((e) => fail('声音开启失败：' + e.message));
-    });
-
     // 默认开：页面加载就尝试建立音频上下文。浏览器通常会把自动播放挂起（不算错误），
     // 这时只要用户第一次操作（点画布、滚轮、按键）就自动恢复——不用再去点声音按钮。
     // 这两个按钮自己会处理手势，跳过以免「刚点开启又被 toggle 静音」。
     function unlockAudio(e) {
       const t = e && e.target;
-      if (t && t.closest && t.closest('#audioBtn, #startBtn')) return;
+      if (t && t.closest && t.closest('#audioBtn')) return;
       if (audio.enabled) {
         if (audio.ctx && audio.ctx.state !== 'running' && !audio.muted) audio.ctx.resume().catch(() => {});
         for (const ev of ['pointerdown', 'keydown', 'touchstart']) removeEventListener(ev, unlockAudio);
@@ -2174,8 +2166,8 @@
     fRules.open();
 
     const fMotion = gui.addFolder('飞行与视野');
-    bindNum(fMotion, 'count', 50, MAX_N, 10, '元素数量',
-      '元素总数（默认 1000，上限 10000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域，万级时约 20 FPS 上下）。调少：更容易看清单只的行为。',
+    bindNum(fMotion, 'count', 10, MAX_N, 10, '元素数量',
+      '元素总数（默认 1000，范围 10~3000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域，3000 只时约 30 FPS）。调少：更容易看清单只的行为。',
       (v) => setCount(v));
     bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
       '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
@@ -3135,10 +3127,15 @@
           ring.quaternion.copy(camera.quaternion);
           ring.scale.setScalar(params.fleeRange);   // 半径仍由「危险感知距离」控制
           ring.visible = true;
-          // 明暗呼吸：很慢（周期约 4.5s），幅度也小，只在暗处隐约可见
+          // 明暗呼吸：很慢（周期约 4.5s）。刚吃饱时几乎完全透明，
+          // 饿了才逐渐显出来并且变红变亮——圈本身就是「它还想不想吃东西」的指示灯。
           const ph = ring.material.uniforms.uPhase.value;
           const breathe = 0.5 + 0.5 * Math.sin(now * 0.0014 + ph);
-          ring.material.uniforms.uAlpha.value = 0.13 + 0.13 * breathe;   // 0.13~0.26，只在暗处隐约可见
+          const hungry = (now - predFeedAt[p]) >= cdMs ? 1 : 0;
+          predHeat[p] += (hungry - predHeat[p]) * (1 - Math.exp(-dt / 0.6));
+          const heat = predHeat[p];
+          ring.material.uniforms.uHeat.value = heat;
+          ring.material.uniforms.uAlpha.value = (0.02 + 0.42 * heat) * (0.72 + 0.28 * breathe);
 
           // ---- 体色：冷却期=浅橙黄，狩猎=深橙，冷却最后 1 秒渐变回深橙 ----
           // k=1 表示「刚吃饱」的浅橙黄，k=0 表示「随时能扑」的深橙。
@@ -3363,6 +3360,13 @@
         return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
           g: +predCol[p * 3 + 1].toFixed(2), b: +predCol[p * 3 + 2].toFixed(2),
           cooling: (performance.now() - predFeedAt[p]) < params.feedCooldown * 1000
+        }));
+      },
+      // 警戒圈状态：heat 0=刚吃饱（几乎透明）1=饿了（高饱和红）
+      get ringState() {
+        return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
+          heat: +predHeat[p].toFixed(2),
+          alpha: +threatRings[p].material.uniforms.uAlpha.value.toFixed(3)
         }));
       },
       get predatorTrail() {
