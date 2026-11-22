@@ -356,7 +356,7 @@
         <li><b>随机性</b>每只鸟各有速度系数与缓慢游走；撞墙会随机散射，捕食者也会摆尾。</li>
         <li><b>传送门边界</b>撞到边界的鸟有 1% 概率从对侧穿出，出入点关于中心对称。</li>
         <li><b>捕食者</b>锐角三角形，带碰撞体积，接触即捕食；进食后减速随机巡游。</li>
-        <li><b>两种爆发</b>被逼近时冲刺逃命（洋红高亮）；掉队太久也会冲刺追赶大部队，共用同一份体力。</li>
+        <li><b>爆发</b>只有被捕食者逼近时才会冲刺逃命（洋红发光 + 渐隐拖尾）；体力耗尽后必须恢复，不能连续爆发。</li>
         <li><b>反应延迟</b>看到捕食者不会立刻爆发：贴身的鸟约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像一圈涟漪从捕食者身边扩散开。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时只有低频嗡鸣，抱团后和声变厚、节拍渐起。与提示音共用右上角声音开关。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
@@ -551,7 +551,6 @@
     const stamina = new Float32Array(MAX_N);
     stamina.fill(1);
     const sprintUntil = new Float64Array(MAX_N);   // 爆发到期时间（ms）
-    const lagSince = new Float64Array(MAX_N);      // 开始「掉队」的时间戳，0 表示没掉队
     // 反应延迟：看到捕食者不等于立刻爆发。每只鸟有一个「危险感知计时器」，
     // 距离越近需要的累积时间越短（贴身约 45ms，感知圈边缘约 260ms，按距离平方过渡），
     // 再乘个体反应系数 0.78~1.32。这样爆发是从捕食者身边向外一圈圈亮起来，
@@ -561,13 +560,14 @@
     const REACT_NEAR_MS = 45;
     const REACT_FAR_MS = 260;
 
-    // 追赶大部队的判据：离群体质心超过 LAG_DIST_K 倍群体半径、且身边同伴数
-    // 不足平均值的 LAG_LONELY_K，并且连续保持 LAG_HOLD_MS 毫秒才允许起爆——
-    // 这样不会因为一帧的邻域抖动就触发，也不会让整个群体同时冲刺。
-    const LAG_DIST_K = 1.55;
-    const LAG_LONELY_K = 0.55;
-    const LAG_HOLD_MS = 380;
-    let lastCatchupSound = -Infinity;
+    // ---------------------------------------------------------------- 爆发拖尾
+    // 只有爆发中的个体才画拖尾。不做逐帧历史记录（万只时太贵），
+    // 而是给每只鸟维护「尾巴点」：尾巴用指数平滑追头部，稳态落后量 ≈ 速度 × τ，
+    // 所以尾巴长度自然随爆发速度变长，起爆瞬间从零快速拉长。
+    const trailHead = new Float32Array(MAX_N * 2);  // 头部（= 当前位置）
+    const trailTail = new Float32Array(MAX_N * 2);  // 尾巴（滞后点）
+    const trailAmt = new Float32Array(MAX_N);       // 拖尾强度 0~1，用于淡入淡出
+    const TRAIL_TAU = 0.115;                        // 尾巴跟随时间常数（秒）
     // ---------------------------------------------------------------- 个体差异
     // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
     // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
@@ -586,8 +586,8 @@
     const capNow = new Float32Array(MAX_N);        // 每只鸟当前生效的速度上限（只用于调试采样）
     capNow.fill(params.maxSpeed * 0.78);
     let sprintCount = 0, sprintingCount = 0;
-    let catchupCount = 0, laggingCount = 0, cohesion01 = 0;   // cohesion01：0=散开 1=紧团
-    // 上一帧的群体半径（RMS），追赶判定用它来区分「掉队」和「在队形内部」
+    let cohesion01 = 0;   // 0=散开 1=紧团
+    // 上一帧的群体半径（RMS），用于相干度与群体尺度
     let groupRms = 12;
 
     // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
@@ -668,7 +668,7 @@
         rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
         birthAt[i] = isBirth ? performance.now() : -Infinity;
         stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
-        lagSince[i] = 0; alertMs[i] = 0;
+        alertMs[i] = 0; trailAmt[i] = 0;
         rollTraits(i);
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
@@ -704,7 +704,7 @@
       rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
       birthAt[i] = now;
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
-      lagSince[i] = 0; alertMs[i] = 0;
+      alertMs[i] = 0; trailAmt[i] = 0;
       rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
     }
 
@@ -734,8 +734,8 @@
       initBoids(0, activeCount);
       initPredators(0, activeP);
       predCatches = 0;
-      sprintCount = 0; catchupCount = 0;
-      caught.fill(0); respawnAt.fill(0); lagSince.fill(0);
+      sprintCount = 0;
+      caught.fill(0); respawnAt.fill(0);
       predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
       clearBursts();
     };
@@ -953,6 +953,88 @@
     arrows.frustumCulled = false;
     scene.add(arrows);
 
+    // ---------------------------------------------------------------- 爆发拖尾
+    // 每条拖尾 = 一个实例四边形，从尾巴点拉到头点，沿长度收窄 + 加色发光。
+    // 只有爆发中的个体才写入实例（其余攒成 instanceCount = 0），所以常态零开销；
+    // 极端情况下并发爆发会超过上限，多出的直接丢弃（画面看不出来，也保护帧率）。
+    const MAX_TRAILS = 600;
+    const trailGeo = new THREE.InstancedBufferGeometry();
+    trailGeo.setAttribute('position', new THREE.Float32BufferAttribute([
+      -1, -1, 0,  1, -1, 0,  1, 1, 0,  -1, 1, 0
+    ], 3));
+    trailGeo.setAttribute('aLocal', new THREE.Float32BufferAttribute([
+      -1, -1,  1, -1,  1, 1,  -1, 1
+    ], 2));
+    trailGeo.setIndex([0, 1, 2, 0, 2, 3]);
+    const trHead = new Float32Array(MAX_TRAILS * 3);
+    const trTail = new Float32Array(MAX_TRAILS * 3);
+    const trCol = new Float32Array(MAX_TRAILS * 3);
+    const trWid = new Float32Array(MAX_TRAILS);
+    const trAlp = new Float32Array(MAX_TRAILS);
+    const aTrHead = new THREE.InstancedBufferAttribute(trHead, 3).setUsage(THREE.DynamicDrawUsage);
+    const aTrTail = new THREE.InstancedBufferAttribute(trTail, 3).setUsage(THREE.DynamicDrawUsage);
+    const aTrCol = new THREE.InstancedBufferAttribute(trCol, 3).setUsage(THREE.DynamicDrawUsage);
+    const aTrWid = new THREE.InstancedBufferAttribute(trWid, 1).setUsage(THREE.DynamicDrawUsage);
+    const aTrAlp = new THREE.InstancedBufferAttribute(trAlp, 1).setUsage(THREE.DynamicDrawUsage);
+    trailGeo.setAttribute('aHead', aTrHead);
+    trailGeo.setAttribute('aTail', aTrTail);
+    trailGeo.setAttribute('aColor', aTrCol);
+    trailGeo.setAttribute('aWidth', aTrWid);
+    trailGeo.setAttribute('aAlpha', aTrAlp);
+    trailGeo.instanceCount = 0;
+    const trailMat = new THREE.ShaderMaterial({
+      vertexShader: `
+        attribute vec2 aLocal;
+        attribute vec3 aHead;
+        attribute vec3 aTail;
+        attribute vec3 aColor;
+        attribute float aWidth;
+        attribute float aAlpha;
+        varying float vT;        // 0=尾 1=头
+        varying float vAcross;   // 横向 -1~1
+        varying vec3 vColor;
+        varying float vAlpha;
+        varying float vFade;
+        void main() {
+          vec2 dv = aHead.xy - aTail.xy;
+          float len = length(dv);
+          vec2 dir = len > 1e-4 ? dv / len : vec2(1.0, 0.0);
+          vec2 perp = vec2(-dir.y, dir.x);
+          float t = 0.5 + 0.5 * aLocal.x;
+          // 宽度沿长度收窄：尾部细、靠近头部略鼓，看起来像被拉出的速度线
+          float w = aWidth * (0.26 + 0.74 * pow(t, 0.7));
+          vec2 p = aTail.xy + dir * (len * t) + perp * (aLocal.y * w);
+          vT = t; vAcross = aLocal.y; vColor = aColor; vAlpha = aAlpha;
+          vec4 mv = modelViewMatrix * vec4(p, 0.0, 1.0);
+          vFade = 1.0 - smoothstep(45.0, 145.0, -mv.z);
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: `
+        varying float vT;
+        varying float vAcross;
+        varying vec3 vColor;
+        varying float vAlpha;
+        varying float vFade;
+        void main() {
+          float core = 1.0 - smoothstep(0.25, 1.0, abs(vAcross));
+          float glow = exp(-abs(vAcross) * 2.4) * 0.45;
+          float a = (core + glow) * vAlpha * (0.25 + 0.75 * vT) * vFade;
+          if (a < 0.004) discard;
+          // 加法混合下不要再把 a 预乘进 rgb：否则实际亮度是 a²，几乎看不见
+          gl_FragColor = vec4(vColor * (0.45 + 1.05 * vT), a);
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      side: THREE.DoubleSide
+    });
+    const trailMesh = new THREE.Mesh(trailGeo, trailMat);
+    trailMesh.frustumCulled = false;
+    scene.add(trailMesh);
+
     // ---------------------------------------------------------------- 捕食者渲染
     // 同样是箭头，但用「实心宽箭头」+ 暖橙红色 + 亮边，和猎物的细线「>」一眼分开；
     // 尺寸只比猎物大几倍，不再使用夸张的大剪影。
@@ -1081,6 +1163,7 @@
     const tmpColor = new THREE.Color();
     const tmpBirth = new THREE.Color(0x7dff9a);
     const tmpSprint = new THREE.Color(0xff9ad4);   // 爆发：在自身色相上烧向粉白（每帧按个体重算）
+    const tmpTrail = new THREE.Color(0xff9ad4);    // 拖尾：与爆发同一身份色
 
     // ---------------------------------------------------------------- 声音
     // 只保留三种事件音：加速逃逸 / 被吃掉 / 新生。
@@ -1708,9 +1791,9 @@
     bindNum(fPred, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
       '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
     bindNum(fPred, 'sprintDuration', 0.2, 3, 0.1, '爆发持续(秒)',
-      '爆发持续时间｜一次冲刺能维持几秒。调长：逃得更远。调短：更像瞬间闪避。结束后速度回到巡航上限。逃命和「掉队追赶」共用这个时长。');
+      '爆发持续时间｜一次逃命冲刺能维持几秒。调长：逃得更远、拖尾更长。调短：更像瞬间闪避。结束后速度回到巡航上限。');
     bindNum(fPred, 'sprintRecovery', 1, 12, 0.5, '体力恢复(秒)',
-      '体力恢复时间｜爆发后要几秒才能再次爆发（逃命和归队追赶共用）。调大：几乎不能连续爆发，鸟更容易被抓、也更容易掉队。调小：可以频繁逃生。');
+      '体力恢复时间｜爆发后要几秒才能再次爆发。调大：几乎不能连续爆发，鸟更容易被抓。调小：可以频繁逃生。');
     bindBool(fPred, 'infoCascade', '警报传递',
       '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
     fPred.open();
@@ -1772,7 +1855,6 @@
       const paceSpeed = maxSpeed * 0.78;
       currentPace = paceSpeed;
       sprintingCount = 0;
-      laggingCount = 0;
 
       // 群体惊吓检测：捕食者接近鱼群质心时触发一次波纹，离开后再进入才重新触发。
       if (P > 0) {
@@ -1959,7 +2041,7 @@
         const k = i * 3;
         const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
         let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
-        // 安全时按群体节奏控速；受惊时恢复满速；爆发（逃命或归队）时直接用爆发速度作为
+        // 安全时按群体节奏控速；受惊时恢复满速；爆发时直接用爆发速度作为
         // 转向目标速度——否则「追赶」只会把速度上限抬高，方向却仍按巡航速度算，容易冲过头。
         const isDashing = time < sprintUntil[i];
         const calm = !fleeing[i] && !isDashing;
@@ -2138,33 +2220,8 @@
           fleeing[i] = 0;
         }
 
-        // ---- 追赶大部队：没有威胁、但被队伍甩下时，同样允许一次爆发 ----
-        // 触发条件与「被追」共用同一套体力/冷却（stamina、sprintUntil、sprintDuration），
-        // 所以爆发时长、倍率、恢复时间完全一致，只是动机从「逃命」换成「归队」。
-        // 判据强调「真的掉队」：离质心超过 1.55 倍群体半径，且身边同伴数不到平均的 55%，
-        // 还要连续保持 380ms——避免队形正常呼吸就把全群点燃。
-        if (!sprinting && stamina[i] >= 1 && time >= sprintUntil[i]) {
-          const gdx = px - groupX, gdy = py - groupY;
-          const lonely = count < Math.max(3, avgNeighbors * LAG_LONELY_K);
-          if (lonely && gdx * gdx + gdy * gdy > (groupRms * LAG_DIST_K) * (groupRms * LAG_DIST_K)) {
-            laggingCount++;
-            if (lagSince[i] === 0) lagSince[i] = time;
-            else if (time - lagSince[i] >= LAG_HOLD_MS) {
-              sprintUntil[i] = time + params.sprintDuration * 1000;
-              stamina[i] = 0;
-              catchupCount++;   // 归队爆发单独计数，sprintCount 仍只统计「被追逃命」
-              // 归队爆发比逃命爆发更轻、更稀：只偶尔出声，避免大群同时冲刺时糊成一片嗡嗡声。
-              if (time - lastCatchupSound > 600 && Math.random() < 0.12) {
-                lastCatchupSound = time;
-                audio.sprint(0.22);
-              }
-            }
-          } else {
-            lagSince[i] = 0;
-          }
-        } else if (sprinting || stamina[i] < 1) {
-          lagSince[i] = 0;
-        }
+        // 爆发只有一种动机：被逼近时的逃命。归队/合群不消耗体力、不爆发，
+        // 掉队的鸟靠常规转向力慢慢追上大部队。
 
         sprinting = time < sprintUntil[i];
         if (sprinting) sprintingCount++;
@@ -2269,7 +2326,7 @@
             caught[i] = 1;
             respawnAt[i] = time + 1000;   // 1 秒后重新出生
             birthAt[i] = -Infinity;
-            stamina[i] = 0; sprintUntil[i] = 0; lagSince[i] = 0;
+            stamina[i] = 0; sprintUntil[i] = 0;
             break;
           }
         }
@@ -2298,7 +2355,7 @@
       // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
       avgNeighbors = sumNeighbors / aliveN;
       const neighborDensity = Math.min(1, avgNeighbors / 45);
-      // 群体半径（RMS）：既用于相干度，也用于「掉队」判定（追赶爆发）。
+      // 群体半径（RMS）：用于相干度与音乐驱动的聚集度。
       groupRms = Math.max(0.5, Math.sqrt(spread / aliveN));
       // 半径尺度取「整屏对角的一半」左右，让紧团≈1、铺满全屏≈0，指标才有分辨力。
       const coherence = Math.max(0, Math.min(1, 1 - groupRms / (B * 1.15)));
@@ -2393,6 +2450,48 @@
       aVel.needsUpdate = true;
       aCol.needsUpdate = true;
       aSiz.needsUpdate = true;
+
+      // ---- 爆发拖尾 ----
+      // 尾巴用指数平滑追头部：稳态落后量 ≈ 速度 × TRAIL_TAU，所以爆发越快拖尾越长；
+      // 起爆时尾巴贴住身体、从零开始拉开，结束后自然淡出（不再瞬移）。
+      tmpTrail.setHSL(0.928, 0.9, 0.62);
+      const tailK = 1 - Math.exp(-dt / TRAIL_TAU);
+      const fadeDown = Math.exp(-dt / 0.10);
+      const riseUp = Math.min(1, dt * 14);
+      const arrowW = params.arrowSize;
+      let tc = 0;
+      for (let i = 0; i < n; i++) {
+        const k = i * 3;
+        const dashing = !caught[i] && now < sprintUntil[i];
+        if (dashing) {
+          if (trailAmt[i] < 0.06) {                 // 刚起爆：尾巴贴住身体，避免拖出一条长线
+            trailTail[i * 2] = pos[k];
+            trailTail[i * 2 + 1] = pos[k + 1];
+          }
+          trailAmt[i] = Math.min(1, trailAmt[i] + riseUp);
+          const tx = trailTail[i * 2], ty = trailTail[i * 2 + 1];
+          trailTail[i * 2] = tx + (pos[k] - tx) * tailK;
+          trailTail[i * 2 + 1] = ty + (pos[k + 1] - ty) * tailK;
+        } else if (trailAmt[i] > 0.002) {
+          trailAmt[i] *= fadeDown;
+        } else {
+          trailAmt[i] = 0;
+          continue;
+        }
+        if (trailAmt[i] <= 0.02 || tc >= MAX_TRAILS) continue;
+        const o = tc * 3;
+        trHead[o] = pos[k]; trHead[o + 1] = pos[k + 1]; trHead[o + 2] = 0;
+        trTail[o] = trailTail[i * 2]; trTail[o + 1] = trailTail[i * 2 + 1]; trTail[o + 2] = 0;
+        trCol[o] = tmpTrail.r; trCol[o + 1] = tmpTrail.g; trCol[o + 2] = tmpTrail.b;
+        trWid[tc] = arrowW * 0.92;
+        trAlp[tc] = trailAmt[i] * 0.95;
+        tc++;
+      }
+      trailGeo.instanceCount = tc;
+      if (tc > 0) {
+        aTrHead.needsUpdate = true; aTrTail.needsUpdate = true;
+        aTrCol.needsUpdate = true; aTrWid.needsUpdate = true; aTrAlp.needsUpdate = true;
+      }
 
       // 捕食者：GPU 属性更新 + 威胁圈跟随相机
       predMesh.visible = params.predatorOn;
@@ -2563,6 +2662,18 @@
       get activeBursts() { return killBursts.filter((b) => b.active).length; },
       get sprintCount() { return sprintCount; },
       get sprintingCount() { return sprintingCount; },
+      get trailCount() { return trailGeo.instanceCount; },
+      get trailSample() {
+        const out = [];
+        for (let i = 0; i < Math.min(3, trailGeo.instanceCount); i++) {
+          out.push({
+            head: [+trHead[i * 3].toFixed(2), +trHead[i * 3 + 1].toFixed(2)],
+            tail: [+trTail[i * 3].toFixed(2), +trTail[i * 3 + 1].toFixed(2)],
+            w: +trWid[i].toFixed(3), a: +trAlp[i].toFixed(3)
+          });
+        }
+        return out;
+      },
       get recoveringCount() {
         let c = 0;
         for (let i = 0; i < activeCount; i++) if (stamina[i] < 1) c++;
@@ -2621,11 +2732,6 @@
       get wanderBase() { return WANDER_BASE; },
       set wanderBase(v) { WANDER_BASE = Math.max(0, Math.min(4, +v || 0)); },
       get groupRms() { return +groupRms.toFixed(2); },
-      get laggingCount() { return laggingCount; },
-      get catchupCount() { return catchupCount; },
-      get laggingFlags() {
-        return Array.from({ length: activeCount }, (_, i) => (lagSince[i] > 0 ? 1 : 0));
-      },
       get temperature() { return temperature; },
       get pressure() { return pressure; },
       get impulse() { return collisionImpulse; },
