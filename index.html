@@ -203,7 +203,7 @@
     display: inline-block; width: 7px; height: 7px; margin-right: 6px;
     border-radius: 50%; background: #4a5c78; transition: background .12s, box-shadow .12s;
   }
-  .dot.sprint { background: #ffd36e; box-shadow: 0 0 10px #ffd36e; }
+  .dot.sprint { background: #ff9ad4; box-shadow: 0 0 10px #ff9ad4; }
   .dot.pred { background: #ff6b3d; box-shadow: 0 0 10px #ff6b3d; }
   .dot.birth { background: #7dff9a; box-shadow: 0 0 10px #7dff9a; }
 
@@ -355,8 +355,9 @@
       <ul>
         <li><b>随机性</b>每只鸟各有速度系数与缓慢游走；撞墙会随机散射，捕食者也会摆尾。</li>
         <li><b>传送门边界</b>撞到边界的鸟有 1% 概率从对侧穿出，出入点关于中心对称。</li>
-        <li><b>捕食者</b>锐角三角形，接触即捕食；进食后减速随机巡游。</li>
-        <li><b>两种爆发</b>被逼近时冲刺逃命；掉队太久也会冲刺追赶大部队，共用同一份体力。</li>
+        <li><b>捕食者</b>锐角三角形，带碰撞体积，接触即捕食；进食后减速随机巡游。</li>
+        <li><b>两种爆发</b>被逼近时冲刺逃命（洋红高亮）；掉队太久也会冲刺追赶大部队，共用同一份体力。</li>
+        <li><b>反应延迟</b>看到捕食者不会立刻爆发：贴身的鸟约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像一圈涟漪从捕食者身边扩散开。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时只有低频嗡鸣，抱团后和声变厚、节拍渐起。与提示音共用右上角声音开关。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
       </ul>
@@ -551,6 +552,14 @@
     stamina.fill(1);
     const sprintUntil = new Float64Array(MAX_N);   // 爆发到期时间（ms）
     const lagSince = new Float64Array(MAX_N);      // 开始「掉队」的时间戳，0 表示没掉队
+    // 反应延迟：看到捕食者不等于立刻爆发。每只鸟有一个「危险感知计时器」，
+    // 距离越近需要的累积时间越短（贴身约 45ms，感知圈边缘约 260ms，按距离平方过渡），
+    // 再乘个体反应系数 0.78~1.32。这样爆发是从捕食者身边向外一圈圈亮起来，
+    // 而不是整群像开关一样同时闪烁。
+    const alertMs = new Float32Array(MAX_N);       // 当前已累计的危险感知时间（ms）
+    const reactJit = new Float32Array(MAX_N);      // 个体反应快慢系数
+    const REACT_NEAR_MS = 45;
+    const REACT_FAR_MS = 260;
 
     // 追赶大部队的判据：离群体质心超过 LAG_DIST_K 倍群体半径、且身边同伴数
     // 不足平均值的 LAG_LONELY_K，并且连续保持 LAG_HOLD_MS 毫秒才允许起爆——
@@ -571,6 +580,7 @@
       spdJit[i] = 0.86 + Math.random() * 0.28;
       wAng[i] = Math.random() * Math.PI * 2;
       wAmp[i] = 0.55 + Math.random() * 1.1;
+      reactJit[i] = 0.78 + Math.random() * 0.54;
     }
 
     const capNow = new Float32Array(MAX_N);        // 每只鸟当前生效的速度上限（只用于调试采样）
@@ -604,11 +614,12 @@
     const predPrev = new Float32Array(MAX_P * 3);  // 上一帧位置，用于「扫掠」碰撞检测
 
     const MAX_FORCE = 14;
-    // 捕食者外形：锐角等腰三角形。腰长 = 鸟的 1.4 倍，底 = 鸟的 0.7 倍。
+    // 捕食者外形：锐角等腰三角形。腰长 = 鸟的 1.4 倍、底 = 0.7 倍，再整体 ×2。
     // 「鸟的尺寸」指一只元素的实际整体尺寸（实例四边形边长 = 2 × arrowSize）。
+    const PRED_SCALE = 2;                              // 整体体积倍率
     const birdExtent = () => params.arrowSize * 2;
-    const predLeg = () => birdExtent() * 1.4;          // 腰长
-    const predBase = () => birdExtent() * 0.7;         // 底边长
+    const predLeg = () => birdExtent() * 1.4 * PRED_SCALE;      // 腰长
+    const predBase = () => birdExtent() * 0.7 * PRED_SCALE;     // 底边长
     // 碰撞体积：按三角形外接范围取一个略宽于外形的圆，再加上鸟自身半径。
     // 捕食者单帧位移可能超过这个半径，所以判定会用「上一帧 → 当前帧」的线段做扫掠，避免穿模。
     const catchRadius = () => predLeg() * 0.45 + predBase() * 0.35 + params.arrowSize * 0.9;
@@ -657,7 +668,7 @@
         rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
         birthAt[i] = isBirth ? performance.now() : -Infinity;
         stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
-        lagSince[i] = 0;
+        lagSince[i] = 0; alertMs[i] = 0;
         rollTraits(i);
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
@@ -693,7 +704,7 @@
       rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
       birthAt[i] = now;
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
-      lagSince[i] = 0;
+      lagSince[i] = 0; alertMs[i] = 0;
       rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
     }
 
@@ -1069,7 +1080,7 @@
 
     const tmpColor = new THREE.Color();
     const tmpBirth = new THREE.Color(0x7dff9a);
-    const tmpSprint = new THREE.Color(0xffd36e);   // 爆发逃逸：暖金色高亮
+    const tmpSprint = new THREE.Color(0xff9ad4);   // 爆发：在自身色相上烧向粉白（每帧按个体重算）
 
     // ---------------------------------------------------------------- 声音
     // 只保留三种事件音：加速逃逸 / 被吃掉 / 新生。
@@ -1667,7 +1678,7 @@
     bindNum(fMotion, 'flow', 0, 4, 0.05, '气流扰动',
       '气流扰动｜调大：鸟更容易被随机气流带偏，运动更自然，但队形更松散。调 0：完全按三规则飞行。');
     bindNum(fMotion, 'arrowSize', 0.18, 0.9, 0.01, '元素大小',
-      '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍），所以它只影响外观，不影响运动规则。');
+      '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍，再整体 ×2），所以它只影响外观，不影响运动规则。');
     fMotion.open();
 
     const fPred = gui.addFolder('捕食与逃逸');
@@ -1691,7 +1702,7 @@
     bindNum(fPred, 'chaseWeight', 0, 4, 0.05, '追击力度',
       '追击力度｜调大：捕食者拐弯追得更凶、咬得更紧；太大急转会不自然。');
     bindNum(fPred, 'fleeRange', 3, 24, 0.5, '危险感知距离',
-      '危险感知距离｜鱼群在多远开始察觉捕食者。调大：整群提前绕开，几乎不会被逼近。调小：捕食者贴脸才逃，容易被抓。');
+      '危险感知距离｜鱼群在多远开始察觉捕食者。调大：整群提前绕开，几乎不会被逼近。调小：捕食者贴脸才逃，容易被抓。注意察觉后还要经过反应延迟（贴身约 45ms、圈边缘约 260ms）才会爆发冲刺。');
     bindNum(fPred, 'fleeWeight', 0, 6, 0.05, '逃跑力度',
       '逃跑力度｜调大：个体和整群都逃得更拼命，鱼群会更整齐地绕开捕食者。太大会盖过群聚，队形散掉。');
     bindNum(fPred, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
@@ -2040,12 +2051,27 @@
             const d2 = dx * dx + dy * dy + dz * dz;
             if (d2 < nearest2) { nearest2 = d2; nearestP = p; }
           }
-          if (nearest2 < fleeR2 && stamina[i] >= 1 && time >= sprintUntil[i]) {
-            sprintUntil[i] = time + params.sprintDuration * 1000;
-            stamina[i] = 0;
-            sprintCount++;
-            audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
-            // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
+          // 反应延迟：进入感知圈只是「看到」，还要累积够所需时间才会起爆。
+          // 所需时间随距离（平方）从贴身 45ms 增长到圈边缘 260ms，再乘个体系数，
+          // 于是爆发会从捕食者身边向外扩散，而不是整群同时亮。
+          if (nearest2 < fleeR2) {
+            if (stamina[i] >= 1 && time >= sprintUntil[i]) {
+              const dNorm = Math.min(1, Math.sqrt(nearest2) / fleeR);
+              const need = (REACT_NEAR_MS + (REACT_FAR_MS - REACT_NEAR_MS) * dNorm * dNorm) * reactJit[i];
+              alertMs[i] += dt * 1000;
+              if (alertMs[i] >= need) {
+                alertMs[i] = 0;
+                sprintUntil[i] = time + params.sprintDuration * 1000;
+                stamina[i] = 0;
+                sprintCount++;
+                audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
+                // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
+              }
+            } else {
+              alertMs[i] = 0;
+            }
+          } else {
+            alertMs[i] = 0;   // 脱离感知圈就清空，重新进入要重新累积
           }
           sprinting = time < sprintUntil[i];
 
@@ -2341,13 +2367,21 @@
         } else {
           col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
         }
-        // 爆发中：暖金色脉冲高亮 + 略微放大；新生绿色优先，不覆盖。
+        // 爆发中：不换成另一种颜色（原来抹成黄色，和冷色调的群体完全打架），
+        // 而是在自身色相上「烧」向粉白——色相推到紫红端、亮度抬高、边缘更亮，
+        // 亮度用一次起爆的衰减包络（而非固定频率频闪），30FPS 下也不会像坏灯管。
         if (now < sprintUntil[i] && age >= BIRTH_TOTAL_MS) {
-          const flick = 0.72 + 0.20 * (0.5 + 0.5 * Math.sin(now * 0.022 + i));
-          col[k] = col[k] * (1 - flick) + tmpSprint.r * flick;
-          col[k + 1] = col[k + 1] * (1 - flick) + tmpSprint.g * flick;
-          col[k + 2] = col[k + 2] * (1 - flick) + tmpSprint.b * flick;
-          size *= 1.45;
+          const span = Math.max(160, params.sprintDuration * 1000);
+          const t = Math.min(1, Math.max(0, (now - (sprintUntil[i] - span)) / span));
+          const surge = 0.45 + 0.55 * Math.exp(-t * 3.4);      // 起爆瞬间最强，随后回落
+          tmpSprint.setHSL(0.928 - local * 0.02, 0.96, 0.45 + 0.07 * surge);
+          // 色相全程保持（爆发=洋红发光），只有亮度与尺寸在起爆瞬间冲高再回落，
+          // 这样整段爆发期的身份色是一致的，不会一半时间又退回青蓝。
+          const w = 0.82;
+          col[k] = col[k] * (1 - w) + tmpSprint.r * w;
+          col[k + 1] = col[k + 1] * (1 - w) + tmpSprint.g * w;
+          col[k + 2] = col[k + 2] * (1 - w) + tmpSprint.b * w;
+          size *= 1.22 + 0.24 * surge;
         }
         siz[i] = size;
       }
@@ -2477,7 +2511,18 @@
       get portalChance() { return PORTAL_P; },
       get teleports() { return teleportCount; },
       get predShape() {
-        return { leg: +predLeg().toFixed(3), base: +predBase().toFixed(3), birdExtent: +birdExtent().toFixed(3) };
+        return { leg: +predLeg().toFixed(3), base: +predBase().toFixed(3), birdExtent: +birdExtent().toFixed(3), scale: PRED_SCALE };
+      },
+      // 反应延迟：near/far 为贴身与感知圈边缘所需毫秒数，jitter 是个体系数范围
+      get reaction() {
+        return { nearMs: REACT_NEAR_MS, farMs: REACT_FAR_MS, jitter: [0.78, 1.32], pending: Array.from(alertMs.slice(0, activeCount)).filter((v) => v > 0).length };
+      },
+      get sprintingPositions() {
+        const t = performance.now(), out = [];
+        for (let i = 0; i < activeCount; i++) {
+          if (sprintUntil[i] > t && !caught[i]) out.push({ x: +pos[i * 3].toFixed(2), y: +pos[i * 3 + 1].toFixed(2) });
+        }
+        return out;
       },
       get maxAbsZ() {
         let m = 0;

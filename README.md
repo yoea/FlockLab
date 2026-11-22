@@ -12,7 +12,9 @@
 - **速度上限**：每只鸟的速度上限直接取当前状态的目标值——爆发 > 受惊 > 巡航节奏（巡航速度的 78%），起爆即提速、威胁解除即收速，不做额外的加速度积分。
 - **个体随机性**：每只鸟有自己固定的速度系数（0.86~1.14）和一条缓慢漂移的私人游走航向；邻居越多，游走被群体「稳住」得越强。捕食者也有个体速度系数和持续摆尾的航向漂移（追击时幅度小、冷却巡游时幅度大）。这些都是局部量，不改变三条规则，群体结构仍是涌现出来的，只是不再像弹珠一样整齐。
 - **边界传送门**：撞到边界的个体有 1% 概率不反弹，而是从对侧穿出，出入点关于场地中心对称（左边偏下飞出 → 右边偏上飞进）；其余 99% 弹性反射，但反射角会随机散射 ±23°、速度乘 0.82~1.08，所以不会沿原路精确弹回。
-- **捕食与逃逸**：捕食者是锐角（等腰）三角形——腰长 = 元素尺寸的 1.4 倍、底 = 0.7 倍，又尖又小；带碰撞体积，接触即算捕获（用「上一帧→当前帧」线段做扫掠判定，高速追击不会穿模）。鱼群会预测威胁点、传递警报、整群绕开，危险时短时爆发冲刺（体力耗尽必须恢复）。
+- **捕食与逃逸**：捕食者是锐角（等腰）三角形——腰长 = 元素尺寸的 1.4 倍、底 = 0.7 倍，再整体 ×2；带碰撞体积，接触即算捕获（用「上一帧→当前帧」线段做扫掠判定，高速追击不会穿模）。鱼群会预测威胁点、传递警报、整群绕开，危险时短时爆发冲刺（体力耗尽必须恢复）。
+- **反应延迟**：进入危险感知圈只是「看到」，还要累积够反应时间才会爆发——贴身约 45ms、感知圈边缘约 260ms（按距离平方过渡），再乘个体反应系数 0.78~1.32。所以爆发像一圈涟漪从捕食者身边向外扩散，而不是整群同时亮起。脱离感知圈会清零重来。
+- **爆发配色**：爆发不是把个体染成黄色，而是在自身色相上烧向洋红（即群体渐变最末端的紫红端），亮度与尺寸在起爆瞬间冲高、随后回落，全段保持同一身份色，避免固定频率频闪。
 - **两种爆发**：被逼近时冲刺逃命；**掉队时也会冲刺追赶大部队**——离群体质心超过 1.55 倍群体半径、身边同伴数不足平均的 55%、且连续 380ms 才触发，与逃命共用同一份体力和同一套爆发时长/倍率/恢复时间（默认 0.8s / 1.35× / 5s），所以不能靠反复爆发无限追。归队爆发的声音更轻更稀。
 - **进食冷却巡游**：捕食成功后进入冷却，期间不再追击，只以四成速度随机巡游保存体力；冷却时长最多可调到 60 秒。
 - **延迟重生**：被吃掉的个体隐藏 1 秒后再出生，重生点从 32 个候选位置里挑离所有捕食者最远、且离边界留有余量的位置。
@@ -80,4 +82,4 @@ flocklab/
 
 音乐状态可用 `FlockLab.musicState`（`running` / `c` / `tension` / `gain` / `chord` / `pulse` / `shimmer`）读取，音量用 `FlockLab.music.setLevel(0~2)` 实时调。
 
-页面暴露 `window.FlockLab` 便于自动化验证：`params`、`defaults`、`saveParams`、`resetAll`、`setCount`、`setPredCount`、`positions`、`predatorPositions`、`predatorSpeeds`、`predatorCaps`、`predatorCooling`、`capSample`、`catches`、`deadCount`、`respawnDelays`、`catchRadius`、`predShape`、`portalChance`、`teleports`、`cohesion`、`groupRms`、`laggingCount`、`catchupCount`、`laggingFlags`、`soundEvents`、`bound` 等。
+页面暴露 `window.FlockLab` 便于自动化验证：`params`、`defaults`、`saveParams`、`resetAll`、`setCount`、`setPredCount`、`positions`、`predatorPositions`、`predatorSpeeds`、`predatorCaps`、`predatorCooling`、`capSample`、`catches`、`deadCount`、`respawnDelays`、`catchRadius`、`predShape`、`reaction`（反应延迟阈值与待起爆数量）、`sprintingPositions`（正在爆发的个体坐标）、`portalChance`、`teleports`、`cohesion`、`groupRms`、`laggingCount`、`catchupCount`、`laggingFlags`、`soundEvents`、`bound` 等。
