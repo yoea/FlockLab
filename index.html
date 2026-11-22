@@ -358,7 +358,7 @@
         <li><b>捕食者</b>锐角三角形，带碰撞体积，接触即捕食；进食后减速随机巡游。</li>
         <li><b>爆发</b>只有被捕食者逼近时才会冲刺逃命（洋红发光 + 渐隐拖尾）；体力耗尽后必须恢复，不能连续爆发。</li>
         <li><b>反应延迟</b>看到捕食者不会立刻爆发：贴身的鸟约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像一圈涟漪从捕食者身边扩散开。</li>
-        <li><b>草地</b>场地里有 2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 2 分钟）；落地的鸟变成苔绿色，飞行中的鸟会绕开草地。</li>
+        <li><b>草地</b>场地里有 2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 1 分钟）；落地的鸟变成苔绿色、彼此保持间距，飞行中的鸟会绕开草地。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时只有低频嗡鸣，抱团后和声变厚、节拍渐起。与提示音共用右上角声音开关。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
       </ul>
@@ -581,6 +581,11 @@
     // resting 只是「打算去 / 正在往过飞」，不算休息——否则一脱队就被算成休息了。
     const settled = new Uint8Array(MAX_N);
     const restApproachUntil = new Float64Array(MAX_N);  // 前往草地的截止时间，飞太久就放弃
+    const restMoves = new Uint8Array(MAX_N);            // 已在草地上换过几次位置（最多 2 次）
+    const restTries = new Uint8Array(MAX_N);            // 为了找空位而重新选点的次数
+    let flyLandings = 0;   // 「掠过草地顺手落下」的次数（调试用）
+    const overGrass = new Uint8Array(MAX_N);            // 上一帧是否正在草地正上方（用于「掠过」判定）
+    const REST_SPACING = 1.5;                           // 草地上个体之间要保持的最小距离（≈6 个身位）
     // ---------------------------------------------------------------- 个体差异
     // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
     // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
@@ -761,6 +766,9 @@
     initPredators(0, activeP);
     initBoids(0, activeCount);
     const resetBoids = () => {
+      // 重置会把所有鸟重生到随机位置：草地上的占位必须一起清掉，
+      // 否则 members 里会残留旧索引，之后新鸟复用这些索引就会出现「两只鸟叠在一起」。
+      for (const gp of grass) { gp.members.clear(); gp.count = 0; }
       initBoids(0, activeCount);
       initPredators(0, activeP);
       predCatches = 0;
@@ -1086,7 +1094,7 @@
     // 草地总面积占屏幕的比例
     const GRASS_FRAC = 0.15;
     // 停留时长：只要没危险就一直待着，最长 100~120 秒
-    const REST_MAX_MIN = 100000, REST_MAX_SPAN = 20000;   // ms
+    const REST_MAX_MIN = 50000, REST_MAX_SPAN = 10000;    // ms（50~60 秒）
 
     // 估算一片草地上落在场地内的面积（蒙特卡洛）：用于按目标面积反推 R，
     // 这样即使草地压在边界上、被切掉一块，场地里看到的面积仍然是目标值。
@@ -1118,7 +1126,7 @@
         const a2 = 0.04 + Math.random() * 0.09;
         const p1 = Math.random() * Math.PI * 2;
         const p2 = Math.random() * Math.PI * 2;
-        const gp = { x: 0, y: 0, R: 1, a1, p1, a2, p2, area: perArea, cap: 0, count: 0 };
+        const gp = { x: 0, y: 0, R: 1, a1, p1, a2, p2, area: perArea, cap: 0, count: 0, members: new Set() };
         // 位置：允许压在边界上（草地可以有一部分在场地外），但中心留在场内
         let x = 0, y = 0;
         for (let t = 0; t < 60; t++) {
@@ -1135,7 +1143,8 @@
           R = Math.min(R * Math.sqrt(perArea / measured), Math.max(bd.hx, bd.hy) * 1.1);
         }
         gp.R = R;
-        gp.cap = Math.max(20, Math.round(perArea / 4.2));
+        // 容量按「每个个体 5.2 平方单位」估算，保证停稳后还能保持约 1.7 的间距
+        gp.cap = Math.max(14, Math.floor(perArea / 6.6));
         grass.push(gp);
       }
       // 复用/补齐网格
@@ -1162,41 +1171,116 @@
     buildGrass();
 
     // 在草地内取一个点：极坐标均匀采样，再按谐波半径筛一遍，保证落在形状里
-    function pickRestPoint(gp) {
+    // 在草地上找一个「和已停的鸟保持间距」的落点。找不到就放宽一次再退回中心。
+    function pickRestPoint(gp, skipI) {
       const bd = bounds2D();
       const cl = (v, h) => Math.max(-h + 1.2, Math.min(h - 1.2, v));
-      for (let t = 0; t < 18; t++) {
+      // 草地越挤，允许的间距越小；实在放不下就选「最空」的那个点，而不是统统堆到中心
+      const minSep = REST_SPACING * (gp.members.size > gp.cap * 0.75 ? 0.7 : 1);
+      const ms2 = minSep * minSep;
+      let bx = gp.x, by = gp.y, bestScore = -Infinity;
+      for (let t = 0; t < 34; t++) {
         const th = Math.random() * Math.PI * 2;
         const rr = gp.R * Math.sqrt(Math.random()) * 0.94;
         const lim = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2)) * 0.92;
         const x = gp.x + Math.cos(th) * rr, y = gp.y + Math.sin(th) * rr;
-        // 草地可以压边界，但鸟必须停在场内
-        if (rr <= lim && Math.abs(x) < bd.hx - 1.2 && Math.abs(y) < bd.hy - 1.2) return [x, y];
+        if (rr > lim || Math.abs(x) > bd.hx - 1.2 || Math.abs(y) > bd.hy - 1.2) continue;
+        let nearest = Infinity;
+        for (const j of gp.members) {
+          if (j === skipI || !settled[j]) continue;
+          const dx = x - pos[j * 3], dy = y - pos[j * 3 + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 < nearest) nearest = d2;
+        }
+        if (nearest >= ms2) return [x, y];
+        if (nearest > bestScore) { bestScore = nearest; bx = x; by = y; }
       }
-      return [cl(gp.x, bd.hx), cl(gp.y, bd.hy)];
+      return [bx, by];
     }
-    // 让第 i 只鸟出发去休息：挑一片没满且最近的草地
+    // 草地很挤时用这个：采样一批候选点，返回「离最近邻居最远」的那个。
+    // 比一直 first-fit 强，因为饱和时 80% 的随机点都不合格。
+    function pickRestPointBest(gp, skipI) {
+      const bd = bounds2D();
+      let bx = gp.x, by = gp.y, best = -1;
+      for (let t = 0; t < 26; t++) {
+        const th = Math.random() * Math.PI * 2;
+        const rr = gp.R * Math.sqrt(Math.random()) * 0.94;
+        const lim = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2)) * 0.92;
+        const x = gp.x + Math.cos(th) * rr, y = gp.y + Math.sin(th) * rr;
+        if (rr > lim || Math.abs(x) > bd.hx - 1.2 || Math.abs(y) > bd.hy - 1.2) continue;
+        let nearest = Infinity;
+        for (const j of gp.members) {
+          if (j === skipI || !settled[j]) continue;
+          const dx = x - pos[j * 3], dy = y - pos[j * 3 + 1];
+          const d2 = dx * dx + dy * dy;
+          if (d2 < nearest) nearest = d2;
+        }
+        if (nearest > best) { best = nearest; bx = x; by = y; }
+      }
+      return [bx, by];
+    }
+
     function startRest(i, time) {
       const k = i * 3;
       let best = -1, bestD2 = Infinity;
       for (let g = 0; g < grass.length; g++) {
         const gp = grass[g];
-        if (gp.count >= gp.cap) continue;
+        if (gp.members.size >= gp.cap) continue;
         const dx = pos[k] - gp.x, dy = pos[k + 1] - gp.y;
         const d2 = dx * dx + dy * dy;
         if (d2 < bestD2) { bestD2 = d2; best = g; }
       }
       if (best < 0) { restDue[i] = time + 2500; return; }   // 都满了，过会儿再试
       const gp = grass[best];
-      const [tx, ty] = pickRestPoint(gp);
+      const [tx, ty] = pickRestPoint(gp, i);
       restTgt[i * 2] = tx; restTgt[i * 2 + 1] = ty;
-      resting[i] = 1; settled[i] = 0; restPatch[i] = best; gp.count++;
+      resting[i] = 1; settled[i] = 0; restPatch[i] = best;
+      restMoves[i] = 0; restTries[i] = 0;
+      gp.members.add(i); gp.count = gp.members.size;
       restSince[i] = 0;
       // 先给一段赶路时间；真正「开始休息」要等它到点并停稳（见 settled）
       const travel = Math.hypot(tx - pos[k], ty - pos[k + 1]) / Math.max(6, params.maxSpeed * 0.6);
-      restApproachUntil[i] = time + travel * 1000 + 8000;
-      restUntil[i] = time + travel * 1000 + 6000;   // 到点后会重设成 100~120 秒
+      restApproachUntil[i] = time + travel * 1000 + 15000;
+      restUntil[i] = time + travel * 1000 + 15000;   // 到点后会重设成 50~60 秒
       restDue[i] = time + 24000 + Math.random() * 22000;
+      // 有新的鸟降落到这片草地：已经休息 5~60 秒的老住客有 10% 概率往旁边挪个位置，
+      // 免得草地点位被一批「先到者」长期占死。每只鸟最多挪 2 次。
+      for (const j of gp.members) {
+        if (j === i || !settled[j] || restMoves[j] >= 2) continue;
+        const dwell = time - restSince[j];
+        if (dwell < 5000 || dwell > 60000) continue;
+        if (Math.random() >= 0.10) continue;
+        const [nx, ny] = pickRestPointBest(gp, j);
+        restTgt[j * 2] = nx; restTgt[j * 2 + 1] = ny;
+        settled[j] = 0; restTries[j] = 0;                 // 重新走一小段再停
+        restMoves[j]++;
+        wAng[j] = Math.random() * Math.PI * 2;            // 换个朝向后重新站定
+      }
+    }
+
+    // 「掠过草地」时顺路落下来：不等到休息时间，10% 概率就地减速停住
+    function landHere(i, g, time) {
+      const gp = grass[g];
+      if (gp.members.size >= gp.cap) return false;
+      const k = i * 3;
+      // 落点优先取当前位置附近（顺势停下），但也要和别人保持间距
+      let tx = pos[k], ty = pos[k + 1];
+      let ok = true;
+      for (const j of gp.members) {
+        if (!settled[j]) continue;
+        const dx = tx - pos[j * 3], dy = ty - pos[j * 3 + 1];
+        if (dx * dx + dy * dy < REST_SPACING * REST_SPACING) { ok = false; break; }
+      }
+      if (!ok) [tx, ty] = pickRestPointBest(gp, i);
+      restTgt[i * 2] = tx; restTgt[i * 2 + 1] = ty;
+      resting[i] = 1; settled[i] = 0; restPatch[i] = g;
+      restMoves[i] = 0; restTries[i] = 0; restSince[i] = 0;
+      gp.members.add(i); gp.count = gp.members.size;
+      restApproachUntil[i] = time + 2500;     // 已经在草地上方，很快就能停稳
+      restUntil[i] = time + 2500;
+      restDue[i] = time + 24000 + Math.random() * 22000;
+      flyLandings++;
+      return true;
     }
     // 结束休息（起飞或被惊到）
     // 关掉草地：所有正在休息的立刻起飞（不然它们会定在原地不动）
@@ -1212,7 +1296,7 @@
       const wasSettled = settled[i] === 1;
       resting[i] = 0; settled[i] = 0;
       const g = restPatch[i];
-      if (g >= 0 && grass[g]) grass[g].count--;
+      if (g >= 0 && grass[g]) { grass[g].members.delete(i); grass[g].count = grass[g].members.size; }
       restPatch[i] = -1;
       // 「必须停留至少 5 秒」：真正停稳过、且被吓走时待够了 5 秒，才算休成；
       // 没停稳（还在赶路）或没待够就被赶走，都当作这次没休成，隔几秒重来。
@@ -2225,7 +2309,7 @@
 
     const fGrass = gui.addFolder('草地');
     bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
-      '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 15%，可以压到边界上）。每只鸟每隔二三十秒必须去一次，挑一片最近、没满的降落，只要没有危险就一直待着（最长 100~120 秒）；被惊到会立刻飞走并重新计时，没待够 5 秒的下次很快会再来。不休息的鸟会主动绕开草地。关掉后草地隐藏，正在休息的鸟马上起飞。',
+      '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 15%，可以压到边界上）。每只鸟每隔二三十秒必须去一次，挑一片最近、没满的降落，只要没有危险就一直待着（最长 50~60 秒）；被惊到会立刻飞走并重新计时，没待够 5 秒的下次很快会再来。草地上的个体会保持间距、各朝各的方向；有新鸟落下时，已经休息 5~60 秒的老住客有 10% 概率往旁边挪（每只最多挪 2 次）。掠过草地的鸟还有 10% 概率顺势落下来。不休息的鸟会主动绕开草地。关掉后草地隐藏，正在休息的鸟马上起飞。',
       (v) => { syncGrassVisibility(); if (!v) liftAllResting(); });
     fGrass.open();
 
@@ -2514,10 +2598,44 @@
             if (ex * ex + ey * ey < safe2) { scared = true; break; }
           }
           // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算
-          if (!settled[i] && dd < 1.2 && Math.hypot(vx, vy) < 1.6) {
+          if (!settled[i] && dd < 0.55 && Math.hypot(vx, vy) < 1.6) {
+            // 站定前看一眼周围的人：离得太近就换个点再站，最多试 4 次
+            const gp = grass[restPatch[i]];
+            let tooClose = false;
+            if (gp) {
+              const lim = REST_SPACING * 0.8;
+              for (const j of gp.members) {
+                if (j === i || !settled[j]) continue;
+                const ex = px - pos[j * 3], ey = py - pos[j * 3 + 1];
+                if (ex * ex + ey * ey < lim * lim) { tooClose = true; break; }
+              }
+            }
+            if (tooClose && gp) {
+              // 位置太挤：直接挪到这片草地上最空的一点再站定（幅度只有一两个单位，
+              // 看起来就是「落地时挪了半步」），比让它再飞一趟自然得多。
+              for (let tryN = 0; tryN < 3 && tooClose; tryN++) {
+                const [nx, ny] = pickRestPointBest(gp, i);
+                let bad = false;
+                const lim = REST_SPACING * 0.8;
+                for (const j of gp.members) {
+                  if (j === i || !settled[j]) continue;
+                  const ex = nx - pos[j * 3], ey = ny - pos[j * 3 + 1];
+                  if (ex * ex + ey * ey < lim * lim) { bad = true; break; }
+                }
+                if (!bad) {
+                  pos[k] = nx; pos[k + 1] = ny;
+                  restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
+                  tooClose = false;
+                }
+              }
+              restTries[i]++;
+            }
             settled[i] = 1;
+            // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位，
+            // 把刚检查好的间距又挤掉。
+            vel[k] = 0; vel[k + 1] = 0;
             restSince[i] = time;
-            restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN;   // 100~120 秒
+            restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN;   // 50~60 秒
           }
           // 飞太久还没停稳（草地太挤/一直被挤）就放弃，别一直算作「在路上」
           if (!settled[i] && time > restApproachUntil[i]) {
@@ -2728,6 +2846,7 @@
         if (py < -hy + m) fy += (-hy + m - py) * 2.2;
         // 绕开草地：不休息的鸟会主动沿着草地边缘滑过去，而不是直接从草地上方穿过去。
         // 做法是「法向推开 + 沿当前运动方向的切向」——只推法向的话看起来像撞到墙弹开。
+        let insideG = -1;   // 当前正压在哪片草地上（-1 = 不在任何草地上）
         if (params.grassOn && grass.length) {
           for (let g = 0; g < grass.length; g++) {
             const gp = grass[g];
@@ -2740,6 +2859,7 @@
             const rr = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2));
             const nx = gdx / gd, ny = gdy / gd;
             if (gd < rr) {
+              insideG = g;
               // 已经压在草地上（比如刚起飞）：先往外推，力度随深入程度加大
               const k = Math.min(1, (rr - gd) / Math.max(1, rr * 0.5));
               fx += nx * (10 + 14 * k); fy += ny * (10 + 14 * k);
@@ -2751,6 +2871,25 @@
               fx += (nx * 9 + tx2 * sgn * 7) * w;
               fy += (ny * 9 + ty2 * sgn * 7) * w;
             }
+          }
+          // 掠过草地：刚进入草地范围的那一刻，10% 概率顺势减速落下来。
+          // 只在「边沿进入」时掷一次骰子，不会每帧都掷。
+          if (insideG >= 0) {
+            // 同样不能用 fleeing 判断有没有危险（信息级联会让全群都是 fleeing），
+            // 直接看最近的捕食者有多远。
+            if (!overGrass[i] && time >= sprintUntil[i] && Math.random() < 0.10) {
+              let safe = true;
+              const safe2 = fleeR * 1.6 * (fleeR * 1.6);
+              for (let p = 0; p < P; p++) {
+                const q = p * 3;
+                const ex = px - predPos[q], ey = py - predPos[q + 1];
+                if (ex * ex + ey * ey < safe2) { safe = false; break; }
+              }
+              if (safe) landHere(i, insideG, time);
+            }
+            overGrass[i] = 1;
+          } else {
+            overGrass[i] = 0;
           }
         }
         fx += Math.sin(py * 0.11 + flowT) * params.flow;
@@ -3313,6 +3452,31 @@
       get sprintingCount() { return sprintingCount; },
       get trailCount() { return trailGeo.instanceCount; },
       get restingCount() { return restingCount; },
+      // 休息质量诊断：最小间距、换过位置的个体数、最长停留
+      get flyLandings() { return flyLandings; },
+      get restStats() {
+        const now = performance.now();
+        let minSep = Infinity, moved = 0, maxDwell = 0, settledN = 0;
+        for (const gp of grass) {
+          const members = [];
+          for (const i of gp.members) if (settled[i]) members.push(i);
+          settledN += members.length;
+          for (const i of members) {
+            const dwell = now - restSince[i];
+            if (dwell > maxDwell) maxDwell = dwell;
+            if (restMoves[i] > 0) moved++;
+          }
+          for (let a = 0; a < members.length && a < 200; a++) {
+            for (let b = a + 1; b < members.length && b < 200; b++) {
+              const i = members[a], j = members[b];
+              const dx = pos[i * 3] - pos[j * 3], dy = pos[i * 3 + 1] - pos[j * 3 + 1];
+              const d = Math.hypot(dx, dy);
+              if (d < minSep) minSep = d;
+            }
+          }
+        }
+        return { settled: settledN, minSep: +minSep.toFixed(2), moved, maxDwellSec: +(maxDwell / 1000).toFixed(1) };
+      },
       get grassRest() {
         let traveling = 0, still = 0;
         for (let i = 0; i < activeCount; i++) {
@@ -3323,7 +3487,7 @@
         return { traveling, settled: still };
       },
       get grassInfo() {
-        return grass.map((g) => ({ x: +g.x.toFixed(1), y: +g.y.toFixed(1), R: +g.R.toFixed(1), area: Math.round(g.area), cap: g.cap, count: g.count }));
+        return grass.map((g) => ({ x: +g.x.toFixed(1), y: +g.y.toFixed(1), R: +g.R.toFixed(1), area: Math.round(g.area), cap: g.cap, count: g.members.size }));
       },
       // 正在「飞越草地」的个体数（不含休息中的）：用来验证绕行是否生效
       get flyingOverGrass() {
