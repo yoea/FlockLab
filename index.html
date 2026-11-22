@@ -1366,9 +1366,11 @@
         float glow = exp(-max(d, 0.0) * 4.8) * 0.36;
         float a = clamp(fill + glow, 0.0, 1.0) * vFade;
         if (a < 0.004) discard;
-        vec3 c = vColor * (0.96 + 0.34 * vSpeed) * (fill * 0.94 + rim + glow * 0.5);
-        float tip = 1.0 - smoothstep(0.04, 0.30, length(p - vec2(0.56, 0.0)));
-        c = mix(c, vec3(1.0, 0.95, 0.82), tip * 0.5 * fill);
+        // 体色直接由 vColor 决定（冷却期的浅橙黄 / 狩猎的深橙），
+        // 这里只做很轻的速度提亮和一个暖色高光——原来的白色高光会把浅橙黄洗成奶白。
+        vec3 c = vColor * (0.94 + 0.22 * vSpeed) * (fill * 0.94 + rim + glow * 0.5);
+        float tip = 1.0 - smoothstep(0.04, 0.26, length(p - vec2(0.62, 0.0)));
+        c = mix(c, vec3(1.0, 0.74, 0.36), tip * 0.3 * fill);
         gl_FragColor = vec4(c, a);
         #include <colorspace_fragment>
       }
@@ -1379,20 +1381,52 @@
     predMesh.visible = params.predatorOn;
     scene.add(predMesh);
 
-    // 威胁圈：标示该捕食者的逃逸半径 R，始终朝向相机（billboard）
-    const ringGeo = new THREE.RingGeometry(0.972, 1.0, 72);
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xff6b3d, transparent: true, opacity: 0.20,
-      side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending
-    });
+    // 警戒圈：标示该捕食者的逃逸半径 R（大小仍由「危险感知距离」决定）。
+    // 视觉上刻意压得很轻：一圈「红→黑」的细环 + 缓慢的明暗呼吸，
+    // 只在暗处隐约看出一点点，不抢主体。
+    const ringGeo = new THREE.PlaneGeometry(2, 2);   // 局部坐标 -1~1，正好对应半径 1
     const threatRings = [];
     for (let p = 0; p < MAX_P; p++) {
-      const ring = new THREE.Mesh(ringGeo, ringMat);
+      const mat = new THREE.ShaderMaterial({
+        uniforms: { uAlpha: { value: 0 }, uPhase: { value: Math.random() * 6.283 } },
+        vertexShader: `
+          varying vec2 vLocal;
+          void main() {
+            vLocal = position.xy;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec2 vLocal;
+          uniform float uAlpha;
+          void main() {
+            float r = length(vLocal);
+            if (r > 1.08) discard;
+            float d = (r - 0.965) * 46.0;          // 到环心的归一化距离
+            float band = exp(-d * d);              // 主环：很细
+            float inner = exp(-pow((r - 0.965) * 10.0, 2.0)) * 0.30;   // 内侧暗红晕
+            float outer = exp(-pow((r - 0.965) * 7.5, 2.0)) * 0.16;    // 外侧更淡
+            // 红 → 黑渐变：环上最亮是暗红，离开环就落到接近背景的黑
+            vec3 col = mix(vec3(0.05, 0.0, 0.0), vec3(0.75, 0.12, 0.07), clamp(band * 1.1 + inner * 0.7, 0.0, 1.0));
+            float a = (band * 0.45 + inner * 0.20 + outer * 0.10) * uAlpha;
+            if (a < 0.002) discard;
+            gl_FragColor = vec4(col, a);
+            #include <colorspace_fragment>
+          }
+        `,
+        transparent: true,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide
+      });
+      const ring = new THREE.Mesh(ringGeo, mat);
       ring.visible = false;
       ring.frustumCulled = false;
+      ring.renderOrder = -4;
       threatRings.push(ring);
       scene.add(ring);
-      predCol[p * 3] = 1.0; predCol[p * 3 + 1] = 0.34; predCol[p * 3 + 2] = 0.12;
+      predCol[p * 3] = 0.72; predCol[p * 3 + 1] = 0.15; predCol[p * 3 + 2] = 0.03;
       predSiz[p] = predLeg();
     }
 
@@ -2967,14 +3001,35 @@
         pVel.needsUpdate = true;
         pCol.needsUpdate = true;
         pSiz.needsUpdate = true;
+        const cdMs = params.feedCooldown * 1000;
         for (let p = 0; p < MAX_P; p++) {
           const ring = threatRings[p];
           if (p >= activeP) { ring.visible = false; continue; }
           const k = p * 3;
           ring.position.set(predPos[k], predPos[k + 1], predPos[k + 2]);
           ring.quaternion.copy(camera.quaternion);
-          ring.scale.setScalar(params.fleeRange);
+          ring.scale.setScalar(params.fleeRange);   // 半径仍由「危险感知距离」控制
           ring.visible = true;
+          // 明暗呼吸：很慢（周期约 4.5s），幅度也小，只在暗处隐约可见
+          const ph = ring.material.uniforms.uPhase.value;
+          const breathe = 0.5 + 0.5 * Math.sin(now * 0.0014 + ph);
+          ring.material.uniforms.uAlpha.value = 0.13 + 0.13 * breathe;   // 0.13~0.26，只在暗处隐约可见
+
+          // ---- 体色：冷却期=浅橙黄，狩猎=深橙，冷却最后 1 秒渐变回深橙 ----
+          // k=1 表示「刚吃饱」的浅橙黄，k=0 表示「随时能扑」的深橙。
+          let kk = 0;
+          const since = now - predFeedAt[p];
+          if (since >= 0 && since < cdMs) {
+            const fadeIn = Math.min(1, since / 320);                       // 捕食成功 → 0.32s 渐变到浅色
+            const fadeOut = Math.min(1, Math.max(0, (cdMs - since) / 1000)); // 最后 1 秒渐变回深色
+            kk = Math.min(fadeIn, fadeOut);
+          }
+          // 着色器内部还有约 1.4 倍的亮度合成（fill+rim+glow），所以这里要给低一些，
+          // 否则两个通道一起削顶，浅橙黄会糊成奶白。
+          predCol[k] = 0.72;
+          predCol[k + 1] = 0.15 + 0.28 * kk;   // 0.15（深橙）→ 0.43（浅橙黄）
+          predCol[k + 2] = 0.03 + 0.13 * kk;   // 0.03 → 0.16
+
           // 扑击瞬间箭头放大脉冲，与冲击波同步。
           const pulse = Math.max(0, 1 - (now - predPulseAt[p]) / 280);
           predSiz[p] = predLeg() * (1 + 0.32 * pulse);
@@ -3152,6 +3207,13 @@
           m = Math.max(m, Math.hypot(dx, dy));
         }
         return +m.toFixed(2);
+      },
+      // 体色与冷却状态：g 分量 0.30=深橙（随时能扑），0.78=浅橙黄（刚吃饱）
+      get predatorColors() {
+        return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
+          g: +predCol[p * 3 + 1].toFixed(2), b: +predCol[p * 3 + 2].toFixed(2),
+          cooling: (performance.now() - predFeedAt[p]) < params.feedCooldown * 1000
+        }));
       },
       get predatorTrail() {
         return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
