@@ -38,23 +38,53 @@
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
   }
 
-  #brand { position: fixed; left: 22px; top: 20px; z-index: 5; }
-  #brand .card-title {
-    font-size: 20px; font-weight: 650; letter-spacing: 0.06em;
+  /* 左上角只留 LOGO：无备注文字，点击打开「关于」 */
+  #brand {
+    position: fixed; left: 20px; top: 16px; z-index: 6;
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 7px 15px 7px 11px; border-radius: 999px; cursor: pointer;
+    color: inherit; font: inherit; line-height: 1;
+    background: rgba(9, 15, 29, 0.55);
+    border: 1px solid var(--line);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    transition: border-color .25s ease, box-shadow .25s ease, transform .18s ease;
+  }
+  #brand:hover { border-color: rgba(99, 230, 255, 0.5); box-shadow: 0 0 24px rgba(99, 230, 255, 0.14); }
+  #brand:active { transform: scale(0.97); }
+  #brand .mark { width: 19px; height: 19px; display: block; }
+  #brand .word {
+    font-size: 15px; font-weight: 650; letter-spacing: 0.14em;
     background: linear-gradient(92deg, #8ff3ff 0%, #a6b4ff 48%, #ff8dc2 100%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  #brand .card-body p { margin: 5px 0 0; font-size: 11px; color: var(--dim); letter-spacing: 0.08em; }
 
-  #audioBtn, #uiBtn {
+  /* 右上角一排图标按钮：场景操作 + 声音 + 隐藏界面 */
+  #topbar {
     position: fixed; right: 18px; top: 18px; z-index: 8;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .ico {
     width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
     cursor: pointer; color: var(--ink); border-radius: 50%;
-    border: 1px solid rgba(99, 230, 255, 0.38);
+    border: 1px solid rgba(99, 230, 255, 0.34);
     background: rgba(11, 26, 43, 0.82);
-    transition: transform .18s ease, border-color .25s ease, box-shadow .25s ease, opacity .35s ease;
+    transition: transform .18s ease, border-color .25s ease, box-shadow .25s ease,
+                opacity .35s ease, background .25s ease;
   }
-  #audioBtn:hover { transform: translateY(-1px); border-color: rgba(99, 230, 255, 0.85); }
+  .ico:hover {
+    transform: translateY(-1px);
+    border-color: rgba(99, 230, 255, 0.82);
+    background: rgba(16, 38, 60, 0.92);
+    box-shadow: 0 0 16px rgba(99, 230, 255, 0.14);
+  }
+  .ico:active { transform: translateY(0) scale(0.95); }
+  .ico svg { width: 18px; height: 18px; }
+  .ico svg .st {
+    fill: none; stroke: currentColor; stroke-width: 1.7;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  .ico svg .fl { fill: currentColor; }
   #audioBtn.live { border-color: rgba(120, 255, 190, 0.52); box-shadow: 0 0 16px rgba(70, 230, 175, 0.15); }
   #audioBtn svg { width: 19px; height: 19px; }
   #audioBtn .spk { fill: currentColor; }
@@ -64,7 +94,7 @@
   }
   #audioBtn.live .cross, #audioBtn:not(.live) .waves { display: none; }
 
-  #uiBtn { right: 62px; z-index: 9; }
+  #uiBtn { z-index: 9; }
   #uiBtn svg { width: 18px; height: 18px; }
   #uiBtn .eye, #uiBtn .pupil {
     fill: none; stroke: currentColor; stroke-width: 1.7;
@@ -84,11 +114,51 @@
   /* 隐藏全部界面后，小眼睛自身也会淡出；晃动鼠标或按键再显现 */
   #uiBtn.faded { opacity: 0; pointer-events: none; }
 
-  /* 演示模式：只保留切换按钮，其余界面全部隐藏 */
+  /* 演示模式：只保留「小眼睛」，其余界面全部隐藏。
+     场景按钮与声音用 visibility 隐藏，保留占位，避免小眼睛位置跳动。 */
   body.ui-hidden #brand,
   body.ui-hidden #hud,
-  body.ui-hidden #audioBtn,
   body.ui-hidden .lil-gui.root { display: none !important; }
+  body.ui-hidden #topbar .scene-btn,
+  body.ui-hidden #topbar #audioBtn { visibility: hidden; pointer-events: none; }
+
+  /* 暂停时按钮改为高亮，明确当前处于冻结状态 */
+  #pauseBtn.on { border-color: rgba(255, 211, 110, 0.6); box-shadow: 0 0 16px rgba(255, 211, 110, 0.16); }
+
+  /* 关于：点击左上角 LOGO 打开的简洁模态框 */
+  #about {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+    background: radial-gradient(ellipse at center, rgba(5, 7, 15, 0.55) 0%, rgba(5, 7, 15, 0.88) 78%);
+    opacity: 0; visibility: hidden; transition: opacity .26s ease, visibility .26s ease;
+  }
+  #about.open { opacity: 1; visibility: visible; }
+  #about .about-card {
+    position: relative; width: min(430px, 100%); padding: 26px 28px 22px;
+    transform: translateY(8px) scale(0.98); transition: transform .26s ease;
+  }
+  #about.open .about-card { transform: none; }
+  #about .about-logo {
+    margin: 0 0 12px; font-size: 20px; font-weight: 650; letter-spacing: 0.14em;
+    background: linear-gradient(92deg, #8ff3ff 0%, #a6b4ff 52%, #ff8dc2 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  #about .about-lead { margin: 0 0 16px; font-size: 12.5px; line-height: 1.9; color: #b8c8e2; }
+  #about ul { margin: 0; padding: 0; list-style: none; }
+  #about li {
+    font-size: 11.5px; line-height: 1.85; color: var(--dim);
+    padding: 5px 0; border-top: 1px solid rgba(126, 170, 235, 0.1);
+  }
+  #about li b { color: var(--ink); font-weight: 600; margin-right: 8px; letter-spacing: 0.06em; }
+  #about .about-foot { margin: 16px 0 0; font-size: 10px; color: #5d7090; letter-spacing: 0.1em; }
+  #about .about-close {
+    position: absolute; right: 12px; top: 12px; width: 26px; height: 26px;
+    display: grid; place-items: center; padding: 0; cursor: pointer;
+    color: var(--dim); font-size: 16px; line-height: 1;
+    border: 0; border-radius: 50%; background: rgba(255, 255, 255, 0.05);
+    transition: color .2s, background .2s;
+  }
+  #about .about-close:hover { color: var(--ink); background: rgba(255, 255, 255, 0.11); }
 
   /* 可折叠玻璃卡片：标题可点，正文不拦截画布拖拽 */
   .card { pointer-events: auto; padding: 0; }
@@ -177,8 +247,8 @@
   .lil-gui.root { margin-top: 76px; margin-right: 18px; }
 
   /* 触控屏：放大所有可点区域，面板限高可滚动，避免挡住群体 */
-  body.touch #audioBtn, body.touch #uiBtn { width: 44px; height: 44px; }
-  body.touch #uiBtn { right: 70px; }
+  body.touch .ico { width: 44px; height: 44px; }
+  body.touch #topbar { gap: 10px; }
   body.touch #startBtn { min-height: 48px; padding: 14px 34px; }
   body.touch .card-head { min-height: 44px; }
   body.touch .lil-gui {
@@ -200,47 +270,94 @@
   body.touch .lil-gui .controller .slider { touch-action: none; }
 
   @media (max-width: 720px) {
-    #brand { left: 12px; top: 12px; }
+    #brand { left: 12px; top: 12px; padding: 6px 12px 6px 9px; }
+    #brand .word { font-size: 13px; }
     #hud { left: 12px; bottom: 12px; min-width: 0; }
-    #audioBtn { right: 10px; top: 10px; }
-    #uiBtn { right: 54px; top: 10px; }
-    body.touch #uiBtn { right: 62px; }
-    .lil-gui.root { margin-top: 58px; margin-right: 6px; }
+    #topbar { right: 10px; top: 10px; gap: 6px; }
+    .lil-gui.root { margin-top: 60px; margin-right: 6px; }
+  }
+
+  /* 窄屏：五个图标按钮会顶到 LOGO，收起文字只留图标 */
+  @media (max-width: 560px) {
+    #brand { padding: 9px; }
+    #brand .word { display: none; }
+    #brand .mark { width: 20px; height: 20px; }
+    #topbar { gap: 5px; }
+    body.touch .ico, .ico { width: 38px; height: 38px; }
+    #audioBtn svg { width: 18px; height: 18px; }
   }
 </style>
 </head>
 <body>
   <div id="scene"></div>
 
-  <div id="brand" class="glass card">
-    <button class="card-head" type="button" aria-expanded="true">
-      <span class="card-title">FLOCKLAB</span><span class="chev">▾</span>
+  <button id="brand" type="button" title="关于 FlockLab" aria-label="关于 FlockLab">
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+      <path d="M2.6 15.4 8.4 6.2l5.4 8.6" stroke="#63e6ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="M9.6 19.2 14.4 11l4.9 8.2" stroke="#a6b4ff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" />
+      <path d="M15.6 8.6 18.6 4l3.2 4.8" stroke="#ff8dc2" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.85" />
+    </svg>
+    <span class="word">FLOCKLAB</span>
+  </button>
+
+  <div id="topbar">
+    <button id="viewBtn" class="ico scene-btn" type="button" title="重置视角" aria-label="重置视角">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="st" d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+        <circle class="st" cx="12" cy="12" r="2.6" />
+      </svg>
     </button>
-    <div class="card-body"><p id="brandSub">二维平面 · 方向个体 · GPU 渲染</p></div>
+    <button id="resetBtn" class="ico scene-btn" type="button" title="重新初始化（恢复默认参数）" aria-label="重新初始化">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="st" d="M20 12a8 8 0 1 1-2.4-5.7" />
+        <path class="st" d="M20 4v4.2h-4.2" />
+      </svg>
+    </button>
+    <button id="pauseBtn" class="ico scene-btn" type="button" title="暂停模拟" aria-label="暂停模拟">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect class="fl pauseIcon" x="7" y="5" width="3.4" height="14" rx="1.2" />
+        <rect class="fl pauseIcon" x="13.6" y="5" width="3.4" height="14" rx="1.2" />
+        <path class="fl playIcon" d="M8 5.4 19 12 8 18.6z" style="display:none" />
+      </svg>
+    </button>
+
+    <button id="uiBtn" class="ico" type="button" title="隐藏所有界面" aria-label="隐藏所有界面">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="eye" d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z" />
+        <circle class="pupil" cx="12" cy="12" r="2.4" />
+        <path class="slash" d="M4.5 4.5l15 15" />
+      </svg>
+    </button>
+
+    <button id="audioBtn" class="ico muted" type="button" title="开启声音" aria-label="开启声音">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="spk" d="M4 9h4l5-4v14l-5-4H4z" />
+        <path class="waves" d="M16.5 9.2c1.1 1.1 1.1 4.5 0 5.6M19.4 6.6c2.4 2.8 2.4 8 0 10.8" />
+        <path class="cross" d="M17 9.5l5 5M22 9.5l-5 5" />
+      </svg>
+    </button>
   </div>
 
-  <button id="audioBtn" class="muted" type="button" title="开启声音" aria-label="开启声音">
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path class="spk" d="M4 9h4l5-4v14l-5-4H4z" />
-      <path class="waves" d="M16.5 9.2c1.1 1.1 1.1 4.5 0 5.6M19.4 6.6c2.4 2.8 2.4 8 0 10.8" />
-      <path class="cross" d="M17 9.5l5 5M22 9.5l-5 5" />
-    </svg>
-  </button>
-
-  <button id="uiBtn" type="button" title="隐藏所有界面" aria-label="隐藏所有界面">
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path class="eye" d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z" />
-      <circle class="pupil" cx="12" cy="12" r="2.4" />
-      <path class="slash" d="M4.5 4.5l15 15" />
-    </svg>
-  </button>
+  <div id="about" aria-hidden="true">
+    <div class="about-card glass" role="dialog" aria-modal="true" aria-labelledby="aboutLead">
+      <button class="about-close" type="button" aria-label="关闭">×</button>
+      <p class="about-logo">FLOCKLAB</p>
+      <p class="about-lead" id="aboutLead">二维 Boids 涌现模拟：每个个体只遵循分离、对齐、聚合三条规则，整体的群飞行为由局部规则自发产生。</p>
+      <ul>
+        <li><b>传送门边界</b>撞到边界的鸟有 5% 概率从对侧穿出，出入点关于中心对称。</li>
+        <li><b>捕食者</b>锐角三角形，接触即捕食；进食后减速随机巡游。</li>
+        <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
+      </ul>
+      <p class="about-foot">Three.js · WebGL · 单文件实现</p>
+    </div>
+  </div>
 
   <div id="hud" class="glass card">
     <button class="card-head" type="button" aria-expanded="true">
       <span class="card-title">实时状态</span><span class="chev">▾</span>
     </button>
     <div class="card-body">
-      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">880</span> <span style="color:#ff8a5c">◆<span id="hPred">2</span></span></span></div>
+      <div class="hud-row"><span class="k">个体数量</span><span class="v"><span id="hCount">600</span> <span style="color:#ff8a5c">◆<span id="hPred">2</span></span></span></div>
       <div class="hud-row"><span class="k">聚集密度 ρ</span><span class="bar"><i id="hDensityBar"></i></span></div>
       <div class="hud-row"><span class="k">温度 T ∝ v²</span><span class="v" id="hTemp">0.00</span></div>
       <div class="hud-row"><span class="k">气压 P = ρT</span><span class="v" id="hPress">0.00</span></div>
@@ -310,8 +427,12 @@
     // ---------------------------------------------------------------- 参数
     // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
     const BOUND = 40;
-    const params = {
-      count: 880,
+    const MAX_N = 1200;
+    const MAX_P = 10;
+
+    // 出厂默认值：只有点击「重新初始化」才会回到这里。
+    const DEFAULTS = {
+      count: 600,
       separation: 1.39,
       alignment: 1.35,
       cohesion: 1.16,
@@ -321,10 +442,8 @@
       maxSpeed: 15.2,
       minSpeed: 2.2,
       boundary: BOUND,
-      arrowSize: 0.22,
+      arrowSize: 0.25,
       master: 0.38,
-      enabled: false,
-      paused: false,
       // 捕食者：标准 Reynolds pursuit + 预测逃逸模型
       predatorOn: true,
       predatorCount: 2,
@@ -341,8 +460,59 @@
       sprintDuration: 0.8,
       sprintRecovery: 5.0
     };
-    const MAX_N = 1200;
-    const MAX_P = 10;
+    // 运行时参数：先从 localStorage 恢复上次的调整结果，没有存档才用默认值。
+    const params = { ...DEFAULTS, enabled: false, paused: false };
+
+    // 只持久化「用户可调」的参数；enabled / paused 属于会话状态，不写入存档。
+    const PERSIST_KEYS = [
+      'count', 'separation', 'alignment', 'cohesion', 'perception', 'separationRange',
+      'flow', 'maxSpeed', 'minSpeed', 'arrowSize',
+      'predatorOn', 'predatorCount', 'fleeWeight', 'fleeRange', 'predict',
+      'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
+      'sprintFactor', 'sprintDuration', 'sprintRecovery'
+    ];
+    const STORE_KEY = 'flocklab.params.v2';
+    const PARAM_RANGE = {
+      count: [50, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
+      perception: [1, 14], separationRange: [0.2, 6], flow: [0, 4],
+      maxSpeed: [2, 18], minSpeed: [0.5, 8], arrowSize: [0.18, 0.9],
+      predatorCount: [1, MAX_P], fleeWeight: [0, 6], fleeRange: [3, 24],
+      predict: [0, 1.5], chaseWeight: [0, 4], predSpeed: [2, 36],
+      lockTime: [0, 5], feedCooldown: [0.3, 60],
+      sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12]
+    };
+    const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    function loadParams() {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (_) { saved = null; }
+      if (!saved || typeof saved !== 'object') return;
+      for (const key of PERSIST_KEYS) {
+        const v = saved[key];
+        if (v === undefined || v === null) continue;
+        const def = DEFAULTS[key];
+        if (typeof v !== typeof def) continue;
+        if (typeof v === 'number' && !isFinite(v)) continue;
+        let next = typeof v === 'number' ? v : !!v;
+        const range = PARAM_RANGE[key];
+        if (range) next = clampNum(next, range[0], range[1]);
+        if (key === 'count' || key === 'predatorCount') next = Math.round(next);
+        params[key] = next;
+      }
+    }
+    loadParams();
+
+    let saveTimer = 0;
+    function saveParams() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        try {
+          const out = {};
+          for (const key of PERSIST_KEYS) out[key] = params[key];
+          localStorage.setItem(STORE_KEY, JSON.stringify(out));
+        } catch (_) { /* 隐私模式写不进去时静默忽略 */ }
+      }, 120);
+    }
+
     let activeCount = params.count;
     let activeP = params.predatorCount;
 
@@ -394,11 +564,29 @@
     // 冷却期随机巡游的航向与下一次改向时间
     const predWanderAng = new Float32Array(MAX_P);
     const predWanderUntil = new Float64Array(MAX_P);
+    const predPrev = new Float32Array(MAX_P * 3);  // 上一帧位置，用于「扫掠」碰撞检测
 
     const MAX_FORCE = 14;
-    // 捕食者的碰撞体积跟随外形的等边三角形大小：接触即算捕获（仍受进食冷却限制）。
-    const predBaseSize = () => Math.max(1.1, params.arrowSize * 7);
-    const catchRadius = () => predBaseSize() * 0.78 + params.arrowSize * 0.6;
+    // 捕食者外形：锐角等腰三角形。腰长 = 鸟的 1.4 倍，底 = 鸟的 0.7 倍。
+    // 「鸟的尺寸」指一只元素的实际整体尺寸（实例四边形边长 = 2 × arrowSize）。
+    const birdExtent = () => params.arrowSize * 2;
+    const predLeg = () => birdExtent() * 1.4;          // 腰长
+    const predBase = () => birdExtent() * 0.7;         // 底边长
+    // 碰撞体积：按三角形外接范围取一个略宽于外形的圆，再加上鸟自身半径。
+    // 捕食者单帧位移可能超过这个半径，所以判定会用「上一帧 → 当前帧」的线段做扫掠，避免穿模。
+    const catchRadius = () => predLeg() * 0.45 + predBase() * 0.35 + params.arrowSize * 0.9;
+    // 点到线段的距离平方：捕食者单帧可能移动好几个身位，用线段代替点判定才不会「穿过」猎物。
+    function segDist2(px, py, ax, ay, bx, by) {
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy;
+      let t = len2 > 1e-9 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0;
+      t = t < 0 ? 0 : (t > 1 ? 1 : t);
+      const qx = ax + dx * t - px, qy = ay + dy * t - py;
+      return qx * qx + qy * qy;
+    }
+    // 传送门：撞到边界的个体有 5% 概率从对侧穿出（出入点关于场地中心对称）
+    const PORTAL_P = 0.05;
+    let teleportCount = 0;
     const PRED_FORCE = 24;
     const PRED_SEP_RANGE2 = 6 * 6;
     const PRED_SEP_FORCE = 34;
@@ -729,7 +917,9 @@
     predGeo.instanceCount = activeP;
     const predMat = arrowMat.clone();
     predMat.uniforms.uMaxSpeed.value = params.predSpeed;
-    // 等边锐角三角形：三边等长、方向即运动方向，和猎物细线「>」完全不同。
+    // 锐角等腰三角形：腰长 1、底 0.5（即「腰 1.4 : 底 0.7」的比例），方向即运动方向。
+    // 顶点 (2h/3, 0)、(-h/3, ±0.25)，h = √(1 - 0.25²) → 重心落在原点。
+    // 实际尺寸由 predSiz = 腰长 控制，所以只改一处就能整体缩放。
     predMat.fragmentShader = `
       varying vec2 vLocal;
       varying vec3 vColor;
@@ -749,16 +939,16 @@
       }
       void main() {
         vec2 p = vLocal;
-        // 顶点 (1,0)、(-0.5,±√3/2)：中心在原点的等边三角形
-        float d = sdTri(p, vec2(1.0, 0.0), vec2(-0.5, 0.8660254), vec2(-0.5, -0.8660254));
-        float fill = 1.0 - smoothstep(0.0, 0.035, d);
-        float rim = exp(-abs(d) * 20.0) * 0.32;
-        float glow = exp(-max(d, 0.0) * 7.0) * 0.28;
+        float d = sdTri(p, vec2(0.6454972, 0.0), vec2(-0.3227486, 0.25), vec2(-0.3227486, -0.25));
+        // 形体很小，边缘留足够的软过渡，避免细尖角出现锯齿
+        float fill = 1.0 - smoothstep(0.0, 0.055, d);
+        float rim = exp(-abs(d) * 16.0) * 0.5;
+        float glow = exp(-max(d, 0.0) * 4.8) * 0.36;
         float a = clamp(fill + glow, 0.0, 1.0) * vFade;
         if (a < 0.004) discard;
-        vec3 c = vColor * (0.92 + 0.32 * vSpeed) * (fill * 0.88 + rim + glow * 0.5);
-        float tip = 1.0 - smoothstep(0.05, 0.34, length(p - vec2(0.72, 0.0)));
-        c = mix(c, vec3(1.0, 0.95, 0.82), tip * 0.45 * fill);
+        vec3 c = vColor * (0.96 + 0.34 * vSpeed) * (fill * 0.94 + rim + glow * 0.5);
+        float tip = 1.0 - smoothstep(0.04, 0.30, length(p - vec2(0.56, 0.0)));
+        c = mix(c, vec3(1.0, 0.95, 0.82), tip * 0.5 * fill);
         gl_FragColor = vec4(c, a);
         #include <colorspace_fragment>
       }
@@ -783,7 +973,7 @@
       threatRings.push(ring);
       scene.add(ring);
       predCol[p * 3] = 1.0; predCol[p * 3 + 1] = 0.34; predCol[p * 3 + 2] = 0.12;
-      predSiz[p] = predBaseSize();
+      predSiz[p] = predLeg();
     }
 
     // 捕杀特效三段式：0ms 亮核爆闪 → 90ms 内环扩张 + 火花 → 240ms 外环余波。
@@ -1054,6 +1244,51 @@
       audio.toggle().catch((e) => fail('声音切换失败：' + e.message));
     });
 
+    // ---------------------------------------------------------------- 场景按钮
+    // 原来的「场景」折叠面板里的三项都是动作而不是参数，这里提成图标按钮，与右上角图标并列。
+    const pauseBtn = document.getElementById('pauseBtn');
+    const pauseIcon = pauseBtn.querySelectorAll('.pauseIcon');
+    const playIcon = pauseBtn.querySelector('.playIcon');
+    function syncPauseBtn() {
+      const on = params.paused;
+      pauseBtn.classList.toggle('on', on);
+      for (const el of pauseIcon) el.style.display = on ? 'none' : '';
+      playIcon.style.display = on ? '' : 'none';
+      const label = on ? '继续模拟' : '暂停模拟';
+      pauseBtn.title = label;
+      pauseBtn.setAttribute('aria-label', label);
+    }
+    pauseBtn.addEventListener('click', () => {
+      params.paused = !params.paused;
+      syncPauseBtn();
+      wake();
+    });
+    document.getElementById('resetBtn').addEventListener('click', () => {
+      applyDefaults();          // 恢复默认参数 + 重新初始化群体
+      wake();
+    });
+    document.getElementById('viewBtn').addEventListener('click', () => {
+      resetView2D();
+      wake();
+    });
+    syncPauseBtn();
+
+    // ---------------------------------------------------------------- 关于
+    const about = document.getElementById('about');
+    const brandBtn = document.getElementById('brand');
+    function openAbout() {
+      about.classList.add('open');
+      about.setAttribute('aria-hidden', 'false');
+    }
+    function closeAbout() {
+      about.classList.remove('open');
+      about.setAttribute('aria-hidden', 'true');
+    }
+    brandBtn.addEventListener('click', openAbout);
+    about.addEventListener('click', (e) => { if (e.target === about) closeAbout(); });
+    about.querySelector('.about-close').addEventListener('click', closeAbout);
+    addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAbout(); });
+
     // 演示模式：一次点击隐藏控制台、卡片、提示等所有 UI，只留这个图标用于恢复。
     const uiBtn = document.getElementById('uiBtn');
     uiBtn.addEventListener('click', () => {
@@ -1096,85 +1331,110 @@
     // 每行滑块的 title 写清“调大之后会怎样”，避免用户靠猜。
     const tip = (ctrl, text) => { ctrl.domElement.setAttribute('title', text); return ctrl; };
     const gui = new GUI({ title: 'FlockLab 控制台', width: 300 });
+    // 控件登记表：恢复默认值后用它把面板显示同步回来。
+    const guiCtrls = [];
+    function bindNum(folder, key, min, max, step, label, hint, after) {
+      const ctrl = folder.add(params, key, min, max, step).name(label);
+      ctrl.onChange((v) => { if (after) after(v); saveParams(); });
+      tip(ctrl, hint);
+      guiCtrls.push([key, ctrl]);
+      return ctrl;
+    }
+    function bindBool(folder, key, label, hint, after) {
+      const ctrl = folder.add(params, key).name(label);
+      ctrl.onChange((v) => { if (after) after(v); saveParams(); });
+      tip(ctrl, hint);
+      guiCtrls.push([key, ctrl]);
+      return ctrl;
+    }
 
     const fRules = gui.addFolder('鸟群规则');
-    tip(fRules.add(params, 'separation', 0, 4, 0.01).name('分离力度'),
+    bindNum(fRules, 'separation', 0, 4, 0.01, '分离力度',
       '分离｜调大：鸟会把贴得太近的同伴用力推开，群体更松散、不重叠。调小：彼此贴得很近甚至挤成一团。');
-    tip(fRules.add(params, 'alignment', 0, 4, 0.01).name('对齐力度'),
+    bindNum(fRules, 'alignment', 0, 4, 0.01, '对齐力度',
       '对齐｜调大：鸟更倾向和周围同伴同向飞，队伍更整齐。调小：各飞各的，方向散乱。');
-    tip(fRules.add(params, 'cohesion', 0, 4, 0.01).name('聚合力度'),
+    bindNum(fRules, 'cohesion', 0, 4, 0.01, '聚合力度',
       '聚合｜调大：鸟更想靠近同伴中心，容易抱团。调小：群体更分散。');
-    tip(fRules.add(params, 'perception', 1, 14, 0.1).name('视野范围'),
+    bindNum(fRules, 'perception', 1, 14, 0.1, '视野范围',
       '视野半径｜调大：每只鸟能看到更远的同伴，队伍更连贯（计算量也更大）。调小：只看身边几只，队形容易断裂。');
-    tip(fRules.add(params, 'separationRange', 0.2, 6, 0.1).name('安全距离'),
+    bindNum(fRules, 'separationRange', 0.2, 6, 0.1, '安全距离',
       '安全距离｜两只鸟比这更近时才开始互躲。调大：队伍稀疏、空隙大。调小：能挤得很紧密。它和“分离力度”不同：这里管多近才躲，分离力度管躲得多用力。');
     fRules.open();
 
     const fMotion = gui.addFolder('飞行与视野');
-    tip(fMotion.add(params, 'count', 50, MAX_N, 10).name('鸟群数量').onChange(setCount),
-      '鸟群总数｜调多：画面更壮观、群体感更强，但帧率会下降。调少：更容易看清单只的行为。');
-    tip(fMotion.add(params, 'maxSpeed', 2, 18, 0.1).name('巡航速度').onChange((v) => {
-      arrowMat.uniforms.uMaxSpeed.value = v;
-    }),
-      '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。');
-    tip(fMotion.add(params, 'flow', 0, 4, 0.05).name('气流扰动'),
+    bindNum(fMotion, 'count', 50, MAX_N, 10, '元素数量',
+      '元素总数｜调多：画面更壮观、群体感更强，但帧率会下降。调少：更容易看清单只的行为。',
+      (v) => setCount(v));
+    bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
+      '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
+      (v) => { arrowMat.uniforms.uMaxSpeed.value = v; });
+    bindNum(fMotion, 'flow', 0, 4, 0.05, '气流扰动',
       '气流扰动｜调大：鸟更容易被随机气流带偏，运动更自然，但队形更松散。调 0：完全按三规则飞行。');
-    tip(fMotion.add(params, 'arrowSize', 0.18, 0.9, 0.01).name('箭头大小'),
-      '箭头大小｜只改变外观，不影响任何运动规则。');
+    bindNum(fMotion, 'arrowSize', 0.18, 0.9, 0.01, '元素大小',
+      '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍），所以它只影响外观，不影响运动规则。');
     fMotion.open();
 
     const fPred = gui.addFolder('捕食与逃逸');
-    tip(fPred.add(params, 'predatorOn').name('开启捕食者').onChange((v) => {
-      predMesh.visible = v;
-      for (let p = 0; p < MAX_P; p++) threatRings[p].visible = v && p < activeP;
-      document.getElementById('hPred').textContent = v ? activeP : '0';
-      if (v) {
-        initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0);
-        predCatches = 0; sprintCount = 0; stamina.fill(1); sprintUntil.fill(0);
-      }
-    }),
-      '开启捕食者｜打开后出现橙红色等边三角形，接触即捕获；鸟会逃逸，危险时会短时爆发加速。');
-    tip(fPred.add(params, 'predatorCount', 1, MAX_P, 1).name('捕食者数量').onChange(setPredCount),
-      '捕食者数量｜调多：鸟群压力更大、逃生更混乱。调少（推荐 1 只）：更容易看清追击、爆发和捕杀动画。');
-    tip(fPred.add(params, 'predSpeed', 2, 36, 0.1).name('捕食者速度').onChange((v) => {
-      predMat.uniforms.uMaxSpeed.value = v;
-    }),
-      '捕食者速度｜调大：追得更快、更容易抓到鸟（捕获间隔变短）。调小：鸟更容易逃掉。');
-    tip(fPred.add(params, 'chaseWeight', 0, 4, 0.05).name('追击力度'),
+    bindBool(fPred, 'predatorOn', '开启捕食者',
+      '开启捕食者｜打开后出现橙红色锐角三角形，接触即捕获；鸟会逃逸，危险时会短时爆发加速。',
+      (v) => {
+        predMesh.visible = v;
+        for (let p = 0; p < MAX_P; p++) threatRings[p].visible = v && p < activeP;
+        document.getElementById('hPred').textContent = v ? activeP : '0';
+        if (v) {
+          initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0);
+          predCatches = 0; sprintCount = 0; stamina.fill(1); sprintUntil.fill(0);
+        }
+      });
+    bindNum(fPred, 'predatorCount', 1, MAX_P, 1, '捕食者数量',
+      '捕食者数量｜调多：鸟群压力更大、逃生更混乱。调少（推荐 1 只）：更容易看清追击、爆发和捕杀动画。',
+      (v) => setPredCount(v));
+    bindNum(fPred, 'predSpeed', 2, 36, 0.1, '捕食者速度',
+      '捕食者速度｜调大：追得更快、更容易抓到鸟（捕获间隔变短）。调小：鸟更容易逃掉。',
+      (v) => { predMat.uniforms.uMaxSpeed.value = v; });
+    bindNum(fPred, 'chaseWeight', 0, 4, 0.05, '追击力度',
       '追击力度｜调大：捕食者拐弯追得更凶、咬得更紧；太大急转会不自然。');
-    tip(fPred.add(params, 'fleeRange', 3, 24, 0.5).name('危险感知距离'),
+    bindNum(fPred, 'fleeRange', 3, 24, 0.5, '危险感知距离',
       '危险感知距离｜鱼群在多远开始察觉捕食者。调大：整群提前绕开，几乎不会被逼近。调小：捕食者贴脸才逃，容易被抓。');
-    tip(fPred.add(params, 'fleeWeight', 0, 6, 0.05).name('逃跑力度'),
+    bindNum(fPred, 'fleeWeight', 0, 6, 0.05, '逃跑力度',
       '逃跑力度｜调大：个体和整群都逃得更拼命，鱼群会更整齐地绕开捕食者。太大会盖过群聚，队形散掉。');
-    tip(fPred.add(params, 'sprintFactor', 1, 2.5, 0.05).name('爆发速度倍率'),
+    bindNum(fPred, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
       '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
-    tip(fPred.add(params, 'sprintDuration', 0.2, 3, 0.1).name('爆发持续(秒)'),
+    bindNum(fPred, 'sprintDuration', 0.2, 3, 0.1, '爆发持续(秒)',
       '爆发持续时间｜一次冲刺能维持几秒。调长：逃得更远。调短：更像瞬间闪避。结束后速度回到巡航上限。');
-    tip(fPred.add(params, 'sprintRecovery', 1, 12, 0.5).name('体力恢复(秒)'),
+    bindNum(fPred, 'sprintRecovery', 1, 12, 0.5, '体力恢复(秒)',
       '体力恢复时间｜爆发后要几秒才能再次爆发。调大：几乎不能连续爆发，鸟更容易被抓。调小：可以频繁逃生。');
-    tip(fPred.add(params, 'infoCascade').name('警报传递'),
+    bindBool(fPred, 'infoCascade', '警报传递',
       '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
     fPred.open();
 
-    const fScene = gui.addFolder('场景');
-    tip(fScene.add(params, 'paused').name('暂停模拟'),
-      '暂停模拟｜冻结运动，方便观察某一帧；再点一次继续。');
-    tip(fScene.add({ reset: resetBoids }, 'reset').name('重新初始化'),
-      '重新初始化｜把鸟群和捕食者放回随机初始位置，清空捕获与体力记录。');
-    tip(fScene.add({ view: resetView2D }, 'view').name('重置视角'),
-      '重置视角｜把缩放和平移恢复到默认。');
-    fScene.open();
-
     const fAdv = gui.addFolder('高级参数（很少用）');
-    tip(fAdv.add(params, 'minSpeed', 0.5, 8, 0.1).name('最低速度'),
+    bindNum(fAdv, 'minSpeed', 0.5, 8, 0.1, '最低速度',
       '最低速度｜鸟再慢也不会低于这个值，避免悬停不动。一般不用调。');
-    tip(fAdv.add(params, 'predict', 0, 1.5, 0.05).name('预判系数'),
+    bindNum(fAdv, 'predict', 0, 1.5, 0.05, '预判系数',
       '预判系数｜鸟逃跑时会朝捕食者未来位置躲。调大：躲得更提前；太大像未卜先知。');
-    tip(fAdv.add(params, 'lockTime', 0, 5, 0.1).name('锁定目标(秒)'),
+    bindNum(fAdv, 'lockTime', 0, 5, 0.1, '锁定目标(秒)',
       '锁定目标｜捕食者专注追同一只鸟的秒数。调大：不容易被鸟群晃动骗到，追击更稳定。');
-    tip(fAdv.add(params, 'feedCooldown', 0.3, 60, 0.1).name('进食冷却(秒)'),
+    bindNum(fAdv, 'feedCooldown', 0.3, 60, 0.1, '进食冷却(秒)',
       '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
     fAdv.close();
+
+    // 恢复出厂参数：点右上角「重新初始化」才会走到这里，平时刷新都沿用存档。
+    function applyDefaults() {
+      for (const key of PERSIST_KEYS) params[key] = DEFAULTS[key];
+      params.paused = false;
+      syncPauseBtn();
+      setCount(params.count);
+      setPredCount(params.predatorCount);
+      predMesh.visible = params.predatorOn;
+      for (let p = 0; p < MAX_P; p++) threatRings[p].visible = params.predatorOn && p < activeP;
+      document.getElementById('hPred').textContent = params.predatorOn ? activeP : '0';
+      arrowMat.uniforms.uMaxSpeed.value = params.maxSpeed;
+      predMat.uniforms.uMaxSpeed.value = params.predSpeed;
+      for (const [, ctrl] of guiCtrls) ctrl.updateDisplay();
+      saveParams();
+      resetBoids();
+    }
 
     // ---------------------------------------------------------------- 空间哈希
     const grid = new Map();
@@ -1234,6 +1494,7 @@
         for (let p = 0; p < P; p++) {
           const q = p * 3;
           const ppx = predPos[q], ppy = predPos[q + 1], ppz = predPos[q + 2];
+          predPrev[q] = ppx; predPrev[q + 1] = ppy; predPrev[q + 2] = 0;
           const pvx = predVel[q], pvy = predVel[q + 1], pvz = predVel[q + 2];
           // 进食冷却：吃饱后不再追击，只以四成左右的速度随机巡游保存体力。
           // 速度上限本身按加速度积分变化，所以「追击 ↔ 巡游」之间是平滑过渡。
@@ -1579,20 +1840,42 @@
         keSum += 0.5 * sp * sp;
 
         pos[k] += vx * dt; pos[k + 1] += vy * dt;
-        // 矩形硬边界：逐轴夹紧并弹性反射
-        if (pos[k] > hx) { pos[k] = hx; vel[k] = -Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
-        else if (pos[k] < -hx) { pos[k] = -hx; vel[k] = Math.abs(vx) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2)); }
-        if (pos[k + 1] > hy) { pos[k + 1] = hy; vel[k + 1] = -Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
-        else if (pos[k + 1] < -hy) { pos[k + 1] = -hy; vel[k + 1] = Math.abs(vy) * 0.92; boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2)); }
+
+        // 边界：默认弹性反射；每次撞墙都有 5% 概率变成「传送门」——
+        // 从对侧穿出，且出入点关于场地中心对称（左边偏下飞出 → 右边偏上飞进）。
+        // 速度方向保持不变，所以刚进场的个体一定是朝场内飞的。
+        const outX = pos[k] > hx ? 1 : (pos[k] < -hx ? -1 : 0);
+        const outY = pos[k + 1] > hy ? 1 : (pos[k + 1] < -hy ? -1 : 0);
+        if (outX || outY) {
+          if (Math.random() < PORTAL_P) {
+            if (outX) { pos[k] = -outX * hx; pos[k + 1] = -pos[k + 1]; }
+            if (outY) { pos[k + 1] = -outY * hy; pos[k] = -pos[k]; }
+            // 斜角同时越界时镜像后可能仍在外侧，夹回场内
+            if (pos[k] > hx) pos[k] = hx; else if (pos[k] < -hx) pos[k] = -hx;
+            if (pos[k + 1] > hy) pos[k + 1] = hy; else if (pos[k + 1] < -hy) pos[k + 1] = -hy;
+            teleportCount++;
+          } else {
+            if (outX) {
+              pos[k] = outX * hx;
+              vel[k] = -outX * Math.abs(vx) * 0.92;
+              boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2));
+            }
+            if (outY) {
+              pos[k + 1] = outY * hy;
+              vel[k + 1] = -outY * Math.abs(vy) * 0.92;
+              boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2));
+            }
+          }
+        }
         pos[k + 2] = 0; vel[k + 2] = 0;
 
-        // 捕获：捕食者三角形有碰撞体积，接触即算捕食成功（仍受进食冷却限制）
+        // 捕获：捕食者是锐角三角形，有实际碰撞体积，接触即算捕食成功（仍受进食冷却限制）。
+        // 用上一帧到当前帧的线段做扫掠判定：高速追击时不会一帧跨过猎物。
         if (P > 0 && !caught[i]) {
           for (let p = 0; p < P; p++) {
             if (time - predFeedAt[p] < params.feedCooldown * 1000) continue;
             const q = p * 3;
-            const dx = pos[k] - predPos[q], dy = pos[k + 1] - predPos[q + 1];
-            if (dx * dx + dy * dy >= catchR2) continue;
+            if (segDist2(pos[k], pos[k + 1], predPrev[q], predPrev[q + 1], predPos[q], predPos[q + 1]) >= catchR2) continue;
             const rvx = vx - predVel[q], rvy = vy - predVel[q + 1];
             const vrel = Math.max(0.5, Math.hypot(rvx, rvy));
             const J = Math.pow(vrel, 1.2) / predNorm;
@@ -1723,7 +2006,7 @@
           ring.visible = true;
           // 扑击瞬间箭头放大脉冲，与冲击波同步。
           const pulse = Math.max(0, 1 - (now - predPulseAt[p]) / 280);
-          predSiz[p] = predBaseSize() * (1 + 0.32 * pulse);
+          predSiz[p] = predLeg() * (1 + 0.32 * pulse);
         }
       } else {
         for (const ring of threatRings) ring.visible = false;
@@ -1809,10 +2092,19 @@
     });
 
     updateRectFrame();
+    // 存档恢复后同步 HUD 上的初始数量
+    document.getElementById('hCount').textContent = activeCount;
+    document.getElementById('hPred').textContent = params.predatorOn ? activeP : '0';
     requestAnimationFrame(render);
 
     window.FlockLab = {
-      params, resetBoids, setCount, setPredCount, spawnBurst,
+      params, defaults: DEFAULTS, resetBoids, resetAll: applyDefaults, setCount, setPredCount, spawnBurst,
+      saveParams,
+      get portalChance() { return PORTAL_P; },
+      get teleports() { return teleportCount; },
+      get predShape() {
+        return { leg: +predLeg().toFixed(3), base: +predBase().toFixed(3), birdExtent: +birdExtent().toFixed(3) };
+      },
       get maxAbsZ() {
         let m = 0;
         for (let i = 0; i < activeCount; i++) m = Math.max(m, Math.abs(pos[i * 3 + 2]));
