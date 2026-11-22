@@ -358,6 +358,7 @@
         <li><b>捕食者</b>锐角三角形，带碰撞体积，接触即捕食；进食后减速随机巡游。</li>
         <li><b>爆发</b>只有被捕食者逼近时才会冲刺逃命（洋红发光 + 渐隐拖尾）；体力耗尽后必须恢复，不能连续爆发。</li>
         <li><b>反应延迟</b>看到捕食者不会立刻爆发：贴身的鸟约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像一圈涟漪从捕食者身边扩散开。</li>
+        <li><b>草地</b>场地里有 2~3 片云朵状草地（约占屏幕 1/9），鸟每隔二三十秒会挑一片降落歇 3~6 秒；捕食者靠近就立刻惊飞。</li>
         <li><b>音乐</b>四层生成式音景随聚集度变化：散开时只有低频嗡鸣，抱团后和声变厚、节拍渐起。与提示音共用右上角声音开关。</li>
         <li><b>操作</b>拖拽平移 · 滚轮或双指缩放；右上角复位视角、恢复默认参数、暂停。</li>
       </ul>
@@ -377,6 +378,7 @@
       <div class="hud-row"><span class="k">音乐 聚集度驱动</span><span class="bar"><i id="hMusicBar"></i></span></div>
       <div class="hud-row"><span class="k">音效 逃逸 / 被吃 / 新生</span><span class="v"><span class="dot" id="hSprintFx"></span><span class="dot" id="hPredFx"></span><span class="dot" id="hBirthFx"></span></span></div>
       <div class="hud-row"><span class="k">爆发中 / 恢复中</span><span class="v" id="hSprint">0 / 0</span></div>
+      <div class="hud-row"><span class="k">草地休息</span><span class="v" id="hRest">0</span></div>
       <div class="hud-row"><span class="k">帧率</span><span class="v" id="hFps">— FPS</span></div>
     </div>
   </div>
@@ -475,7 +477,9 @@
       sprintRecovery: 5.0,
       // 音量：音乐与音效分开，默认音乐明显更轻，避免低频一直嗡嗡地压着
       musicLevel: 0.55,
-      fxLevel: 1.0
+      fxLevel: 1.0,
+      // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
+      grassOn: true
     };
     // 运行时参数：先从 localStorage 恢复上次的调整结果，没有存档才用默认值。
     const params = { ...DEFAULTS, enabled: false, paused: false };
@@ -487,7 +491,7 @@
       'predatorOn', 'predatorCount', 'fleeWeight', 'fleeRange', 'predict',
       'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
       'sprintFactor', 'sprintDuration', 'sprintRecovery',
-      'musicLevel', 'fxLevel'
+      'musicLevel', 'fxLevel', 'grassOn'
     ];
     // v3：元素数量上限/默认值改为 10000 / 1000，旧存档里的 600 不再沿用。
     const STORE_KEY = 'flocklab.params.v3';
@@ -573,6 +577,14 @@
     const trailTail = new Float32Array(MAX_N * 2);  // 尾巴（滞后点）
     const trailAmt = new Float32Array(MAX_N);       // 拖尾强度 0~1，用于淡入淡出
     const TRAIL_TAU = 0.115;                        // 尾巴跟随时间常数（秒）
+    // ---------------------------------------------------------------- 草地休息
+    // 每只鸟有一张「休息预约」：到点就去最近的空地降落 3~6 秒，再起飞。
+    // 草地有容量，满了就稍后再试，所以不会一千只同时挤进同一片。
+    const resting = new Uint8Array(MAX_N);
+    const restPatch = new Int8Array(MAX_N).fill(-1);   // 停在哪片草地（-1 = 没有）
+    const restUntil = new Float64Array(MAX_N);         // 起身时间
+    const restDue = new Float64Array(MAX_N);           // 下次想休息的时间
+    const restTgt = new Float32Array(MAX_N * 2);       // 落点
     // ---------------------------------------------------------------- 个体差异
     // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
     // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
@@ -592,6 +604,7 @@
     capNow.fill(params.maxSpeed * 0.78);
     let sprintCount = 0, sprintingCount = 0;
     let cohesion01 = 0;   // 0=散开 1=紧团
+    let restingCount = 0;  // 当前在草地上休息的数量（HUD/调试用）
     // 上一帧的群体半径（RMS），用于相干度与群体尺度
     let groupRms = 12;
 
@@ -620,7 +633,7 @@
     const predTrailP = new Float32Array(MAX_P);      // 平滑后的加速度强度 0~1
     const predTrailAmt = new Float32Array(MAX_P);    // 拖尾强度 0~1
     const predTrailTail = new Float32Array(MAX_P * 2);
-    const PRED_TRAIL_REF = 45;                       // 加速度达到这个值即视为「全力冲刺」（实测中位数约 12、峰值约 64）
+    let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即视为「全力冲刺」（实测中位数 12、峰值 64）
     // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
     const predSpdJit = new Float32Array(MAX_P);
     const predWobble = new Float32Array(MAX_P);
@@ -682,6 +695,8 @@
         birthAt[i] = isBirth ? performance.now() : -Infinity;
         stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
         alertMs[i] = 0; trailAmt[i] = 0;
+        resting[i] = 0; restPatch[i] = -1;
+        restDue[i] = performance.now() + 4000 + Math.random() * 26000;
         rollTraits(i);
         caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
       }
@@ -719,6 +734,8 @@
       stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
       alertMs[i] = 0; trailAmt[i] = 0;
       trailTail[i * 2] = pos[k]; trailTail[i * 2 + 1] = pos[k + 1];
+      resting[i] = 0; restPatch[i] = -1;
+      restDue[i] = now + 5000 + Math.random() * 20000;
       rollTraits(i);   // 重生等于换一只新个体：速度脾气和游走相位都重新抽
     }
 
@@ -794,6 +811,7 @@
     document.getElementById('scene').appendChild(renderer.domElement);
 
     // 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
+    let bgMesh = null;   // 背景渐变稍后才创建，先声明避免「用到未定义变量」
     function updateOrthoFrustum() {
       const aspect = innerWidth / innerHeight;
       const halfH = view2DFitHalfH() / view2D.zoom;
@@ -801,6 +819,10 @@
       orthoCam.left = -halfW; orthoCam.right = halfW;
       orthoCam.top = halfH; orthoCam.bottom = -halfH;
       orthoCam.updateProjectionMatrix();
+      // 背景渐变挂在相机上，尺寸跟着视锥走，永远铺满视口
+      if (bgMesh) {
+        bgMesh.scale.set(halfW * 2.06, halfH * 2.06, 1);
+      }
     }
     updateOrthoFrustum();
 
@@ -886,6 +908,252 @@
       rectFrameGeo.attributes.position.needsUpdate = true;
     }
     updateRectFrame();
+
+    // ---------------------------------------------------------------- 背景点缀
+    // 纯粹是氛围：一层挂在相机上的极淡径向渐变 + 会缓慢漂移的尘埃点。
+    // 都压得很暗（亮度 0.01~0.06 量级），并且不参与任何仿真，不影响主体观感。
+    const bgGeo = new THREE.PlaneGeometry(1, 1);
+    const bgMat = new THREE.ShaderMaterial({
+      uniforms: { uHalf: { value: new THREE.Vector2(1, 1) } },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+      `,
+      fragmentShader: `
+        varying vec2 vUv;
+        uniform vec2 uHalf;
+        void main() {
+          vec2 p = (vUv - 0.5) * 2.0;              // -1~1
+          float d = length(p * vec2(1.0, 0.85));
+          // 中心微微亮一点的冷调，向外压暗，再叠一点极轻的右上暖光
+          float core = smoothstep(1.15, 0.0, d);
+          float warm = smoothstep(1.2, 0.2, length(p - vec2(0.55, 0.45)));
+          // 注意：这里是线性空间，经过 colorspace_fragment 转 sRGB 后会被提亮，
+          // 所以数值必须压到 0.003 量级，最终观感才是近黑的深蓝。
+          vec3 col = mix(vec3(0.0030, 0.0042, 0.0072), vec3(0.0055, 0.0082, 0.0130), core);
+          col += vec3(0.0035, 0.0022, 0.0014) * warm * 0.9;
+          // 暗角：边缘再压一层，避免画面四周发灰
+          col *= 0.72 + 0.28 * core;
+          gl_FragColor = vec4(col, 1.0);
+          #include <colorspace_fragment>
+        }
+      `,
+      depthWrite: false,
+      depthTest: false
+    });
+    bgMesh = new THREE.Mesh(bgGeo, bgMat);
+    bgMesh.frustumCulled = false;
+    bgMesh.renderOrder = -10;
+    camera.add(bgMesh);           // 挂在相机上：平移缩放都跟着，永远铺满视口
+    bgMesh.position.set(0, 0, -60);
+    scene.add(camera);
+    scene.background = null;      // 让这层渐变接管背景
+
+    // 尘埃：世界坐标里的一小把点，缓慢漂移 + 呼吸式明暗，撞到边界就绕回
+    const DUST_N = 260;
+    const dustPos = new Float32Array(DUST_N * 3);
+    const dustSeed = new Float32Array(DUST_N);
+    const dustGeo = new THREE.BufferGeometry();
+    dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3).setUsage(THREE.DynamicDrawUsage));
+    dustGeo.setAttribute('aSeed', new THREE.BufferAttribute(dustSeed, 1));
+    const dustMat = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 }, uHalfH: { value: BOUND }, uPR: { value: 1 } },
+      vertexShader: `
+        attribute float aSeed;
+        uniform float uTime;
+        uniform float uPR;
+        varying float vAlpha;
+        void main() {
+          vec4 mv = modelViewMatrix * vec4(position, 1.0);
+          gl_Position = projectionMatrix * mv;
+          // 每颗尘埃自己呼吸，周期 6~14 秒，明暗只在 0.35~1 之间
+          float ph = aSeed * 6.2831;
+          float breathe = 0.62 + 0.38 * sin(uTime * (0.45 + fract(aSeed * 7.0) * 0.5) + ph);
+          vAlpha = breathe * (0.35 + 0.65 * fract(aSeed * 13.0));
+          gl_PointSize = (1.0 + 1.6 * fract(aSeed * 3.0)) * uPR;
+        }
+      `,
+      fragmentShader: `
+        varying float vAlpha;
+        void main() {
+          vec2 q = gl_PointCoord - 0.5;
+          float d = length(q);
+          float a = smoothstep(0.5, 0.0, d) * vAlpha * 0.14;
+          if (a < 0.004) discard;
+          gl_FragColor = vec4(vec3(0.55, 0.78, 1.0) * a, a);
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false
+    });
+    const dust = new THREE.Points(dustGeo, dustMat);
+    dust.frustumCulled = false;
+    dust.renderOrder = -9;
+    scene.add(dust);
+    function seedDust() {
+      const bd = bounds2D();
+      for (let i = 0; i < DUST_N; i++) {
+        dustPos[i * 3] = (Math.random() * 2 - 1) * bd.hx * 1.05;
+        dustPos[i * 3 + 1] = (Math.random() * 2 - 1) * bd.hy * 1.05;
+        dustPos[i * 3 + 2] = 0;
+        dustSeed[i] = Math.random();
+      }
+      dustGeo.attributes.position.needsUpdate = true;
+      dustGeo.attributes.aSeed.needsUpdate = true;
+    }
+    seedDust();
+
+    // ---------------------------------------------------------------- 草地
+    // 2~3 片「云朵状」草地：极坐标谐波 r(θ) = R·(1 + a₁sin(3θ+φ₁) + a₂sin(5θ+φ₂))，
+    // 在着色器里直接求值，所以缩放不糊、边缘能有柔和的发光过渡。
+    // 总面积固定为屏幕的 1/9，位置随机但互不重叠、离边界留余量。
+    const GRASS_N = 3;
+    const grass = [];             // { x, y, R, a1, p1, a2, p2, area, cap, count }
+    const grassMeshes = [];
+    const grassMatProto = new THREE.ShaderMaterial({
+      uniforms: {
+        uCenter: { value: new THREE.Vector2(0, 0) },
+        uR: { value: 10 },
+        uHarm: { value: new THREE.Vector4(0.1, 0, 0.06, 0) },
+        uTime: { value: 0 },
+        uFade: { value: 1 }
+      },
+      vertexShader: `
+        varying vec2 vWorld;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          vWorld = wp.xy;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }
+      `,
+      fragmentShader: `
+        varying vec2 vWorld;
+        uniform vec2 uCenter;
+        uniform float uR;
+        uniform vec4 uHarm;
+        uniform float uTime;
+        uniform float uFade;
+        float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+        void main() {
+          vec2 d = vWorld - uCenter;
+          float th = atan(d.y, d.x);
+          float rr = uR * (1.0 + uHarm.x * sin(3.0 * th + uHarm.y) + uHarm.z * sin(5.0 * th + uHarm.w));
+          float r = length(d);
+          if (r > rr + 1.6) discard;
+          float inside = 1.0 - smoothstep(rr - 1.0, rr + 0.2, r);
+          // 内部：低频斑块（两三个正弦相乘，不引入贴图）
+          float n = 0.5 + 0.5 * sin(d.x * 0.33 + uTime * 0.12) * sin(d.y * 0.29 - uTime * 0.09);
+          float n2 = 0.5 + 0.5 * sin(d.x * 0.9 - d.y * 0.7 + uTime * 0.05);
+          vec3 col = mix(vec3(0.05, 0.34, 0.23), vec3(0.20, 0.66, 0.45), n * 0.7 + n2 * 0.3);
+          // 边缘：一圈很淡的荧光，和整体霓虹感一致
+          float rim = exp(-abs(r - rr) * 2.0);
+          float a = (inside * (0.070 + 0.050 * n) + rim * 0.18) * uFade;
+          if (a < 0.003) discard;
+          gl_FragColor = vec4(col * (0.85 + 0.5 * rim), a);
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false
+    });
+    function buildGrass() {
+      const bd = bounds2D();
+      // 屏幕面积 = 4·hx·hy，草地总面积取 1/9
+      const totalArea = (2 * bd.hx * 2 * bd.hy) / 9;
+      grass.length = 0;
+      const count = 2 + (Math.random() < 0.5 ? 1 : 0);   // 2 或 3 片
+      const perArea = totalArea / count;
+      for (let g = 0; g < count; g++) {
+        const a1 = 0.10 + Math.random() * 0.13;
+        const a2 = 0.04 + Math.random() * 0.09;
+        const p1 = Math.random() * Math.PI * 2;
+        const p2 = Math.random() * Math.PI * 2;
+        // 面积 ≈ πR²(1 + (a1²+a2²)/2)，反解 R
+        const R = Math.sqrt(perArea / (Math.PI * (1 + (a1 * a1 + a2 * a2) / 2)));
+        let x = 0, y = 0;
+        for (let t = 0; t < 80; t++) {
+          x = (Math.random() * 2 - 1) * Math.max(0.1, bd.hx - R * 1.25);
+          y = (Math.random() * 2 - 1) * Math.max(0.1, bd.hy - R * 1.25);
+          if (grass.every((e) => Math.hypot(e.x - x, e.y - y) > (e.R + R) * 1.3)) break;
+        }
+        grass.push({ x, y, R, a1, p1, a2, p2, area: perArea, cap: Math.max(16, Math.round(perArea / 3.6)), count: 0 });
+      }
+      // 复用/补齐网格
+      while (grassMeshes.length < GRASS_N) {
+        const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), grassMatProto.clone());
+        m.frustumCulled = false;
+        m.renderOrder = -5;
+        scene.add(m);
+        grassMeshes.push(m);
+      }
+      for (let g = 0; g < grassMeshes.length; g++) {
+        const m = grassMeshes[g], gp = grass[g];
+        if (!gp) { m.visible = false; continue; }
+        const span = gp.R * 2.75;          // 谐波最大 1.23 倍 R，再留点余量
+        m.scale.set(span, span, 1);
+        m.position.set(gp.x, gp.y, -1);
+        m.visible = params.grassOn;
+        m.material.uniforms.uCenter.value.set(gp.x, gp.y);
+        m.material.uniforms.uR.value = gp.R;
+        m.material.uniforms.uHarm.value.set(gp.a1, gp.p1, gp.a2, gp.p2);
+      }
+    }
+
+    buildGrass();
+
+    // 在草地内取一个点：极坐标均匀采样，再按谐波半径筛一遍，保证落在形状里
+    function pickRestPoint(gp) {
+      for (let t = 0; t < 14; t++) {
+        const th = Math.random() * Math.PI * 2;
+        const rr = gp.R * Math.sqrt(Math.random()) * 0.92;
+        const lim = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2)) * 0.9;
+        if (rr <= lim) return [gp.x + Math.cos(th) * rr, gp.y + Math.sin(th) * rr];
+      }
+      return [gp.x, gp.y];
+    }
+    // 让第 i 只鸟出发去休息：挑一片没满且最近的草地
+    function startRest(i, time) {
+      const k = i * 3;
+      let best = -1, bestD2 = Infinity;
+      for (let g = 0; g < grass.length; g++) {
+        const gp = grass[g];
+        if (gp.count >= gp.cap) continue;
+        const dx = pos[k] - gp.x, dy = pos[k + 1] - gp.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = g; }
+      }
+      if (best < 0) { restDue[i] = time + 2500; return; }   // 都满了，过会儿再试
+      const gp = grass[best];
+      const [tx, ty] = pickRestPoint(gp);
+      restTgt[i * 2] = tx; restTgt[i * 2 + 1] = ty;
+      resting[i] = 1; restPatch[i] = best; gp.count++;
+      // 停留时间从「飞到」开始算，所以要先估一段路程
+      const travel = Math.hypot(tx - pos[k], ty - pos[k + 1]) / Math.max(4, params.maxSpeed * 0.78);
+      restUntil[i] = time + travel * 1000 + 2800 + Math.random() * 3200;
+      restDue[i] = time + 24000 + Math.random() * 22000;
+    }
+    // 结束休息（起飞或被惊到）
+    // 关掉草地：所有正在休息的立刻起飞（不然它们会定在原地不动）
+    function liftAllResting() {
+      const now = performance.now();
+      for (let i = 0; i < activeCount; i++) if (resting[i]) endRest(i, now, false);
+    }
+    function syncGrassVisibility() {
+      for (const m of grassMeshes) m.visible = params.grassOn && grass.length > 0 && m.material.uniforms.uR.value > 0;
+      for (let g = 0; g < grassMeshes.length; g++) grassMeshes[g].visible = params.grassOn && !!grass[g];
+    }
+    function endRest(i, time, scared) {
+      resting[i] = 0;
+      const g = restPatch[i];
+      if (g >= 0 && grass[g]) grass[g].count--;
+      restPatch[i] = -1;
+      restDue[i] = time + (scared ? 4000 : 22000) + Math.random() * 18000;
+    }
 
     // ---------------------------------------------------------------- GPU 箭头
     // 一个 quad 实例一个箭头；朝向由顶点着色器在视图空间按速度方向旋转，
@@ -1854,6 +2122,12 @@
       '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
     fAdv.close();
 
+    const fGrass = gui.addFolder('草地');
+    bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
+      '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 1/9）。每只鸟每隔二三十秒会挑一片最近、还没满的草地降落，停 3~6 秒再起飞；附近有捕食者会立刻惊飞。关掉后草地隐藏，正在休息的鸟会马上起飞。',
+      (v) => { syncGrassVisibility(); if (!v) liftAllResting(); });
+    fGrass.open();
+
     const fSound = gui.addFolder('声音');
     bindNum(fSound, 'musicLevel', 0, 1.5, 0.05, '音乐音量',
       '音乐音量｜背景四层音景的总音量。嫌低频嗡嗡就往下调，0 完全关掉音乐（提示音仍保留）。',
@@ -1876,6 +2150,8 @@
       arrowMat.uniforms.uMaxSpeed.value = params.maxSpeed;
       predMat.uniforms.uMaxSpeed.value = params.predSpeed;
       // 音量也回到默认：音乐电平 + 音效总线
+      syncGrassVisibility();
+      liftAllResting();
       music.setLevel(params.musicLevel);
       if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel, audio.ctx.currentTime, 0.08);
       for (const [, ctrl] of guiCtrls) ctrl.updateDisplay();
@@ -1928,7 +2204,9 @@
 
       grid.clear();
       for (let i = 0; i < n; i++) {
-        if (caught[i]) continue;   // 等待重生的个体不参与邻域
+        // 等待重生的个体、以及在草地上休息的个体都不参与邻域：
+        // 休息的鸟速度接近 0，留着会把飞行中的队伍往草地上拽。
+        if (caught[i] || resting[i]) continue;
         const k = i * 3;
         const key = keyOf(Math.floor(pos[k] / cell), Math.floor(pos[k + 1] / cell), 0);
         let bucket = grid.get(key);
@@ -2115,6 +2393,39 @@
         const k = i * 3;
         const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
         let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
+
+        // 在草地上休息：不跑三条规则，只是朝落点漂过去、站稳、偶尔挪一下。
+        // 附近有捕食者立刻起飞，到点也会自己走——所以草地是「歇脚点」而不是避难所。
+        if (resting[i]) {
+          const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
+          const ddx = tx - px, ddy = ty - py;
+          const dd = Math.hypot(ddx, ddy);
+          let rfx = 0, rfy = 0;
+          if (dd > 0.7) {
+            rfx = ddx / dd * 9; rfy = ddy / dd * 9;          // 慢慢走过去
+          } else {
+            rfx = (Math.random() - 0.5) * 2.6; rfy = (Math.random() - 0.5) * 2.6;   // 站定时轻微挪动
+          }
+          acc[k] = rfx; acc[k + 1] = rfy; acc[k + 2] = 0;
+          fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
+          fleeing[i] = 0; neighbors[i] = 0;
+          let scared = false;
+          const safe2 = fleeR * 1.5 * (fleeR * 1.5);
+          for (let p = 0; p < P; p++) {
+            const q = p * 3;
+            const ex = px - predPos[q], ey = py - predPos[q + 1];
+            if (ex * ex + ey * ey < safe2) { scared = true; break; }
+          }
+          if (scared || time >= restUntil[i] || !params.grassOn) {
+            endRest(i, time, scared);
+            // 起飞：给一个朝场内偏中心的速度，别贴着草地边缘继续打转
+            const ang = Math.atan2(py - groupY, px - groupX) + (Math.random() - 0.5) * 1.2;
+            const vs = paceSpeed * (0.8 + Math.random() * 0.3);
+            vel[k] = Math.cos(ang) * vs; vel[k + 1] = Math.sin(ang) * vs; vel[k + 2] = 0;
+          }
+          continue;
+        }
+
         // 安全时按群体节奏控速；受惊时恢复满速；爆发时直接用爆发速度作为
         // 转向目标速度——否则「追赶」只会把速度上限抬高，方向却仍按巡航速度算，容易冲过头。
         const isDashing = time < sprintUntil[i];
@@ -2315,6 +2626,19 @@
         const wanderMag = WANDER_BASE * wAmp[i] / (1 + count * 0.06);
         fx += Math.cos(wAng[i]) * wanderMag;
         fy += Math.sin(wAng[i]) * wanderMag;
+        // 到点了：附近没有捕食者，就去最近的草地歇一会儿。
+        // 注意不能用 fleeing[i] 判断「有没有危险」——信息级联会把整个群体都
+        // 标记成 fleeing（实测 1000 只里 997 只），那样谁也别想落地。
+        if (params.grassOn && !resting[i] && time >= restDue[i] && time >= sprintUntil[i]) {
+          let safe2 = fleeR * 2.2 * (fleeR * 2.2), ok = true;
+          for (let p = 0; p < P; p++) {
+            const q = p * 3;
+            const ex = px - predPos[q], ey = py - predPos[q + 1];
+            if (ex * ex + ey * ey < safe2) { ok = false; break; }
+          }
+          if (ok) startRest(i, time); else restDue[i] = time + 1500;
+        }
+
         acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = 0;
       }
       if (aliveN > 0) { groupX = cx / aliveN; groupY = cy / aliveN; groupZ = 0; }
@@ -2323,6 +2647,17 @@
       for (let i = 0; i < n; i++) {
         if (caught[i]) continue;
         const k = i * 3;
+        if (resting[i]) {
+          // 停在草地上：强阻尼把速度收到 0 附近（不适用最低速度与边界反弹）
+          const damp = Math.exp(-dt / 0.4);
+          const rvx = (vel[k] + acc[k] * dt) * damp;
+          const rvy = (vel[k + 1] + acc[k + 1] * dt) * damp;
+          vel[k] = rvx; vel[k + 1] = rvy; vel[k + 2] = 0;
+          pos[k] += rvx * dt; pos[k + 1] += rvy * dt;
+          const rsp = Math.hypot(rvx, rvy);
+          speedSum += rsp; keSum += 0.5 * rsp * rsp;
+          continue;
+        }
         let vx = vel[k] + acc[k] * dt;
         let vy = vel[k + 1] + acc[k + 1] * dt;
         let sp = Math.hypot(vx, vy);
@@ -2408,6 +2743,7 @@
             stamina[i] = 0; sprintUntil[i] = 0;
             // 被吃掉 → 拖尾立即消失。否则「死亡点 → 1 秒后的重生点」之间会留一条长线。
             trailAmt[i] = 0;
+            if (resting[i]) endRest(i, time, true);   // 从草地上摘掉，别一直占着容量
             break;
           }
         }
@@ -2423,9 +2759,10 @@
       }
       if (P > 0) prevFlee.set(fleeDir);   // 信息级联使用上一帧逃逸方向
 
-      let spread = 0;
+      let spread = 0, restN = 0;
       for (let i = 0; i < n; i++) {
         if (caught[i]) continue;
+        if (resting[i]) restN++;
         const k = i * 3;
         // 参考点必须是用质心（cx 此时还是坐标总和，需要除以 aliveN），
         // 之前直接用总和对减，算出来的半径大了一个数量级，相干度永远是 0。
@@ -2434,6 +2771,7 @@
       }
 
       // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
+      restingCount = restN;
       avgNeighbors = sumNeighbors / aliveN;
       const neighborDensity = Math.min(1, avgNeighbors / 45);
       // 群体半径（RMS）：用于相干度与音乐驱动的聚集度。
@@ -2504,6 +2842,11 @@
           size *= 1 + (1 - fade) * (0.28 + 0.12 * pulse);
         } else {
           col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
+        }
+        // 停在草地上时把渲染速度固定成一个私人朝向：否则速度归零后
+        // atan(0,0)=0，整片鸟会齐刷刷指向右边，看着很假。
+        if (resting[i]) {
+          rVel[k] = Math.cos(wAng[i]); rVel[k + 1] = Math.sin(wAng[i]); rVel[k + 2] = 0;
         }
         // 爆发中：不换成另一种颜色（原来抹成黄色，和冷色调的群体完全打架），
         // 而是在自身色相上「烧」向粉白——色相推到紫红端、亮度抬高、边缘更亮，
@@ -2581,28 +2924,32 @@
       // 这样它只在扑击起步、急转、从巡游切回追击这几下「闪现」，平时是干净的。
       if (params.predatorOn) {
         for (let p = 0; p < activeP && tc < MAX_TRAILS; p++) {
+          // 加速度是尖峰式的（扑击起步只有两三帧），所以这里用「快起慢落」包络：
+          // 冲上去 30ms 就到，落下来要 0.4s——一次冲刺能留下约半秒可见的尾巴，
+          // 否则尾迹还没亮就灭了，看起来就像没生效。
           const target = Math.min(1, predAccel[p] / PRED_TRAIL_REF);
-          predTrailP[p] += (target - predTrailP[p]) * (1 - Math.exp(-dt / 0.10));
+          const kEnv = target > predTrailP[p] ? (1 - Math.exp(-dt / 0.03)) : (1 - Math.exp(-dt / 0.40));
+          predTrailP[p] += (target - predTrailP[p]) * kEnv;
           const power = predTrailP[p];
-          const on = power > 0.2;    // 约等于加速度 > 11：匀速直线与普通转向都不出拖尾
-          const want = on ? Math.min(1, (power - 0.2) / 0.55) : 0;
+          const on = power > 0.18;   // 约等于加速度 > 8：匀速直线与普通续航转向不出拖尾
+          const want = on ? Math.min(1, (power - 0.18) / 0.5) : 0;
           const wasOff = predTrailAmt[p] < 0.02;   // 上一帧还没拖尾 → 本次从身体重新拉起
-          predTrailAmt[p] += (want - predTrailAmt[p]) * (1 - Math.exp(-dt / 0.12));
+          predTrailAmt[p] += (want - predTrailAmt[p]) * (1 - Math.exp(-dt / (want > predTrailAmt[p] ? 0.05 : 0.30)));
           if (predTrailAmt[p] <= 0.02) { predTrailAmt[p] = 0; continue; }
           const hx2 = predPos[p * 3], hy2 = predPos[p * 3 + 1];
           if (wasOff) {   // 尾巴贴住身体，否则会用上一次拖尾的旧尾巴点，瞬间拉出一条长线
             predTrailTail[p * 2] = hx2; predTrailTail[p * 2 + 1] = hy2;
           }
           // 尾巴的长度也随加速度变化：加速越猛，跟随时间常数越大 → 尾巴越长
-          const tk = 1 - Math.exp(-dt / (0.02 + 0.15 * power));
+          const tk = 1 - Math.exp(-dt / (0.02 + 0.22 * power));
           predTrailTail[p * 2] += (hx2 - predTrailTail[p * 2]) * tk;
           predTrailTail[p * 2 + 1] += (hy2 - predTrailTail[p * 2 + 1]) * tk;
           const o = tc * 3;
           trHead[o] = hx2; trHead[o + 1] = hy2; trHead[o + 2] = 0;
           trTail[o] = predTrailTail[p * 2]; trTail[o + 1] = predTrailTail[p * 2 + 1]; trTail[o + 2] = 0;
           trCol[o] = tmpTrailPred.r; trCol[o + 1] = tmpTrailPred.g; trCol[o + 2] = tmpTrailPred.b;
-          trWid[tc] = predLeg() * 0.55;
-          trAlp[tc] = predTrailAmt[p] * 0.85;
+          trWid[tc] = predLeg() * 0.5;
+          trAlp[tc] = predTrailAmt[p] * 0.9;
           tc++;
         }
       }
@@ -2701,6 +3048,7 @@
         let recovering = 0;
         for (let i = 0; i < activeCount; i++) if (stamina[i] < 1) recovering++;
         document.getElementById('hSprint').textContent = sprintingCount + ' / ' + recovering;
+        document.getElementById('hRest').textContent = restingCount;
         document.getElementById('hFps').textContent = Math.round(fps) + ' FPS';
         const fxOn = audio.enabled && !audio.muted;
         document.getElementById('hMusicBar').style.width =
@@ -2715,6 +3063,11 @@
       updateOrthoFrustum();
       updateRectFrame();
       renderer.setSize(innerWidth, innerHeight);
+      bgMat.uniforms.uHalf.value.set(innerWidth, innerHeight);
+      // 场地宽度随屏幕比例变化：草地若被挤到场地外，就重新长一次
+      const bd = bounds2D();
+      const out = grass.some((g) => Math.abs(g.x) + g.R * 1.2 > bd.hx || Math.abs(g.y) + g.R * 1.2 > bd.hy);
+      if (out) { liftAllResting(); buildGrass(); }
     });
 
     updateRectFrame();
@@ -2782,6 +3135,16 @@
       get sprintCount() { return sprintCount; },
       get sprintingCount() { return sprintingCount; },
       get trailCount() { return trailGeo.instanceCount; },
+      get restingCount() { return restingCount; },
+      get grassInfo() {
+        return grass.map((g) => ({ x: +g.x.toFixed(1), y: +g.y.toFixed(1), R: +g.R.toFixed(1), area: Math.round(g.area), cap: g.cap, count: g.count }));
+      },
+      // 草地总面积占屏幕的比例（应为 0.111 ≈ 1/9）
+      get grassRatio() {
+        if (!grass.length) return 0;
+        const bd = bounds2D();
+        return +(grass.reduce((a, g) => a + g.area, 0) / (2 * bd.hx * 2 * bd.hy)).toFixed(3);
+      },
       get maxTrailSpan() {
         let m = 0;
         for (let i = 0; i < trailGeo.instanceCount; i++) {
