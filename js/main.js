@@ -50,7 +50,7 @@ for (const head of document.querySelectorAll('.card > .card-head')) {
 // ---------------------------------------------------------------- 参数
 // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
 const BOUND = 40;
-const MAX_N = 50000;
+const MAX_N = 10000;
 const MAX_P = 10;              // AI 捕食者上限（GUI 可调范围）
 // 鼠标捕食者单独占一个数组槽位（索引 = 当前 AI 捕食者数量），所以要多留一格。
 // GUI 的「捕食者数量」仍以 MAX_P 为上限，两者互不挤占。
@@ -259,9 +259,8 @@ const REST_NUDGE_MIN = 0.45, REST_NUDGE_MAX = 1.25;
 const REST_START_SOFT_CAP = 2, REST_SETTLE_SOFT_CAP = 1;
 // 边界通行判定：靠近墙时先掷一次骰子决定「这次当墙不存在」还是「贴边掉头」。
 // 只有掷中的人才真的会穿出去，其余会一直飞到边界旁再拐弯，不提前造软边界。
-const wallPass = new Uint8Array(MAX_N);             // 1 = 这次撞墙当作没有墙（会穿出去）
-const wallNear = new Uint8Array(MAX_N);             // 是否已进入「靠近墙」的判定区
-const wallTurn = new Float32Array(MAX_N);           // 本次贴边往哪一侧沿墙拐（±1，进判定带时抽）
+// 墙视为不存在：越界一律「穿墙」（见下方 wrapThroughWall），不再有贴边判定带、
+// 不再有反射/随机散射、也不再按概率触发传送门。
 // ---------------------------------------------------------------- 个体差异
 // 每只鸟带一点固定的「脾气」：速度系数不同、方向有自己的缓慢随机游走。
 // 这是为了破除「整群像弹珠一样整齐移动」的机械感——但都仍是局部量，
@@ -318,7 +317,6 @@ let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即�
 // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
 const predSpdJit = new Float32Array(MAX_SLOT);
 const predWobble = new Float32Array(MAX_SLOT);
-const predWallTurn = new Float32Array(MAX_SLOT);  // 贴边掉头时往哪一侧沿墙拐（±1）
 const predPrev = new Float32Array(MAX_SLOT * 3);  // 上一帧位置，用于「扫掠」碰撞检测
 
 // ---------------------------------------------------------------- 鼠标捕食者
@@ -356,10 +354,25 @@ function segDist2(px, py, ax, ay, bx, by) {
   const qx = ax + dx * t - px, qy = ay + dy * t - py;
   return qx * qx + qy * qy;
 }
-// 传送门：靠近墙时先按 10% 判定该个体本次是否可穿墙；可穿者当墙不存在，
-// 越界后按中心对称从对侧穿出；不可穿者一路飞到墙边再急转掉头，不在内侧另造软边界。
-const PORTAL_P = 0.10;
-let teleportCount = 0;
+// ---- 穿墙：墙视为不存在 ----
+// 越界后统一从「关于场地中心对称」的位置继续出现：右边飞出 → 从左边界进、
+// y 同时翻转（左边偏下飞出 → 右边偏上飞进）。速度方向保持不变，所以刚进场的
+// 个体一定是朝场内飞的。鸟、AI 捕食者、鼠标捕食者都走这一套——无概率、
+// 无弹性反射、无随机散射、也不再有贴边急转（那等于把墙挪进场内）。
+// 斜角同时越界时两次镜像都会做，最后夹回场内防止退化成死循环。
+let wrapX = 0, wrapY = 0;
+function wrapThroughWall(x, y, hx, hy) {
+  const outX = x > hx ? 1 : (x < -hx ? -1 : 0);
+  const outY = y > hy ? 1 : (y < -hy ? -1 : 0);
+  if (!outX && !outY) return false;
+  if (outX) { x = -outX * hx; y = -y; }
+  if (outY) { y = -outY * hy; x = -x; }
+  if (x > hx) x = hx; else if (x < -hx) x = -hx;
+  if (y > hy) y = hy; else if (y < -hy) y = -hy;
+  wrapX = x; wrapY = y;
+  return true;
+}
+let teleportCount = 0;   // 累计穿墙次数（状态卡「穿越」计数）
 const PRED_FORCE = 24;
 const PRED_SEP_RANGE2 = 6 * 6;
 const PRED_SEP_FORCE = 34;
@@ -473,7 +486,6 @@ function initPredators(from, to) {
     predTrailAmt[p] = 0; predTrailP[p] = 0; predHeat[p] = 1;
     predSpdJit[p] = 0.9 + Math.random() * 0.2;
     predWobble[p] = Math.random() * Math.PI * 2;
-    predWallTurn[p] = Math.random() < 0.5 ? -1 : 1;
   }
 }
 initPredators(0, activeP);
@@ -633,26 +645,12 @@ cv.addEventListener('wheel', (e) => {
   view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * Math.exp(-e.deltaY * 0.0012)));
 }, { passive: false });
 
-// 安全边界矩形（贴合屏幕宽高比）
-const rectFrameGeo = new THREE.BufferGeometry();
-rectFrameGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(4 * 3), 3));
-const rectFrame = new THREE.LineLoop(rectFrameGeo, new THREE.LineBasicMaterial({
-  color: 0x3b7fb4, transparent: true, opacity: 0.22, depthWrite: false
-}));
-rectFrame.frustumCulled = false;
-scene.add(rectFrame);
+// 视野边界（贴合屏幕宽高比）：只作为「显示范围 / 穿墙的对称轴」存在。
+// 不再画矩形边框——墙在视觉上不存在，个体越界就从关于中心对称的位置继续出现。
 function bounds2D() {
   // 高度固定为 BOUND，宽度按显示器比例展开 → 场地铺满全屏
   return { hx: BOUND * (innerWidth / innerHeight), hy: BOUND };
 }
-function updateRectFrame() {
-  const { hx, hy } = bounds2D();
-  const arr = rectFrameGeo.attributes.position.array;
-  const pts = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]];
-  for (let i = 0; i < 4; i++) { arr[i * 3] = pts[i][0]; arr[i * 3 + 1] = pts[i][1]; arr[i * 3 + 2] = 0; }
-  rectFrameGeo.attributes.position.needsUpdate = true;
-}
-updateRectFrame();
 
 // ---------------------------------------------------------------- 背景点缀
 // 纯粹是氛围：一层挂在相机上的极淡径向渐变 + 会缓慢漂移的尘埃点。
@@ -1675,7 +1673,7 @@ fRules.open();
 
 const fMotion = gui.addFolder('飞行与视野');
 bindNum(fMotion, 'count', 10, MAX_N, 10, '元素数量',
-  '元素总数（默认 800，范围 10~50000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要算物理、每帧上传实例数据，主线程最吃紧）。每只鸟只注意最近的 7 个同伴，所以配对量是固定的 7×数量，不会因为密度翻倍而爆炸；5 万只时单帧仿真约 20~30ms，绘制仍不到 1ms。调少：更容易看清单只的行为。',
+  '元素总数（默认 800，范围 10~10000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要算物理、每帧上传实例数据，主线程最吃紧）。每只鸟只注意最近的 7 个同伴，所以配对量是固定的 7×数量，不会因为密度翻倍而爆炸；1 万只时单帧仿真约 6~10ms，绘制仍不到 1ms。调少：更容易看清单只的行为。',
   (v) => setCount(v));
 bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
   '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
@@ -2047,33 +2045,8 @@ function step(dt, time) {
       ax += (-pvy / vlen) * weave;
       ay += (pvx / vlen) * weave;
 
-      // 贴边掉头：和鸟群一致，只在最后 3.2 个单位介入，不再提前 9 个单位往回压
-      // （那样等于在真边界内侧又造了一条软边界）。捕食者默认 25 的速度很快，
-      // 所以法向修正更强，保证 5~6 帧内把朝外分量折回来并转成沿墙切向。
-      const wm = 3.2;
-      const pspeed = vlen;
-      const psgn = predWallTurn[p] || 1;
-      const pband = (d) => Math.min(1, Math.max(0, d) / wm);
-      if (ppx > hx - wm && pvx > 0) {
-        const s = pband(ppx - (hx - wm));
-        ax -= pvx * (4 + 9 * s) * s + 8 * s;
-        ay += psgn * pspeed * (2 + 5 * s) * s;
-      }
-      if (ppx < -hx + wm && pvx < 0) {
-        const s = pband(-hx + wm - ppx);
-        ax += (-pvx) * (4 + 9 * s) * s + 8 * s;
-        ay += psgn * pspeed * (2 + 5 * s) * s;
-      }
-      if (ppy > hy - wm && pvy > 0) {
-        const s = pband(ppy - (hy - wm));
-        ay -= pvy * (4 + 9 * s) * s + 8 * s;
-        ax += psgn * pspeed * (2 + 5 * s) * s;
-      }
-      if (ppy < -hy + wm && pvy < 0) {
-        const s = pband(-hy + wm - ppy);
-        ay += (-pvy) * (4 + 9 * s) * s + 8 * s;
-        ax += psgn * pspeed * (2 + 5 * s) * s;
-      }
+      // 墙不存在：不再有贴边掉头（那等于把墙挪到场内侧）。捕食者与鸟走同一套
+      // 穿墙规则——越界后从关于中心对称的位置继续出现，见下面的 wrapThroughWall。
       // 饱食（进食冷却中）的捕食者会刻意避让草地：还没碰到草地边缘时就沿
       // 「离开草地」方向施加一个渐强的推力——不是硬性禁止穿行（真撞上也允许
       // 过去），而是像有意识地绕开正在休息的鸟群。追逐时（不 cooling）不避让，
@@ -2111,22 +2084,14 @@ function step(dt, time) {
       predPos[q] = ppx + nvx * dt;
       predPos[q + 1] = ppy + nvy * dt;
       predPos[q + 2] = 0;
-      // 矩形硬边界：逐轴夹紧后弹性反射，再叠加一个随机偏转角——
-      // 真实撞击不是镜面反射，同一条路线上不会来回弹成弹珠。
-      let bounced = false;
-      if (predPos[q] > hx) { predPos[q] = hx; nvx = -Math.abs(nvx) * 0.9; bounced = true; }
-      else if (predPos[q] < -hx) { predPos[q] = -hx; nvx = Math.abs(nvx) * 0.9; bounced = true; }
-      if (predPos[q + 1] > hy) { predPos[q + 1] = hy; nvy = -Math.abs(nvy) * 0.9; bounced = true; }
-      else if (predPos[q + 1] < -hy) { predPos[q + 1] = -hy; nvy = Math.abs(nvy) * 0.9; bounced = true; }
-      if (bounced) {
-        const sc = (Math.random() - 0.5) * 0.7;          // ±20°
-        const cs = Math.cos(sc), sn = Math.sin(sc);
-        const bx = nvx * cs - nvy * sn;
-        const by = nvx * sn + nvy * cs;
-        nvx = bx; nvy = by;
+      // 穿墙：与鸟完全相同的规则——越界后从关于中心对称的位置继续出现，
+      // 速度方向不变（所以进场时一定朝场内），不反射、不散射、不夹紧。
+      if (wrapThroughWall(predPos[q], predPos[q + 1], hx, hy)) {
+        predPos[q] = wrapX; predPos[q + 1] = wrapY;
         predVel[q] = nvx; predVel[q + 1] = nvy;
-        // 万一还是撞到墙：冷却期直接换一个场内巡逻点，别沿着墙根来回蹭
-        if (cooling) { predWpUntil[p] = 0; }
+        teleportCount++;
+        // 尾迹粒子留在旧位置（历史航迹），但发射包络要清零，免得落点凭空接一段
+        predTrailP[p] = 0; predTrailNextAt[p] = 0;
       }
     }
   }
@@ -2141,11 +2106,18 @@ function step(dt, time) {
     const px = predPos[q], py = predPos[q + 1];
     predPrev[q] = px; predPrev[q + 1] = py; predPrev[q + 2] = 0;
     const follow = 1 - Math.exp(-dt / 0.045);
-    let nx = px + (mouseTgt.x - px) * follow;
-    let ny = py + (mouseTgt.y - py) * follow;
-    // 夹在场地内：光标跑到窗口边缘外时，捕食者贴着边界走，不会飞出画面。
-    if (nx > hx) nx = hx; else if (nx < -hx) nx = -hx;
-    if (ny > hy) ny = hy; else if (ny < -hy) ny = -hy;
+    // 光标目标也按穿墙归一化：光标拖到窗口边缘外时，目标落到对侧对应位置，
+    // 捕食者一路飞过去（沿途穿墙），而不是贴着边界来回蹭。
+    let tgx = mouseTgt.x, tgy = mouseTgt.y;
+    if (wrapThroughWall(tgx, tgy, hx, hy)) { tgx = wrapX; tgy = wrapY; }
+    let nx = px + (tgx - px) * follow;
+    let ny = py + (tgy - py) * follow;
+    // 与鸟完全相同的穿墙规则：越界后从关于中心对称的位置继续出现，不夹紧、不反弹
+    if (wrapThroughWall(nx, ny, hx, hy)) {
+      nx = wrapX; ny = wrapY;
+      teleportCount++;
+      predTrailP[slot] = 0; predTrailNextAt[slot] = 0;
+    }
     // 单帧跨得太远（切标签页回来、缩放/平移后光标位置突变）就不做扫掠：
     // 否则判定会用「上一帧 → 这一帧」这条长线，沿途吃掉一整排鸟。
     if ((nx - px) * (nx - px) + (ny - py) * (ny - py) > 36) {
@@ -2560,49 +2532,8 @@ function step(dt, time) {
     if (sprinting) sprintingCount++;
     else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
 
-    // 边界：先判定这次要不要穿墙。
-    //   进入 8 个单位的「判定带」时只掷一次骰子：10% 这次当作没有墙（越界后
-    //   从中心对称点穿出）；离开 10 个单位才重置，避免贴边徘徊时反复掷。
-    const wallM = Math.min(px > 0 ? hx - px : px + hx, py > 0 ? hy - py : py + hy);
-    if (!wallNear[i]) {
-      if (wallM < 8) {
-        wallNear[i] = 1;
-        wallPass[i] = Math.random() < PORTAL_P ? 1 : 0;
-        wallTurn[i] = Math.random() < 0.5 ? -1 : 1;   // 这次贴边往哪一侧拐，避免整群同向
-      }
-    } else if (wallM > 10) {
-      wallNear[i] = 0; wallPass[i] = 0;
-    }
-    if (!wallPass[i]) {
-      // 贴边掉头：只在最后 2.6 个单位介入，鸟可以一路冲到边界旁。
-      // 关键是「转」而不是「刹」——把朝外的速度分量折回来，同时转成沿墙的切向，
-      // 速率交给后面的限速器保持，所以看到的是一次急转弯，而不是离墙一大截就停住。
-      // 旧版提前 9 个单位用二次曲线猛推，等于在真边界内侧又造了一条软边界。
-      const m = 2.6;
-      const turn = Math.max(4, Math.sqrt((vx) * (vx) + (vy) * (vy)));   // 用速率做转向幅度，转向过程中不衰减
-      const sgn = wallTurn[i] || 1;
-      const band = (d) => Math.min(1, Math.max(0, d) / m);
-      if (px > hx - m && vx > 0) {
-        const s = band(px - (hx - m));
-        fx -= vx * (3 + 7 * s) * s + (2 + 6 * s) * s;   // 折回法向 + 一点持续内向推力
-        fy += sgn * turn * (3 + 6 * s) * s;              // 转成沿墙切向
-      }
-      if (px < -hx + m && vx < 0) {
-        const s = band((-hx + m) - px);
-        fx += (-vx) * (3 + 7 * s) * s + (2 + 6 * s) * s;
-        fy += sgn * turn * (3 + 6 * s) * s;
-      }
-      if (py > hy - m && vy > 0) {
-        const s = band(py - (hy - m));
-        fy -= vy * (3 + 7 * s) * s + (2 + 6 * s) * s;
-        fx += sgn * turn * (3 + 6 * s) * s;
-      }
-      if (py < -hy + m && vy < 0) {
-        const s = band((-hy + m) - py);
-        fy += (-vy) * (3 + 7 * s) * s + (2 + 6 * s) * s;
-        fx += sgn * turn * (3 + 6 * s) * s;
-      }
-    }
+    // 墙不存在：不再有贴边判定带 / 掷骰子 / 急转掉头（那些都等于把墙挪进场内）。
+    // 越界时统一穿墙，见积分之后的 wrapThroughWall。
     // 绕开草地：不休息的鸟会主动沿着草地边缘滑过去，而不是直接从草地上方穿过去。
     // 做法是「法向推开 + 沿当前运动方向的切向」——只推法向的话看起来像撞到墙弹开。
     let insideG = -1;   // 当前正压在哪片草地上（-1 = 不在任何草地上）
@@ -2743,48 +2674,16 @@ function step(dt, time) {
       pos[k] += nx * step; pos[k + 1] += ny * step;
     }
 
-    // 边界兜底：上面贴边转向没拉住的少数个体才走这里，弹性反射 + 随机散射；
-    // 进入判定带时掷中的 10% 则变成「传送门」——
-    // 从对侧穿出，且出入点关于场地中心对称（左边偏下飞出 → 右边偏上飞进）。
-    // 速度方向保持不变，所以刚进场的个体一定是朝场内飞的。
-    const outX = pos[k] > hx ? 1 : (pos[k] < -hx ? -1 : 0);
-    const outY = pos[k + 1] > hy ? 1 : (pos[k + 1] < -hy ? -1 : 0);
-    if (outX || outY) {
-      if (wallPass[i]) {
-        if (outX) { pos[k] = -outX * hx; pos[k + 1] = -pos[k + 1]; }
-        if (outY) { pos[k + 1] = -outY * hy; pos[k] = -pos[k]; }
-        // 斜角同时越界时镜像后可能仍在外侧，夹回场内
-        if (pos[k] > hx) pos[k] = hx; else if (pos[k] < -hx) pos[k] = -hx;
-        if (pos[k + 1] > hy) pos[k + 1] = hy; else if (pos[k + 1] < -hy) pos[k + 1] = -hy;
-        teleportCount++;
-        wallPass[i] = 0; wallNear[i] = 0;
-        // 传送是瞬移：粒子本身留在旧位置是对的（历史航迹），但发射包络要清零，
-        // 免得落点接着撒出一段凭空出现的尾迹。
-        trailNextAt[i] = 0; birdTrailP[i] = 0;
-      } else {
-        if (outX) {
-          pos[k] = outX * hx;
-          vx = -outX * Math.abs(vx) * 0.92;
-          boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vx), 1.2));
-        }
-        if (outY) {
-          pos[k + 1] = outY * hy;
-          vy = -outY * Math.abs(vy) * 0.92;
-          boundaryImpact = Math.max(boundaryImpact, Math.pow(2 * Math.abs(vy), 1.2));
-        }
-        // 反弹再加随机散射：偏转 ±23°、速度乘 0.82~1.08。
-        // 这样撞墙既不会沿原路精确返回，整群也不会排着队同步弹开。
-        const scat = (Math.random() - 0.5) * 0.8;
-        const cs = Math.cos(scat), sn = Math.sin(scat);
-        const bx = vx * cs - vy * sn;
-        const by = vx * sn + vy * cs;
-        const sb = 0.82 + Math.random() * 0.26;
-        vx = bx * sb; vy = by * sb;
-        // 散射后若仍在往墙外飞，把法向分量纠正回场内
-        if (outX && vx * outX > 0) vx = -vx;
-        if (outY && vy * outY > 0) vy = -vy;
-        vel[k] = vx; vel[k + 1] = vy;
-      }
+    // ---- 穿墙：墙视为不存在 ----
+    // 越界后统一从「关于场地中心对称」的位置继续出现（左边偏下飞出 → 右边偏上
+    // 飞进），速度方向保持不变，所以刚进场的个体一定是朝场内飞的。
+    // 不再有弹性反射、随机散射，也不再按概率触发——所有个体规则一致。
+    if (wrapThroughWall(pos[k], pos[k + 1], hx, hy)) {
+      pos[k] = wrapX; pos[k + 1] = wrapY;
+      teleportCount++;
+      // 穿墙是瞬移：尾迹粒子留在旧位置是对的（历史航迹），但发射包络要清零，
+      // 免得落点接着撒出一段凭空出现的尾迹。
+      trailNextAt[i] = 0; birdTrailP[i] = 0;
     }
     pos[k + 2] = 0; vel[k + 2] = 0;
 
@@ -3301,7 +3200,6 @@ function render(now) {
 
 addEventListener('resize', () => {
   updateOrthoFrustum();
-  updateRectFrame();
   renderer.setSize(innerWidth, innerHeight);
   bgMat.uniforms.uHalf.value.set(innerWidth, innerHeight);
   // 场地宽度随屏幕比例变化：草地若被挤到场地外，就重新长一次
@@ -3310,7 +3208,6 @@ addEventListener('resize', () => {
   if (out) { liftAllResting(); buildGrass(); }
 });
 
-updateRectFrame();
 // 存档恢复后同步 HUD 上的初始数量
 document.getElementById('hCount').textContent = activeCount;
 document.getElementById('hPred').textContent = params.predatorOn ? activeP : '0';
@@ -3319,7 +3216,8 @@ requestAnimationFrame(render);
 window.FlockLab = {
   params, defaults: DEFAULTS, resetBoids, resetAll: applyDefaults, setCount, setPredCount, spawnBurst,
   saveParams,
-  get portalChance() { return PORTAL_P; },
+  // 穿墙概率恒为 1：墙不存在，越界一律从关于中心对称的位置出现（v38 起无概率、无反射）
+  get portalChance() { return 1; },
   get teleports() { return teleportCount; },
   get predShape() {
     return { leg: +predLeg().toFixed(3), base: +predBase().toFixed(3), birdExtent: +birdExtent().toFixed(3), scale: PRED_SCALE };
@@ -3351,8 +3249,8 @@ window.FlockLab = {
   },
   get view() { return { x: view2D.x, y: view2D.y, zoom: view2D.zoom }; },
   get displayRect() {
-    const a = rectFrameGeo.attributes.position.array;
-    return { hx: +a[3].toFixed(2), hy: +a[7].toFixed(2) };
+    const { hx, hy } = bounds2D();
+    return { hx: +hx.toFixed(2), hy: +hy.toFixed(2) };
   },
   get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
   get count() { return activeCount; },
