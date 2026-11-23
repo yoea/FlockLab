@@ -50,8 +50,14 @@ for (const head of document.querySelectorAll('.card > .card-head')) {
 // ---------------------------------------------------------------- 参数
 // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
 const BOUND = 40;
-const MAX_N = 10000;
+const MAX_N = 50000;
 const MAX_P = 10;
+// 每只鸟只跟「最近的 7 只」打交道（拓扑式邻域，Ballerini 2008 测椋鸟约 7 只）：
+// 不是看见多少算多少，而是按距离由近到远取满 7 个就停。这既符合真实鸟群的注意分配，
+// 也让单帧配对量恒定在 7n（5 万只 = 35 万对），不再随密度平方级上升。
+const NEIGHBOR_CAP = 7;
+// 分段耗时探针（FlockLab.perf 可读）：定位「哪一段吃掉了这一帧」比猜有用。
+const perfParts = { grid: 0, loop: 0, stats: 0, color: 0 };
 
 // 出厂默认值：只有点击「重新初始化」才会回到这里。
 const DEFAULTS = {
@@ -1184,9 +1190,33 @@ function clearBursts() {
   }
 }
 
-const tmpColor = new THREE.Color();
 const tmpBirth = new THREE.Color(0x7dff9a);
-const tmpSprint = new THREE.Color(0xff9ad4);   // 爆发：在自身色相上烧向粉白（每帧按个体重算）
+
+// 颜色查表：邻域饱和度 32 级 × 速度 16 级。原来每只鸟都调一次 THREE.Color.setHSL
+// （内部要做 HSL→RGB 换算），5 万只时单这一趟就要 8ms；预先把 512 种组合算好，
+// 运行时只剩两次整数索引 + 三次数组读。
+const PAL_Q = 32, PAL_S = 16;
+const palFly = new Float32Array(PAL_Q * PAL_S * 3);
+const palRest = new Float32Array(PAL_Q * 3);
+const sprintPal = new Float32Array(PAL_S * 3);   // 爆发色：亮度随包络变化的 16 档洋红
+{
+  const c = new THREE.Color();
+  for (let q = 0; q < PAL_Q; q++) {
+    const local = q / (PAL_Q - 1);
+    c.setHSL(0.36 + local * 0.04, 0.52, 0.46);
+    palRest[q * 3] = c.r; palRest[q * 3 + 1] = c.g; palRest[q * 3 + 2] = c.b;
+    for (let s = 0; s < PAL_S; s++) {
+      c.setHSL(0.52 + local * 0.40, 0.95, 0.46 + (s / (PAL_S - 1)) * 0.22);
+      const o = (q * PAL_S + s) * 3;
+      palFly[o] = c.r; palFly[o + 1] = c.g; palFly[o + 2] = c.b;
+    }
+  }
+  // 爆发色与邻域无关（只跟起爆包络走），单独建一张 16 档表
+  for (let s2 = 0; s2 < PAL_S; s2++) {
+    c.setHSL(0.918, 0.96, 0.45 + 0.07 * (s2 / (PAL_S - 1)));
+    sprintPal[s2 * 3] = c.r; sprintPal[s2 * 3 + 1] = c.g; sprintPal[s2 * 3 + 2] = c.b;
+  }
+}
 const tmpTrail = new THREE.Color(0xff9ad4);    // 拖尾：与爆发同一身份色
 const tmpTrailPred = new THREE.Color(0xff8a4c); // 捕食者拖尾：橙红，和本体一致
 
@@ -1381,7 +1411,7 @@ fRules.open();
 
 const fMotion = gui.addFolder('飞行与视野');
 bindNum(fMotion, 'count', 10, MAX_N, 10, '元素数量',
-  '元素总数（默认 800，范围 10~10000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域并每帧上传实例数据，万只时主线程最吃紧）。调少：更容易看清单只的行为。',
+  '元素总数（默认 800，范围 10~50000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要算物理、每帧上传实例数据，主线程最吃紧）。每只鸟只注意最近的 7 个同伴，所以配对量是固定的 7×数量，不会因为密度翻倍而爆炸；5 万只时单帧仿真约 20~30ms，绘制仍不到 1ms。调少：更容易看清单只的行为。',
   (v) => setCount(v));
 bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
   '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
@@ -1475,10 +1505,19 @@ function applyDefaults() {
 }
 
 // ---------------------------------------------------------------- 空间哈希
-const grid = new Map();
-function keyOf(ix, iy, iz) {
-  return ((ix + 512) * 1024 + (iy + 512)) * 1024 + (iz + 512);
-}
+// 二维计数排序网格：每帧重建，但不分配任何对象。
+// 旧版用 Map<字符串键, 数组>，5 万只时每帧要新建上千个桶数组、写 5 万个字符串键，
+// 光是 GC 就能吃掉几毫秒。这里用「计数 → 前缀和 → 回填」三趟纯 TypedArray 操作，
+// 一次分配、长期复用，格子内容连续，邻居扫描的缓存命中率也更好。
+let gridW = 0, gridH = 0, gridX0 = 0, gridY0 = 0;
+let cellStart = new Int32Array(0);
+let cellEnd = new Int32Array(0);
+let cellFill = new Int32Array(0);
+const cellItems = new Int32Array(MAX_N);
+// 邻域扫描顺序：先自己所在格，再上下左右，最后四个斜角。
+// 二维场地里 z 恒为 0，原来 3×3×3=27 次查表有 24 次必然落空；这里只查 9 个格，
+// 且按由近到远，配合「只取最近 7 只」时先拿到的就是近邻。
+const NBR_OFF = [0, 0, 1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 1, -1, -1, 1, -1, -1];
 
 // ---------------------------------------------------------------- 模拟
 function step(dt, time) {
@@ -1499,6 +1538,8 @@ function step(dt, time) {
   const predNorm = Math.pow(predSpeed, 1.2);
   const sprintSpeed = maxSpeed * params.sprintFactor;
   const catchR2 = Math.pow(catchRadius(), 2);
+  // 拓扑式邻域：每只鸟只取最近的 7 只（见 NEIGHBOR_CAP），单帧配对量 = 7n。
+  const neighborCap = NEIGHBOR_CAP;
   // 群体巡航节奏：无威胁时统一收敛到巡航速度的 78%，受惊/爆发才放开到上限。
   const paceSpeed = maxSpeed * 0.78;
   currentPace = paceSpeed;
@@ -1520,17 +1561,50 @@ function step(dt, time) {
     groupAlert = near;          // 状态卡「群体警戒」徽标
   } else { groupWasThreat = false; groupAlert = false; }
 
-  grid.clear();
+  const tGrid0 = performance.now();
+  // ---- 重建网格：计数 → 前缀和 → 回填 ----
+  const gx0 = Math.floor((-bd.hx - 6) / cell);
+  const gy0 = Math.floor((-bd.hy - 6) / cell);
+  const gw = Math.floor((bd.hx + 6) / cell) - gx0 + 1;
+  const gh = Math.floor((bd.hy + 6) / cell) - gy0 + 1;
+  const gcells = gw * gh;
+  if (gw !== gridW || gh !== gridH) {
+    gridW = gw; gridH = gh;
+    cellStart = new Int32Array(gcells);
+    cellEnd = new Int32Array(gcells);
+    cellFill = new Int32Array(gcells);
+  }
+  gridX0 = gx0; gridY0 = gy0;
+  cellStart.fill(0);
   for (let i = 0; i < n; i++) {
     // 等待重生的个体、以及在草地上休息的个体都不参与邻域：
     // 休息的鸟速度接近 0，留着会把飞行中的队伍往草地上拽。
     if (caught[i] || resting[i]) continue;
     const k = i * 3;
-    const key = keyOf(Math.floor(pos[k] / cell), Math.floor(pos[k + 1] / cell), 0);
-    let bucket = grid.get(key);
-    if (!bucket) { bucket = []; grid.set(key, bucket); }
-    bucket.push(i);
+    const gx = Math.floor(pos[k] / cell) - gridX0;
+    const gy = Math.floor(pos[k + 1] / cell) - gridY0;
+    if (gx < 0 || gy < 0 || gx >= gridW || gy >= gridH) continue;
+    cellStart[gy * gridW + gx]++;
   }
+  let accCells = 0;
+  for (let c = 0; c < gcells; c++) {
+    const cnt = cellStart[c];
+    cellEnd[c] = accCells + cnt;
+    cellFill[c] = accCells + cnt;      // 回填指针从后往前推
+    cellStart[c] = accCells;
+    accCells += cnt;
+  }
+  for (let i = 0; i < n; i++) {
+    if (caught[i] || resting[i]) continue;
+    const k = i * 3;
+    const gx = Math.floor(pos[k] / cell) - gridX0;
+    const gy = Math.floor(pos[k + 1] / cell) - gridY0;
+    if (gx < 0 || gy < 0 || gx >= gridW || gy >= gridH) continue;
+    const c = gy * gridW + gx;
+    cellItems[--cellFill[c]] = i;
+  }
+  const tGrid1 = performance.now();
+  perfParts.grid = tGrid1 - tGrid0;
 
   // ---- 捕食者：Reynolds 预测拦截 + 相互分离 + 边界约束 ----
   if (P > 0) {
@@ -1837,39 +1911,39 @@ function step(dt, time) {
     let dxs = 0, dys = 0, dzs = 0;
     let cfx = 0, cfy = 0, cfz = 0, cascadeCount = 0;   // 信息级联：邻居上一帧的逃逸方向
 
-    const ix = Math.floor(px / cell), iy = Math.floor(py / cell), iz = Math.floor(pz / cell);
-    for (let ox = -1; ox <= 1; ox++) {
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let oz = -1; oz <= 1; oz++) {
-          const bucket = grid.get(keyOf(ix + ox, iy + oy, iz + oz));
-          if (!bucket) continue;
-          for (let b = 0; b < bucket.length; b++) {
-            const j = bucket[b];
-            if (j === i || caught[j]) continue;
-            const m = j * 3;
-            const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
-            const d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 > per2 || d2 < 1e-8) continue;
+    const ix = Math.floor(px / cell) - gridX0, iy = Math.floor(py / cell) - gridY0;
+    nbrScan:
+    for (let oi = 0; oi < 18; oi += 2) {
+      const cx = ix + NBR_OFF[oi], cy = iy + NBR_OFF[oi + 1];
+      if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) continue;
+      const c = cy * gridW + cx;
+      const bEnd = cellEnd[c];
+      for (let b = cellStart[c]; b < bEnd; b++) {
+        if (count >= neighborCap) break nbrScan;
+        const j = cellItems[b];
+        if (j === i || caught[j]) continue;
+        const m = j * 3;
+        const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > per2 || d2 < 1e-8) continue;
 
-            count++;
-            sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
-            ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
-            if (P > 0 && params.infoCascade && fleeing[j]) {
-              cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
-              cascadeCount++;
-            }
-            if (d2 < sep2) {
-              const inv = 1 / d2;
-              dxs += dx * inv; dys += dy * inv; dzs += dz * inv;
-            }
-            if (d2 < COLLIDE_DIST2) {
-              const dist = Math.sqrt(d2);
-              const nx = dx / dist, ny = dy / dist, nz = dz / dist;
-              const rvx = vx - vel[m], rvy = vy - vel[m + 1], rvz = vz - vel[m + 2];
-              const closing = -(rvx * nx + rvy * ny + rvz * nz); // 相向接近才计冲量
-              if (closing > 0) impact = Math.max(impact, Math.pow(closing, 1.2));
-            }
-          }
+        count++;
+        sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
+        ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
+        if (P > 0 && params.infoCascade && fleeing[j]) {
+          cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
+          cascadeCount++;
+        }
+        if (d2 < sep2) {
+          const inv = 1 / d2;
+          dxs += dx * inv; dys += dy * inv; dzs += dz * inv;
+        }
+        if (d2 < COLLIDE_DIST2) {
+          const dist = Math.sqrt(d2);
+          const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+          const rvx = vx - vel[m], rvy = vy - vel[m + 1], rvz = vz - vel[m + 2];
+          const closing = -(rvx * nx + rvy * ny + rvz * nz); // 相向接近才计冲量
+          if (closing > 0) impact = Math.max(impact, Math.pow(closing, 1.2));
         }
       }
     }
@@ -2253,6 +2327,8 @@ function step(dt, time) {
     }
   }
 
+  perfParts.loop = performance.now() - tGrid1;
+  const tStats0 = performance.now();
   // 延迟补位：1 秒后在离捕食者最远、离边界有余量的位置出生
   for (let i = 0; i < n; i++) {
     if (caught[i] && time >= respawnAt[i]) {
@@ -2286,7 +2362,9 @@ function step(dt, time) {
   // 宏观量：数密度 ρ、动能温度 T、理想气体气压 P = ρT
   restingCount = restN;
   avgNeighbors = sumNeighbors / aliveN;
-  const neighborDensity = Math.min(1, avgNeighbors / 45);
+  // 固定 7 只拓扑邻居后，「平均邻居数」恒为 ~7，不再能代表密度；
+  // 改用数量密度（开方只是让 800~5 万的跨度在指标上更平滑）。
+  const neighborDensity = Math.min(1, Math.sqrt(n / 20000));
   // 群体半径（RMS）：用于相干度与音乐驱动的聚集度。
   groupRms = Math.max(0.5, Math.sqrt(spread / aliveN));
   // 半径尺度取「整屏对角的一半」左右，让紧团≈1、铺满全屏≈0，指标才有分辨力。
@@ -2300,6 +2378,7 @@ function step(dt, time) {
 
   // 碰撞强度只作为统计保留，不再触发音效。
   collisionImpulse = Math.max(impact, boundaryImpact) / Math.pow(maxSpeed, 1.2);
+  perfParts.stats = performance.now() - tStats0;
 }
 
 // ---------------------------------------------------------------- 渲染
@@ -2402,17 +2481,36 @@ function render(now) {
   camera.lookAt(view2D.x, view2D.y, 0);
 
   // CPU 只写颜色/尺寸；箭头的朝向与形状全部交给 GPU 着色器。
+  const tCol0 = performance.now();
   const n = activeCount;
+  const SMOOTH = 0.18;   // 30 FPS 下时间常数约 0.15s，抖动明显降低且方向仍跟手
+  const arrowBase = params.arrowSize;
+  const invMaxSpeed = 1 / Math.max(0.001, params.maxSpeed);
+  const sprintSpanMs = Math.max(160, params.sprintDuration * 1000);
   for (let i = 0; i < n; i++) {
-    if (caught[i]) { siz[i] = 0; continue; }   // 等待重生的 1 秒完全隐藏
     const k = i * 3;
+    // 渲染朝向的低通滤波顺手在这里做：原来另有一趟 3n 的循环，白跑一遍内存。
+    // 物理仿真仍用原始 vel，行为不变。
+    rVel[k] += (vel[k] - rVel[k]) * SMOOTH;
+    rVel[k + 1] += (vel[k + 1] - rVel[k + 1]) * SMOOTH;
+    if (caught[i]) { siz[i] = 0; continue; }   // 等待重生的 1 秒完全隐藏
+    // 沿用原来的密度刻度：7 只拓扑邻居对应 0.29，整体偏青蓝，
+    // 稀疏到看不见同伴时更蓝，不会因为改了邻域规则就整群烧成洋红。
     const local = Math.min(1, neighbors[i] / 24);
-    const speedRatio = Math.min(1, Math.hypot(vel[k], vel[k + 1], vel[k + 2]) / params.maxSpeed);
+    const vx = vel[k], vy = vel[k + 1];
+    const speedRatio = Math.min(1, Math.sqrt(vx * vx + vy * vy) * invMaxSpeed);
+    const q = (local * (PAL_Q - 1) + 0.5) | 0;
+    let cr, cg, cb;
     // 落在草地上的鸟换一身「苔绿」：和飞行中的青蓝—紫渐变色系一眼分开，
     // 又不至于像新生个体的亮绿那样抢眼。
-    if (settled[i]) tmpColor.setHSL(0.36 + local * 0.04, 0.52, 0.46);
-    else tmpColor.setHSL(0.52 + local * 0.40, 0.95, 0.46 + speedRatio * 0.22);
-    let size = params.arrowSize + local * 0.10;
+    if (settled[i]) {
+      const o = q * 3;
+      cr = palRest[o]; cg = palRest[o + 1]; cb = palRest[o + 2];
+    } else {
+      const o = (q * PAL_S + ((speedRatio * (PAL_S - 1) + 0.5) | 0)) * 3;
+      cr = palFly[o]; cg = palFly[o + 1]; cb = palFly[o + 2];
+    }
+    let size = arrowBase + local * 0.10;
     // 新生个体：亮绿色 + 轻微脉冲，1.8s 后开始渐变为普通色，3.2s 后完全一致。
     const age = now - birthAt[i];
     if (age >= 0 && age < BIRTH_TOTAL_MS) {
@@ -2420,12 +2518,12 @@ function render(now) {
         (age - BIRTH_SOLID_MS) / (BIRTH_TOTAL_MS - BIRTH_SOLID_MS)));
       const pulse = 0.5 + 0.5 * Math.cos(Math.min(age, 700) * 0.014);
       const glow = 0.85 + 0.3 * pulse;
-      col[k] = tmpColor.r * fade + tmpBirth.r * (1 - fade) * glow;
-      col[k + 1] = tmpColor.g * fade + tmpBirth.g * (1 - fade) * glow;
-      col[k + 2] = tmpColor.b * fade + tmpBirth.b * (1 - fade) * glow;
+      col[k] = cr * fade + tmpBirth.r * (1 - fade) * glow;
+      col[k + 1] = cg * fade + tmpBirth.g * (1 - fade) * glow;
+      col[k + 2] = cb * fade + tmpBirth.b * (1 - fade) * glow;
       size *= 1 + (1 - fade) * (0.28 + 0.12 * pulse);
     } else {
-      col[k] = tmpColor.r; col[k + 1] = tmpColor.g; col[k + 2] = tmpColor.b;
+      col[k] = cr; col[k + 1] = cg; col[k + 2] = cb;
     }
     // 停在草地上时保持「落地那一刻的飞行朝向」：速度归零后 atan(0,0)=0，
     // 若不给朝向整片鸟会齐刷刷指向右边。用落地瞬间记录的角度，方向连续、
@@ -2437,24 +2535,20 @@ function render(now) {
     // 而是在自身色相上「烧」向粉白——色相推到紫红端、亮度抬高、边缘更亮，
     // 亮度用一次起爆的衰减包络（而非固定频率频闪），30FPS 下也不会像坏灯管。
     if (now < sprintUntil[i] && age >= BIRTH_TOTAL_MS) {
-      const span = Math.max(160, params.sprintDuration * 1000);
-      const t = Math.min(1, Math.max(0, (now - (sprintUntil[i] - span)) / span));
+      const t = Math.min(1, Math.max(0, (now - (sprintUntil[i] - sprintSpanMs)) / sprintSpanMs));
       const surge = 0.45 + 0.55 * Math.exp(-t * 3.4);      // 起爆瞬间最强，随后回落
-      tmpSprint.setHSL(0.928 - local * 0.02, 0.96, 0.45 + 0.07 * surge);
       // 色相全程保持（爆发=洋红发光），只有亮度与尺寸在起爆瞬间冲高再回落，
       // 这样整段爆发期的身份色是一致的，不会一半时间又退回青蓝。
+      const so = (((surge - 0.45) * 18.18) | 0) * 3;   // 0.45~1.0 → 0~15
       const w = 0.82;
-      col[k] = col[k] * (1 - w) + tmpSprint.r * w;
-      col[k + 1] = col[k + 1] * (1 - w) + tmpSprint.g * w;
-      col[k + 2] = col[k + 2] * (1 - w) + tmpSprint.b * w;
+      col[k] = col[k] * (1 - w) + sprintPal[so] * w;
+      col[k + 1] = col[k + 1] * (1 - w) + sprintPal[so + 1] * w;
+      col[k + 2] = col[k + 2] * (1 - w) + sprintPal[so + 2] * w;
       size *= 1.22 + 0.24 * surge;
     }
     siz[i] = size;
   }
-  // 箭头朝向低通滤波：Boids 力在拥挤处会逐帧改变方向，直接画瞬时速度会抖动。
-  // 只平滑用于渲染的速度，物理仿真仍使用原始 vel，行为不变。
-  const SMOOTH = 0.18;   // 30 FPS 下时间常数约 0.15s，抖动明显降低且方向仍跟手
-  for (let i = 0; i < n * 3; i++) rVel[i] += (vel[i] - rVel[i]) * SMOOTH;
+  perfParts.color = performance.now() - tCol0;
   aPos.needsUpdate = true;
   aVel.needsUpdate = true;
   aCol.needsUpdate = true;
@@ -2939,6 +3033,8 @@ window.FlockLab = {
     return {
       step: +perf.step.toFixed(2), prep: +perf.prep.toFixed(2), draw: +perf.draw.toFixed(2),
       total: +(perf.step + perf.prep + perf.draw).toFixed(2),
+      grid: +perfParts.grid.toFixed(2), loop: +perfParts.loop.toFixed(2),
+      stats: +perfParts.stats.toFixed(2), color: +perfParts.color.toFixed(2),
       fps: +fps.toFixed(1), count: activeCount
     };
   },
