@@ -1274,16 +1274,18 @@ uiBtn.addEventListener('click', () => {
 });
 syncUiBtn();
 
-// 进入主页先「沉浸」：body 自带 ui-immersive，连小眼睛和图钉钉住的状态卡都不显示，
-// 画面里只有模拟。任意一次真实交互就唤出完整界面；此后不再自动回到沉浸，
-// 隐藏/显示完全交给右下角按钮。每次刷新都会重新沉浸。
-let immersive = document.body.classList.contains('ui-immersive');
-function leaveImmersive() {
-  if (!immersive) return;
-  immersive = false;
-  document.body.classList.remove('ui-immersive');
+// 进入页面：先完整显示所有界面，1 秒后带淡出动画自动收起——
+// 等同于自动替用户点一次「隐藏所有界面」按钮，走的是同一套 ui-hidden 逻辑：
+// 收起后任意操作只把小眼睛显现出来（3 秒闲置再淡出），点眼睛才展开完整界面。
+// 每次打开 / 刷新都会重演。若这 1 秒里用户已手动隐藏，或「关于」弹窗开着，就不抢动作。
+function autoHideUi() {
+  if (document.body.classList.contains('ui-hidden')) return;
+  if (about.classList.contains('open')) { setTimeout(autoHideUi, 800); return; }
+  document.body.classList.add('ui-hidden');
   syncUiBtn();
+  scheduleEyeFade();
 }
+setTimeout(autoHideUi, 1000);
 
 // 闲置自动隐藏：光标 3 秒无操作后消失；演示模式里小眼睛也一样淡出。
 // 晃动鼠标、按键、触摸或滚轮都会立刻恢复，并重新计时。
@@ -1303,13 +1305,14 @@ function wake() {
     scheduleEyeFade();
   }
 }
-const onActivity = () => { leaveImmersive(); wake(); };
-addEventListener('mousemove', onActivity, { passive: true });
-addEventListener('mousedown', onActivity, { passive: true });
-addEventListener('keydown', onActivity, { passive: true });
-addEventListener('wheel', onActivity, { passive: true });
-addEventListener('touchstart', onActivity, { passive: true });
-addEventListener('pointerdown', onActivity, { passive: true });
+// 任意操作只负责「把眼睛叫醒 + 重置光标闲置计时」，不再直接展开完整界面。
+// 展开必须点右下角眼睛按钮（常规逻辑）。
+addEventListener('mousemove', wake, { passive: true });
+addEventListener('mousedown', wake, { passive: true });
+addEventListener('keydown', wake, { passive: true });
+addEventListener('wheel', wake, { passive: true });
+addEventListener('touchstart', wake, { passive: true });
+addEventListener('pointerdown', wake, { passive: true });
 wake();
 
 // 状态卡「钉住」：钉住后一键隐藏界面时它仍留在屏幕上（CSS 用 :not(.pinned) 排除）。
@@ -2919,7 +2922,6 @@ window.FlockLab = {
   get audioOutputConnected() { return audio.outputConnected; },
   get soundEvents() { return { ...audio.total }; },
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
-  get immersive() { return document.body.classList.contains('ui-immersive'); },
   get cursorHidden() { return document.body.classList.contains('cursor-idle'); },
   get eyeFaded() { return uiBtn.classList.contains('faded'); },
   get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },

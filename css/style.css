@@ -63,7 +63,6 @@
     width: 1px; height: 22px; flex: 0 0 1px;
     background: linear-gradient(180deg, transparent, rgba(99, 230, 255, 0.32), transparent);
   }
-  body.ui-hidden #topbar .sep { visibility: hidden; }
   .ico {
     width: 36px; height: 36px; padding: 0; display: grid; place-items: center;
     cursor: pointer; color: var(--ink); border-radius: 50%;
@@ -114,20 +113,27 @@
   /* 隐藏全部界面后，小眼睛自身也会淡出；晃动鼠标或按键再显现 */
   #uiBtn.faded { opacity: 0; pointer-events: none; }
 
-  /* 进入主页先沉浸：连图钉钉住的状态卡、小眼睛一起隐藏，画面里只有模拟。
-     任意一次交互后由 main.js 移除该 class，完整界面随即出现；刷新会重新沉浸。 */
-  body.ui-immersive #brand,
-  body.ui-immersive #hud,
-  body.ui-immersive #topbar,
-  body.ui-immersive .lil-gui.root { display: none !important; }
-
-  /* 演示模式：只保留「小眼睛」，其余界面全部隐藏。
-     场景按钮与声音用 visibility 隐藏，保留占位，避免小眼睛位置跳动。 */
+  /* 隐藏 / 显示全部界面：用 opacity + visibility 过渡，收起和展开都是 ~0.45s 淡出动画
+     （display:none 无法参与过渡，会瞬间消失）。visibility 延迟到淡出结束再切断，
+     展开时则立即恢复可见。 */
+  #brand, #hud, .lil-gui.root {
+    transition: opacity .45s ease, visibility 0s linear 0s;
+  }
   body.ui-hidden #brand,
   body.ui-hidden #hud:not(.pinned),
-  body.ui-hidden .lil-gui.root { display: none !important; }
+  body.ui-hidden .lil-gui.root {
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity .45s ease, visibility 0s linear .45s;
+  }
+
+  /* 演示模式：只保留「小眼睛」，其余界面全部淡出。
+     场景按钮与声音用 visibility 隐藏，保留占位，避免小眼睛位置跳动。 */
   body.ui-hidden #topbar .scene-btn,
-  body.ui-hidden #topbar #audioBtn { visibility: hidden; pointer-events: none; }
+  body.ui-hidden #topbar #audioBtn {
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transition: opacity .45s ease, visibility 0s linear .45s;
+  }
+  body.ui-hidden #topbar .sep { opacity: 0; visibility: hidden; transition: opacity .45s ease, visibility 0s linear .45s; }
 
   /* 暂停时按钮改为高亮，明确当前处于冻结状态 */
   #pauseBtn.on { border-color: rgba(255, 211, 110, 0.6); box-shadow: 0 0 16px rgba(255, 211, 110, 0.16); }
