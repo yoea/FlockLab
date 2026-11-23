@@ -420,3 +420,92 @@
     body.touch .ico, .ico { width: 38px; height: 38px; }
     #audioBtn svg { width: 18px; height: 18px; }
   }
+
+  /* ---------------------------------------------------------------- 手机 / 平板适配
+     原则：
+       ① 状态卡不再和右下角按钮抢同一行（竖屏手机上两者会正面重叠）——抬到按钮行上方；
+       ② 控制台在手机上变成贴底的整宽抽屉，不再是一个 300px 宽的浮窗露在屏幕外；
+       ③ 所有贴边元素都吃 safe-area-inset，刘海机 / 手势条不会盖住按钮；
+       ④ 字号按屏幕缩一档，但可点区域只放大不缩小（≥40px）。
+     只用宽度 / 高度两个维度做断点，不区分设备类型，平板横竖屏都能落到合适的一档。 */
+
+  /* 触屏矮屏（手机横屏，高度 < 520）：面板别把画面吃光 */
+  @media (max-height: 520px) {
+    .lil-gui.root { max-height: 52vh !important; }
+    #hud { bottom: 10px; }
+  }
+
+  /* 平板竖屏 / 窄窗口 */
+  @media (max-width: 900px) {
+    #hud {
+      left: max(12px, env(safe-area-inset-left));
+      bottom: max(12px, env(safe-area-inset-bottom));
+      width: min(280px, calc(100vw - 24px));
+    }
+    #topbar {
+      right: max(10px, env(safe-area-inset-right));
+      bottom: max(10px, env(safe-area-inset-bottom));
+    }
+    .lil-gui.root {
+      right: max(6px, env(safe-area-inset-right)) !important;
+      bottom: calc(62px + env(safe-area-inset-bottom)) !important;
+      max-height: 58vh !important;
+    }
+  }
+
+  /* 手机竖屏：状态卡抬到按钮行上方，面板改成整宽抽屉 */
+  @media (max-width: 620px) {
+    #brand { left: max(10px, env(safe-area-inset-left)); top: max(10px, env(safe-area-inset-top)); }
+    #hud {
+      left: max(10px, env(safe-area-inset-left));
+      bottom: calc(58px + env(safe-area-inset-bottom));
+      width: min(300px, calc(100vw - 20px));
+    }
+    #hud .card-title { font-size: 11px; }
+    #hud .hud-grid { gap: 4px 8px; }
+    #hud .hud-grid b { font-size: 13px; }
+    #hud .hud-grid .k { font-size: 9.5px; }
+    #hud .event-line { font-size: 10px; gap: 6px; }
+    #hud .hud-foot { font-size: 10px; }
+    #hud .bar { width: 74px; }
+
+    /* 控制台：贴底整宽，限高 52vh，内部滚动 */
+    .lil-gui.root {
+      left: max(6px, env(safe-area-inset-left)) !important;
+      right: max(6px, env(safe-area-inset-right)) !important;
+      bottom: calc(54px + env(safe-area-inset-bottom)) !important;
+      width: auto !important;
+      /* !important 是必需的：body.touch .lil-gui.root 的 max-height:66vh 特异性更高 */
+      max-height: 52vh !important;
+      border-radius: 12px;
+      /* 抽屉会盖住状态卡：底色做实在一点，否则两卡内容叠在半透明层上，字糊成一片 */
+      --background-color: rgba(8, 13, 25, 0.97);
+      --title-background-color: rgba(15, 24, 42, 0.99);
+      backdrop-filter: blur(18px) saturate(150%);
+      -webkit-backdrop-filter: blur(18px) saturate(150%);
+    }
+    body.touch .lil-gui {
+      --font-size: 12.5px;
+      --widget-height: 28px;
+      --title-height: 34px;
+      --name-width: 48%;
+    }
+
+    /* 关于弹窗：手机上别留 24px 的大边 */
+    #about { padding: 12px; }
+    #about .about-card { padding: 20px 18px 16px; max-height: 88vh; }
+
+    /* 触控提示：底部一行的按钮不缩，保证 40px 以上 */
+    body.touch .ico, .ico { width: 40px; height: 40px; }
+    #topbar { gap: 6px; }
+
+    /* 轻提示原来 white-space:nowrap，长句在手机上会顶出屏幕 */
+    #toast { max-width: calc(100vw - 28px); white-space: normal; text-align: center; line-height: 1.5; }
+  }
+
+  /* 超窄 / 超矮：状态卡的迷你曲线和四宫格太挤，收掉曲线 */
+  @media (max-width: 400px), (max-height: 430px) {
+    #hud .spark-wrap { display: none; }
+    #hud .hud-grid { display: none; }
+    #hud { width: min(268px, calc(100vw - 20px)); }
+  }

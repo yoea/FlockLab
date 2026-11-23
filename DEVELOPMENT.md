@@ -185,6 +185,15 @@ requestAnimationFrame(render)
 
 关掉草地时 `liftAllResting()` 必须同时清掉 **`contending`（争斗红）与 `restWaitFrom`（排队计时）**，只清 `resting` 会让红鸟留在场上「争夺」一块不存在的草地。新开关请走 `FlockLab.setGrassOn(on)`（与 GUI 回调同路径）。
 
+### 3.6b 响应式布局（手机 / 平板）
+
+只改 CSS，`css/style.css` 末尾三段媒体查询：`≤900px`（平板）、`≤620px`（竖屏手机）、`(max-width:400px) or (max-height:430px)`（超小屏）。
+
+- **`body.touch` 的选择器特异性更高**（0,2,1），媒体查询里想覆盖 `body.touch .lil-gui.root` 的 `max-height` 必须写 `!important`——这个坑踩过一次（面板在手机上仍然是 66vh，把按钮行盖住）。
+- 控制台在手机上改成 `left/right: 6px; width: auto`，并把 `--background-color` 提到 0.97：它是覆盖在状态卡上的抽屉，半透明会让两卡的字叠在一起。
+- 世界尺寸（`view2DFitHalfH`）**没有**跟着屏幕比例变：鸟的元素尺寸是世界单位，改视口高度等于改鸟的像素大小。竖屏手机上场地就是一条竖条，这是有意的取舍。
+- 状态卡在 ≤400px 宽时隐藏迷你曲线和四宫格（`.spark-wrap` / `.hud-grid`），否则一张卡吃掉 28% 屏高。
+
 ### 3.7 其他约定
 
 - **热路径不新建对象/数组**：`step`/`render` 里禁止 `new`、数组字面量、`Math.hypot`（用 `Math.sqrt`）、闭包。跨趟传数据用模块级 `TypedArray`。
