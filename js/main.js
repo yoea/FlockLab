@@ -55,10 +55,12 @@ const MAX_P = 10;              // AI 捕食者上限（GUI 可调范围）
 // 鼠标捕食者单独占一个数组槽位（索引 = 当前 AI 捕食者数量），所以要多留一格。
 // GUI 的「捕食者数量」仍以 MAX_P 为上限，两者互不挤占。
 const MAX_SLOT = MAX_P + 1;
-// 鼠标捕食者的捕食冷却：人控制时移动极快，沿用 AI 那套长冷却会完全吃不到东西。
-// 90ms ≈ 每秒最多 11 只：快速划过鸟群会留下一串小爆发，又不至于一下清空全场
-// （被吃的个体 1 秒后照常重生，数量会自动补回来）。
-const MOUSE_FEED_MS = 90;
+// 鼠标捕食者的捕食冷却：跟 AI 共用「进食冷却」这个参数，只打到 35%（最低 300ms）。
+// 人驾驶时划过鸟群还是有手感，但不再是无冷却连吃——一秒钟最多几只，
+// 和 AI 猛禽受同一个限制（被吃的个体 1 秒后照常重生，数量自动补回来）。
+function mouseFeedMs() {
+  return Math.max(300, params.feedCooldown * 1000 * 0.35);
+}
 // 速度只用于箭头朝向与音效冲击量（位置完全由光标决定，没有速度上限），
 // 夹到 60 是为了不让甩鼠标时音效爆表。
 const MOUSE_VMAX = 60;
@@ -178,6 +180,9 @@ const acc = new Float32Array(MAX_N * 3);
 const col = new Float32Array(MAX_N * 3);
 const siz = new Float32Array(MAX_N);
 const neighbors = new Uint16Array(MAX_N);
+// 局部密度（3×3 格的活跃鸟数，归一化到 0~1）：和「注意力只取 7 只」解耦。
+// 用邻居数当色阶时分不清「稀疏」和「采样上限已满」，万只以上会整片卡在同一色。
+const localDen = new Float32Array(MAX_N);
 const fleeDir = new Float32Array(MAX_N * 3);   // 当前帧逃逸力方向
 const prevFlee = new Float32Array(MAX_N * 3);  // 上一帧逃逸力，用于信息级联（传播带一帧延迟）
 const fleeing = new Uint8Array(MAX_N);
@@ -198,14 +203,14 @@ const reactJit = new Float32Array(MAX_N);      // 个体反应快慢系数
 const REACT_NEAR_MS = 45;
 const REACT_FAR_MS = 260;
 
-// ---------------------------------------------------------------- 爆发拖尾
-// 只有爆发中的个体才画拖尾。不做逐帧历史记录（万只时太贵），
-// 而是给每只鸟维护「尾巴点」：尾巴用指数平滑追头部，稳态落后量 ≈ 速度 × τ，
-// 所以尾巴长度自然随爆发速度变长，起爆瞬间从零快速拉长。
-const trailHead = new Float32Array(MAX_N * 2);  // 头部（= 当前位置）
-const trailTail = new Float32Array(MAX_N * 2);  // 尾巴（滞后点）
-const trailAmt = new Float32Array(MAX_N);       // 拖尾强度 0~1，用于淡入淡出
-const TRAIL_TAU = 0.115;                        // 尾巴跟随时间常数（秒）
+// ---------------------------------------------------------------- 加速尾迹
+// 鸟和捕食者共用一套「独立粒子」尾迹（见下方 MAX_TRAILS 定义）：粒子在生成瞬间
+// 冻结世界坐标与航向，之后不随实体移动，转弯时自然连成弧，按寿命淡出缩小。
+// 这里存的是每只鸟 / 每个捕食者槽位的「发射节流时刻」与「快起慢落包络」——
+// 后者把一次加速摊成约半秒的发射窗口，鸟用速度超限驱动、捕食者用加速度驱动，
+// 除了「怎么判定在加速」之外，节流、撒点、着色器、淡出全部走同一条路径。
+const trailNextAt = new Float64Array(MAX_N);
+const birdTrailP = new Float32Array(MAX_N);   // 鸟的加速包络 0~1（与 predTrailP 对称）
 // ---------------------------------------------------------------- 草地休息
 // 每只鸟有一张「休息预约」：到点就去最近的空地降落 3~6 秒，再起飞。
 // 草地有容量，满了就稍后再试，所以不会一千只同时挤进同一片。
@@ -292,9 +297,9 @@ const predWpUntil = new Float64Array(MAX_SLOT);     // 目标点过期时间
 // 几乎不加速（匀速直线）时完全不出拖尾，所以它只在扑击、急转时闪现。
 const predAccel = new Float32Array(MAX_SLOT);       // 当帧加速度大小（转向力模长）
 const predTrailP = new Float32Array(MAX_SLOT);      // 平滑后的加速度强度 0~1
-const predTrailAmt = new Float32Array(MAX_SLOT);    // 拖尾强度 0~1
+const predTrailAmt = new Float32Array(MAX_SLOT);    // 拖尾强度 0~1（保留给音乐/调试用）
+const predTrailNextAt = new Float64Array(MAX_SLOT);  // 下一颗尾迹粒子的生成时刻
 const predHeat = new Float32Array(MAX_SLOT);        // 饥饿度 0~1：决定警戒圈是暗色（饱食）还是亮色（捕食）
-const predTrailTail = new Float32Array(MAX_SLOT * 2);
 let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即视为「全力冲刺」（实测中位数 12、峰值 64）
 // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
 const predSpdJit = new Float32Array(MAX_SLOT);
@@ -380,7 +385,7 @@ function initBoids(from, to, isBirth = false) {
     rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
     birthAt[i] = isBirth ? performance.now() : -Infinity;
     stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
-    alertMs[i] = 0; trailAmt[i] = 0;
+    alertMs[i] = 0; trailNextAt[i] = 0; birdTrailP[i] = 0;
     resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
     restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
     rollTraits(i);
@@ -421,8 +426,7 @@ function spawnFar(i, now) {
   rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
   birthAt[i] = now;
   stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
-  alertMs[i] = 0; trailAmt[i] = 0;
-  trailTail[i * 2] = pos[k]; trailTail[i * 2 + 1] = pos[k + 1];
+  alertMs[i] = 0; trailNextAt[i] = 0;
   resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
   rollTraits(i);   // 重生等于换一只新个体：速度脾气、游走相位和作息相位都重新抽
@@ -446,7 +450,6 @@ function initPredators(from, to) {
     predWp[p * 2] = 0; predWp[p * 2 + 1] = 0;
     predWpUntil[p] = 0;
     predTrailAmt[p] = 0; predTrailP[p] = 0; predHeat[p] = 1;
-    predTrailTail[p * 2] = predPos[k]; predTrailTail[p * 2 + 1] = predPos[k + 1];
     predSpdJit[p] = 0.9 + Math.random() * 0.2;
     predWobble[p] = Math.random() * Math.PI * 2;
     predWallTurn[p] = Math.random() < 0.5 ? -1 : 1;
@@ -996,58 +999,96 @@ const arrows = new THREE.Mesh(arrowGeo, arrowMat);
 arrows.frustumCulled = false;
 scene.add(arrows);
 
-// ---------------------------------------------------------------- 爆发拖尾
-// 每条拖尾 = 一个实例四边形，从尾巴点拉到头点，沿长度收窄 + 加色发光。
-// 只有爆发中的个体才写入实例（其余攒成 instanceCount = 0），所以常态零开销；
-// 极端情况下并发爆发会超过上限，多出的直接丢弃（画面看不出来，也保护帧率）。
-const MAX_TRAILS = 600;
+// ---------------------------------------------------------------- 加速尾迹（独立粒子）
+// 旧做法是「一条从尾巴点拉到头点的四边形」：尾巴点用指数平滑追身体，本质仍绑在实体上，
+// 于是转弯是直线/折线，尾巴一收整条就消失。现在改成真正的尾迹粒子：
+// 沿实体**实际走过的航迹**每隔一小段撒一个短条，撒下后位置与朝向就冻结在历史点上，
+// 所以转弯会自然弯曲、留下一串彼此独立的痕迹；每个粒子有自己的寿命，靠顶点着色器
+// 按 age 收缩+淡出，CPU 每帧不需要再遍历它们（只在新粒子生成时写一个槽）。
+// 鸟和捕食者走同一套 emitTrail()，只是寿命/尺寸/颜色不同。
+const MAX_TRAILS = 2400;      // 环形槽位，写满就覆盖最旧的（视觉上看不出来）
 const trailGeo = new THREE.InstancedBufferGeometry();
+// 单位短条：aLocal.x 0=尾 1=头，aLocal.y 横向 ±1
 trailGeo.setAttribute('position', new THREE.Float32BufferAttribute([
-  -1, -1, 0,  1, -1, 0,  1, 1, 0,  -1, 1, 0
+  0, -1, 0,  1, -1, 0,  1, 1, 0,  0, 1, 0
 ], 3));
-trailGeo.setAttribute('aLocal', new THREE.Float32BufferAttribute([
-  -1, -1,  1, -1,  1, 1,  -1, 1
-], 2));
+trailGeo.setAttribute('aLocal', new THREE.Float32BufferAttribute([0, -1, 1, -1, 1, 1, 0, 1], 2));
 trailGeo.setIndex([0, 1, 2, 0, 2, 3]);
-const trHead = new Float32Array(MAX_TRAILS * 3);
-const trTail = new Float32Array(MAX_TRAILS * 3);
+
+const trPos = new Float32Array(MAX_TRAILS * 2);    // 生成位置（世界坐标，之后不再改变）
+const trDir = new Float32Array(MAX_TRAILS * 2);    // 生成瞬间的航向（单位向量）
 const trCol = new Float32Array(MAX_TRAILS * 3);
+const trBirth = new Float32Array(MAX_TRAILS);      // 生成时刻（ms）
+const trLife = new Float32Array(MAX_TRAILS);       // 寿命（ms）
+const trLen = new Float32Array(MAX_TRAILS);
 const trWid = new Float32Array(MAX_TRAILS);
-const trAlp = new Float32Array(MAX_TRAILS);
-const aTrHead = new THREE.InstancedBufferAttribute(trHead, 3).setUsage(THREE.DynamicDrawUsage);
-const aTrTail = new THREE.InstancedBufferAttribute(trTail, 3).setUsage(THREE.DynamicDrawUsage);
+trBirth.fill(-1e9);                                 // 空槽 → age 极大 → 顶点着色器裁掉
+const aTrPos = new THREE.InstancedBufferAttribute(trPos, 2).setUsage(THREE.DynamicDrawUsage);
+const aTrDir = new THREE.InstancedBufferAttribute(trDir, 2).setUsage(THREE.DynamicDrawUsage);
 const aTrCol = new THREE.InstancedBufferAttribute(trCol, 3).setUsage(THREE.DynamicDrawUsage);
+const aTrBirth = new THREE.InstancedBufferAttribute(trBirth, 1).setUsage(THREE.DynamicDrawUsage);
+const aTrLife = new THREE.InstancedBufferAttribute(trLife, 1).setUsage(THREE.DynamicDrawUsage);
+const aTrLen = new THREE.InstancedBufferAttribute(trLen, 1).setUsage(THREE.DynamicDrawUsage);
 const aTrWid = new THREE.InstancedBufferAttribute(trWid, 1).setUsage(THREE.DynamicDrawUsage);
-const aTrAlp = new THREE.InstancedBufferAttribute(trAlp, 1).setUsage(THREE.DynamicDrawUsage);
-trailGeo.setAttribute('aHead', aTrHead);
-trailGeo.setAttribute('aTail', aTrTail);
+trailGeo.setAttribute('aPos', aTrPos);
+trailGeo.setAttribute('aDir', aTrDir);
 trailGeo.setAttribute('aColor', aTrCol);
+trailGeo.setAttribute('aBirth', aTrBirth);
+trailGeo.setAttribute('aLife', aTrLife);
+trailGeo.setAttribute('aLen', aTrLen);
 trailGeo.setAttribute('aWidth', aTrWid);
-trailGeo.setAttribute('aAlpha', aTrAlp);
-trailGeo.instanceCount = 0;
+trailGeo.instanceCount = MAX_TRAILS;
+
+let trailCursor = 0;
+let trailDirty = false;
+// 寿命/尺寸：鸟的尾迹短促细淡，捕食者的更长更亮（它本来就是画面主角）
+const TRAIL_LIFE_BIRD = 300, TRAIL_LEN_BIRD = 0.62;
+const TRAIL_LIFE_PRED = 460, TRAIL_LEN_PRED = 1.25;
+
+function emitTrail(x, y, vx, vy, now, life, len, wid, r, g, b) {
+  const sp = Math.sqrt(vx * vx + vy * vy);
+  const i = trailCursor;
+  trailCursor = (trailCursor + 1) % MAX_TRAILS;
+  trPos[i * 2] = x; trPos[i * 2 + 1] = y;
+  if (sp > 1e-4) { trDir[i * 2] = vx / sp; trDir[i * 2 + 1] = vy / sp; }
+  else { trDir[i * 2] = 1; trDir[i * 2 + 1] = 0; }
+  trBirth[i] = now; trLife[i] = life; trLen[i] = len; trWid[i] = wid;
+  trCol[i * 3] = r; trCol[i * 3 + 1] = g; trCol[i * 3 + 2] = b;
+  trailDirty = true;
+}
+
 const trailMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
   vertexShader: `
     attribute vec2 aLocal;
-    attribute vec3 aHead;
-    attribute vec3 aTail;
+    attribute vec2 aPos;
+    attribute vec2 aDir;
     attribute vec3 aColor;
+    attribute float aBirth;
+    attribute float aLife;
+    attribute float aLen;
     attribute float aWidth;
-    attribute float aAlpha;
+    uniform float uTime;
     varying float vT;        // 0=尾 1=头
     varying float vAcross;   // 横向 -1~1
     varying vec3 vColor;
     varying float vAlpha;
     varying float vFade;
     void main() {
-      vec2 dv = aHead.xy - aTail.xy;
-      float len = length(dv);
-      vec2 dir = len > 1e-4 ? dv / len : vec2(1.0, 0.0);
-      vec2 perp = vec2(-dir.y, dir.x);
-      float t = 0.5 + 0.5 * aLocal.x;
-      // 宽度沿长度收窄：尾部细、靠近头部略鼓，看起来像被拉出的速度线
-      float w = aWidth * (0.26 + 0.74 * pow(t, 0.7));
-      vec2 p = aTail.xy + dir * (len * t) + perp * (aLocal.y * w);
-      vT = t; vAcross = aLocal.y; vColor = aColor; vAlpha = aAlpha;
+      float age = (uTime - aBirth) / max(1.0, aLife);
+      if (age >= 1.0 || age < 0.0) {           // 已过期 / 空槽：挪到裁剪空间外
+        vAlpha = 0.0; vT = 0.0; vAcross = 0.0; vColor = aColor; vFade = 0.0;
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+      }
+      float k = 1.0 - age;
+      float t = aLocal.x;
+      vec2 perp = vec2(-aDir.y, aDir.x);
+      // 粒子随时间变短、变窄，尾端比头端细——像被气流吹散的烟痕
+      float w = aWidth * pow(k, 0.45) * (0.5 + 0.5 * t);
+      vec2 p = aPos + aDir * (aLen * pow(k, 0.7) * t) + perp * (aLocal.y * w);
+      vT = t; vAcross = aLocal.y; vColor = aColor;
+      vAlpha = pow(k, 1.35);                    // 越老越淡（尾巴留得住但很快化开）
       vec4 mv = modelViewMatrix * vec4(p, 0.0, 1.0);
       vFade = 1.0 - smoothstep(45.0, 145.0, -mv.z);
       gl_Position = projectionMatrix * mv;
@@ -1062,10 +1103,10 @@ const trailMat = new THREE.ShaderMaterial({
     void main() {
       float core = 1.0 - smoothstep(0.25, 1.0, abs(vAcross));
       float glow = exp(-abs(vAcross) * 2.4) * 0.45;
-      float a = (core + glow) * vAlpha * (0.25 + 0.75 * vT) * vFade;
+      float a = (core + glow) * vAlpha * (0.18 + 0.82 * vT) * vFade;
       if (a < 0.004) discard;
-      // 加法混合下不要再把 a 预乘进 rgb：否则实际亮度是 a²，几乎看不见
-      gl_FragColor = vec4(vColor * (0.45 + 1.05 * vT), a);
+      // 加法混合下不要把 a 预乘进 rgb：否则实际亮度是 a²，几乎看不见
+      gl_FragColor = vec4(vColor * (0.5 + 0.95 * vT), a);
       #include <colorspace_fragment>
     }
   `,
@@ -1669,17 +1710,46 @@ let cellStart = new Int32Array(0);
 let cellEnd = new Int32Array(0);
 let cellFill = new Int32Array(0);
 const cellItems = new Int32Array(MAX_N);
-// 邻域扫描顺序：先自己所在格，再上下左右，最后四个斜角。
-// 二维场地里 z 恒为 0，原来 3×3×3=27 次查表有 24 次必然落空；这里只查 9 个格，
-// 且按由近到远，配合「只取最近 7 只」时先拿到的就是近邻。
+// 邻域扫描的 9 个格：自己格 → 四邻 → 四角。
 const NBR_OFF = [0, 0, 1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 1, -1, -1, 1, -1, -1];
+// 除自己格以外的 8 个方位，供轮转取样用（顺序与 NBR_OFF 后 8 项一致）。
+const RING_OFF = [1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 1, -1, -1, 1, -1, -1];
+// 局部密度（颜色）用同一套 9 格，但只读每格的计数、不遍历成员。
+const DEN_OFF = NBR_OFF;
+// 每帧推进的轮转游标：让「注意力 7 只」不会永远全部来自自己格。
+// 为什么必须轮转：只按「自己格优先、取满 7 只就停」时，实测 800 只就有 78%、
+// 3000 只有 90% 的鸟，7 个邻居全部来自自己所在的那一格（边长 = 感知半径）。
+// 后果是三个叠加的毛病：
+//   ① 聚合力的质心落在自己格中心 → 整群被拽进一个个方块里，聚成一坨；
+//   ② 分离力只看得到格内最近的几只，挤到极近时 1/d² 权重爆炸 → 一坨被炸开；
+//   ③ 炸开后格内不足 7 只、又能看到邻格 → 聚合力把它拉回来。
+// v33 只写了这段说明、没真正实现轮转；v34 补齐：自己格保底 + 其余 8 格按
+// (鸟序号 + 帧号) 错位轮转，配合下面分离力的连续幅值，掐掉「聚→散→聚」极限环。
+let scanTick = 0;
+// 每只鸟每帧最多扫多少个格内成员（含被距离检查筛掉的）。按数量分档：
+// 每帧总成本 ≈ 扫描量 × 鸟数，5 万只时必须收紧。800 只扫 18 个已经覆盖全部近邻。
+let dbgSepCap = 0;   // 调试用：覆盖扫描配额（0 = 用默认分档）
+function sepCapFor(n) {
+  return dbgSepCap || (n > 20000 ? 10 : n > 2000 ? 14 : 18);
+}
+let dbgNbrCap = 0;   // 调试用：覆盖注意力上限（0 = 用 NEIGHBOR_CAP）
+// 密度归一化基准：3×3 格计数 ≈ 4.5 × 格内鸟数。取值让默认 800 只的 p10/p50/p90
+// 大约落在 0.2 / 0.45 / 0.87，正好铺满原来的青蓝→紫渐变色阶。
+const LOCAL_DEN_K = 70;
 
 // ---------------------------------------------------------------- 模拟
 function step(dt, time) {
   const n = activeCount;
+  scanTick++;                                   // 邻域轮转：每帧换一批方位
   const cell = params.perception;
   const per2 = cell * cell;
   const sep2 = params.separationRange * params.separationRange;
+  const sepSoft = sep2 * 0.015;  // 分离核软化项：见邻域扫描里 1/(d²+ε) 的说明
+  // 分离力软饱和尺度：sl 的量纲是 1/距离，除以安全距离让 crowd 对滑杆不敏感。
+  const SEP_SAT = 4.0 / params.separationRange;
+  // 密度基准随数量线性放大：格数固定时 3×3 计数 ∝ n，固定 70 在 2500 只就全体
+  // 顶格 1.0（用户看到的「不变紫色」）。起步 1.4 让默认 800 只的 p95 也留余量。
+  const denK = LOCAL_DEN_K * 1.4 * Math.max(1, n / 800);
   const maxSpeed = params.maxSpeed;
   const maxForce = MAX_FORCE;
   const B = BOUND;
@@ -1698,7 +1768,8 @@ function step(dt, time) {
   const sprintSpeed = maxSpeed * params.sprintFactor;
   const catchR2 = Math.pow(catchRadius(), 2);
   // 拓扑式邻域：每只鸟只取最近的 7 只（见 NEIGHBOR_CAP），单帧配对量 = 7n。
-  const neighborCap = NEIGHBOR_CAP;
+  const neighborCap = dbgNbrCap || NEIGHBOR_CAP;
+  const sepCap = sepCapFor(n);   // 只跟数量有关，每帧算一次
   // 群体巡航节奏：无威胁时统一收敛到巡航速度的 78%，受惊/爆发才放开到上限。
   const paceSpeed = maxSpeed * 0.78;
   currentPace = paceSpeed;
@@ -2108,16 +2179,54 @@ function step(dt, time) {
     let ax = 0, ay = 0, az = 0;
     let dxs = 0, dys = 0, dzs = 0;
     let cfx = 0, cfy = 0, cfz = 0, cascadeCount = 0;   // 信息级联：邻居上一帧的逃逸方向
+    let asp2 = 0;                                       // 注意力邻里速度平方和（一致性加权用，免 sqrt）
 
     const ix = Math.floor(px / cell) - gridX0, iy = Math.floor(py / cell) - gridY0;
-    nbrScan:
+    // 局部密度：3×3 格的总活跃鸟数（只读计数，不遍历成员，开销可以忽略）。
+    // 颜色色阶必须独立于「注意力只取 7 只」——否则 neighbors[i] 恒为 7，整群永远同一色。
+    let nearby = 0;
     for (let oi = 0; oi < 18; oi += 2) {
-      const cx = ix + NBR_OFF[oi], cy = iy + NBR_OFF[oi + 1];
+      const cx = ix + DEN_OFF[oi], cy = iy + DEN_OFF[oi + 1];
       if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) continue;
       const c = cy * gridW + cx;
-      const bEnd = cellEnd[c];
-      for (let b = cellStart[c]; b < bEnd; b++) {
-        if (count >= neighborCap) break nbrScan;
+      nearby += cellEnd[c] - cellStart[c];
+    }
+    localDen[i] = nearby > denK ? 1 : nearby / denK;
+
+    // ---- 邻域扫描 ----
+    // 两个要点，都是修 v31「编队不稳 / 聚成一坨再炸开」的关键：
+    //  ① 把「注意力」和「分离」拆开。注意力（对齐 / 聚合）只取前 7 只，相当于盯住最近
+    //    的 7 个同伴（椋鸟实测约 6~7 只）；分离却必须看**所有贴近到安全距离内的个体**。
+    //    v31 把两者都限成 7 只：密集时若这 7 只恰好偏在一侧，分离合力就持续偏斜，
+    //    群体被推向一边、撕成几块；块内挤到极近时纯 1/d² 又把块炸开——于是
+    //    「聚成一坨 → 炸开 → 再聚」，有序度在 0.1~0.6 之间来回摆。
+    //    贴身排斥是物理接触，本来就与「注意力上限」无关（真实椋鸟也一样）。
+    //  ② 扫描配额按「已扫描的成员数」算（cand），不是「已接受数」。若按接受数算，
+    //    四角格里那些超出感知半径的成员会不断被跳过、却不消耗配额，5 万只时每只鸟
+    //    要空扫八九百个成员，单帧直接飙到 400ms。
+    // 扫描顺序：自己格 → 四邻 → 四角（四角排在最后，配额先被有效近邻吃掉）。
+    // 两趟配额：自己格先给一小份（保证贴身分离看得到同格最挤的个体），
+    // 其余 8 格按 (鸟序号 + 帧号) 错位轮转，把注意力 7 只分散到不同方位，
+    // 不再让质心被钉在自己格中心。总扫描量仍受 sepCap 约束，性能不变。
+    const selfQuota = (sepCap * 0.45) | 0;
+    const rot = (i + scanTick) & 7;
+    let cand = 0;
+    scanCells:
+    for (let pass = 0; pass <= 8; pass++) {
+      const r = (rot + pass - 1) & 7;
+      const ox = pass === 0 ? 0 : RING_OFF[r * 2];
+      const oy = pass === 0 ? 0 : RING_OFF[r * 2 + 1];
+      const cx = ix + ox, cy = iy + oy;
+      if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) continue;
+      const c = cy * gridW + cx;
+      const b1 = cellEnd[c];
+      const localCap = pass === 0 ? selfQuota : sepCap;
+      for (let b = cellStart[c]; b < b1; b++) {
+        if (cand >= localCap) {
+          if (pass === 0) break;      // 自己格配额用完，接着扫邻格
+          break scanCells;            // 总配额用完
+        }
+        cand++;
         const j = cellItems[b];
         if (j === i || caught[j]) continue;
         const m = j * 3;
@@ -2125,16 +2234,22 @@ function step(dt, time) {
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 > per2 || d2 < 1e-8) continue;
 
-        count++;
-        sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
-        ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
-        if (P > 0 && params.infoCascade && fleeing[j]) {
-          cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
-          cascadeCount++;
+        // 前 7 只：对齐与聚合
+        if (count < neighborCap) {
+          count++;
+          sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
+          ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
+          asp2 += vel[m] * vel[m] + vel[m + 1] * vel[m + 1] + vel[m + 2] * vel[m + 2];
+          if (P > 0 && params.infoCascade && fleeing[j]) {
+            cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
+            cascadeCount++;
+          }
         }
         if (d2 < sep2) {
-          const inv = 1 / d2;
-          dxs += dx * inv; dys += dy * inv; dzs += dz * inv;
+          // 近邻主导但峰值有界：纯 1/d² 在 d≈0.15 时权重到 44，一次擦身就能把整块炸开；
+          // 加一个小的 ε 把峰值压到 ~20，近邻仍比远邻大一个量级以上。
+          const w = 1 / (d2 + sepSoft);
+          dxs += dx * w; dys += dy * w; dzs += dz * w;
         }
         if (d2 < COLLIDE_DIST2) {
           const dist = Math.sqrt(d2);
@@ -2153,7 +2268,12 @@ function step(dt, time) {
     if (count > 0) {
       let len = Math.sqrt((ax) * (ax) + (ay) * (ay) + (az) * (az));
       if (len > 1e-6) {
-        const s = desiredSpeed / len;
+        // 一致性 = |Σv| / sqrt(n·Σv²)（0=各飞各的，1=完全齐飞；与 |Σv|/Σ|v| 等价但省掉逐只开方）。
+        // 只看 7 只时样本很少，散乱状态下「把合方向归一化到 desiredSpeed」会把方向噪声
+        // 放大成满力，群体被随机推力搅成一块块；按一致性加权后，散乱时力只有约四成，
+        // 齐飞时才接近满力——这正是 v30 用 100 多只邻居平均时天然具备的平滑性。
+        const agree = asp2 > 1e-6 ? len / Math.sqrt(count * asp2) : 0;
+        const s = desiredSpeed * (0.72 + 0.28 * agree) / len;
         let tx = ax * s - vx, ty = ay * s - vy, tz = az * s - vz;
         const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
         if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
@@ -2171,8 +2291,15 @@ function step(dt, time) {
     }
     const sl = Math.sqrt((dxs) * (dxs) + (dys) * (dys) + (dzs) * (dzs));
     if (sl > 1e-6) {
-      const s = desiredSpeed / sl;
-      let tx = dxs * s - vx, ty = dys * s - vy, tz = dzs * s - vz;
+      // 幅值随「拥挤程度」连续上升，而不是一有近邻就恒定满力。
+      // 旧写法 desiredSpeed/sl 把 dxs 的模长整个归一化掉 → 分离变成
+      // 「有近邻 = 满推 / 没近邻 = 零」的开关，与同样恒定满力的聚合力对顶，
+      // 群体就在「聚成一坨 → 炸开 → 再聚」之间反复横跳（用户看到的症状）。
+      // crowd = sl/(sl+SEP_SAT) 把开关变成比例控制：刚进安全圈几乎不推，
+      // 挤到贴身才强推，两种力在某个间距上自然平衡，极限环消失。
+      const crowd = sl / (sl + SEP_SAT);
+      const s = desiredSpeed * crowd / sl;
+      let tx = dxs * s - vx * crowd, ty = dys * s - vy * crowd, tz = dzs * s - vz * crowd;
       const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
       if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
       fx += tx * params.separation; fy += ty * params.separation; fz += tz * params.separation;
@@ -2400,7 +2527,11 @@ function step(dt, time) {
       else restDue[i] = time + 1200 + Math.random() * 3000 + restPhase[i] * 2500;
     }
 
-    acc[k] = fx; acc[k + 1] = fy; acc[k + 2] = 0;
+    // 合力一阶低通：只盯 7 只邻居时，逐帧的注意力合力抖动很大，直接积分会让群体
+    // 在「被聚合力收紧 → 分离力炸开 → 再收紧」之间来回摆（用户看到的聚成一坨又分开）。
+    // 时间常数约 2 帧（~65ms）；逃逸爆发走的是独立的速度通道，不受这一层影响。
+    const FSM = 0.55;
+    acc[k] += (fx - acc[k]) * FSM; acc[k + 1] += (fy - acc[k + 1]) * FSM; acc[k + 2] = 0;
   }
   if (aliveN > 0) { groupX = cx / aliveN; groupY = cy / aliveN; groupZ = 0; }
 
@@ -2465,11 +2596,9 @@ function step(dt, time) {
         if (pos[k + 1] > hy) pos[k + 1] = hy; else if (pos[k + 1] < -hy) pos[k + 1] = -hy;
         teleportCount++;
         wallPass[i] = 0; wallNear[i] = 0;
-        // 传送是瞬移：拖尾必须当场清掉，否则会从旧位置拉出一条横穿全屏的线。
-        // 把尾巴重置到落点，下次爆发时从零重新拉开。
-        trailAmt[i] = 0;
-        trailTail[i * 2] = pos[k];
-        trailTail[i * 2 + 1] = pos[k + 1];
+        // 传送是瞬移：粒子本身留在旧位置是对的（历史航迹），但发射包络要清零，
+        // 免得落点接着撒出一段凭空出现的尾迹。
+        trailNextAt[i] = 0; birdTrailP[i] = 0;
       } else {
         if (outX) {
           pos[k] = outX * hx;
@@ -2503,7 +2632,7 @@ function step(dt, time) {
       for (let p = 0; p < P; p++) {
         // 鼠标捕食者冷却远短于 AI：人控制时是「划过就吃」，
         // 若沿用 AI 那套几十秒的冷却，整个玩法就完全没手感。
-        const cdMs = p === baseP ? MOUSE_FEED_MS : params.feedCooldown * 1000;
+        const cdMs = p === baseP ? mouseFeedMs() : params.feedCooldown * 1000;
         if (time - predFeedAt[p] < cdMs) continue;
         const q = p * 3;
         if (segDist2(pos[k], pos[k + 1], predPrev[q], predPrev[q + 1], predPos[q], predPos[q + 1]) >= catchR2) continue;
@@ -2520,8 +2649,8 @@ function step(dt, time) {
         respawnAt[i] = time + 1000;   // 1 秒后重新出生
         birthAt[i] = -Infinity;
         stamina[i] = 0; sprintUntil[i] = 0;
-        // 被吃掉 → 拖尾立即消失。否则「死亡点 → 1 秒后的重生点」之间会留一条长线。
-        trailAmt[i] = 0;
+        // 被吃掉 → 不再产生新尾迹（已有的粒子会按寿命自己淡出）
+        trailNextAt[i] = Infinity; birdTrailP[i] = 0;
         if (resting[i]) endRest(i, time, true);   // 从草地上摘掉，别一直占着容量
         break;
       }
@@ -2758,89 +2887,61 @@ function render(now) {
   aCol.needsUpdate = true;
   aSiz.needsUpdate = true;
 
-  // ---- 爆发拖尾 ----
-  // 尾巴用指数平滑追头部：稳态落后量 ≈ 速度 × TRAIL_TAU，所以爆发越快拖尾越长；
-  // 起爆时尾巴贴住身体、从零开始拉开，结束后自然淡出（不再瞬移）。
+  // ---- 加速尾迹：沿实际航迹撒独立粒子（见文件上方「加速尾迹」的说明）----
+  // 鸟与捕食者共用 emitTrail，只有「怎么判定在加速」不同：
+  //   鸟     → 瞬时速度超出巡航节奏的量（受惊提速 / 爆发冲刺都算），爆发期直接拉满；
+  //   捕食者 → 加速度尖峰。
+  // 两边都先过一道「快起慢落」包络把尖峰摊成约半秒窗口，再按个体节流撒点；
+  // 撒下之后位置/朝向就冻结，不会再跟着实体走，所以转弯会自然弯曲成弧。
   tmpTrail.setHSL(0.928, 0.9, 0.62);
-  const tailK = 1 - Math.exp(-dt / TRAIL_TAU);
-  const fadeDown = Math.exp(-dt / 0.08);
-  const riseUp = Math.min(1, dt * 14);
-  const arrowW = params.arrowSize;
-  let tc = 0;
+  const bR = tmpTrail.r, bG = tmpTrail.g, bB = tmpTrail.b;
+  const pR = tmpTrailPred.r, pG = tmpTrailPred.g, pB = tmpTrailPred.b;
+  const trailBaseW = params.arrowSize * 0.42;
+  const cruiseRef = currentPace;   // step 里算好的本帧巡航速度
+  const birdRise = 1 - Math.exp(-dt / 0.035);
+  const birdFall = 1 - Math.exp(-dt / 0.34);
   for (let i = 0; i < n; i++) {
+    if (caught[i]) continue;
     const k = i * 3;
-    const dashing = !caught[i] && now < sprintUntil[i];
-    if (dashing) {
-      if (trailAmt[i] < 0.06) {                 // 刚起爆：尾巴贴住身体，避免拖出一条长线
-        trailTail[i * 2] = pos[k];
-        trailTail[i * 2 + 1] = pos[k + 1];
-      }
-      trailAmt[i] = Math.min(1, trailAmt[i] + riseUp);
-      const tx = trailTail[i * 2], ty = trailTail[i * 2 + 1];
-      trailTail[i * 2] = tx + (pos[k] - tx) * tailK;
-      trailTail[i * 2 + 1] = ty + (pos[k + 1] - ty) * tailK;
-    } else if (trailAmt[i] > 0.002) {
-      trailAmt[i] *= fadeDown;
-      // 收尾时尾巴也往回缩：否则鸟继续飞、尾巴钉在原地，会拖出一条越拉越长的残留线
-      const bx = trailTail[i * 2], by = trailTail[i * 2 + 1];
-      const kk = 1 - Math.exp(-dt / 0.12);
-      trailTail[i * 2] = bx + (pos[k] - bx) * kk;
-      trailTail[i * 2 + 1] = by + (pos[k + 1] - by) * kk;
-    } else {
-      trailAmt[i] = 0;
-      continue;
-    }
-    if (trailAmt[i] <= 0.02 || tc >= MAX_TRAILS) continue;
-    const o = tc * 3;
-    trHead[o] = pos[k]; trHead[o + 1] = pos[k + 1]; trHead[o + 2] = 0;
-    trTail[o] = trailTail[i * 2]; trTail[o + 1] = trailTail[i * 2 + 1]; trTail[o + 2] = 0;
-    trCol[o] = tmpTrail.r; trCol[o + 1] = tmpTrail.g; trCol[o + 2] = tmpTrail.b;
-    // 常态会有十几到上百只同时爆发，拖尾不能抢戏：细一点、淡一点，
-    // 只做「速度感」的暗示，不画成一条实线。
-    trWid[tc] = arrowW * 0.72;
-    trAlp[tc] = trailAmt[i] * 0.62;
-    tc++;
+    const sp = Math.sqrt(vel[k] * vel[k] + vel[k + 1] * vel[k + 1]);
+    // 巡航附近不撒；只有明显提速（受惊 / 爆发）才进入发射窗口
+    const over = (sp - cruiseRef * 1.08) / (cruiseRef * 0.60);
+    let target = over > 0 ? Math.min(1, over) : 0;
+    if (now < sprintUntil[i]) target = 1;
+    birdTrailP[i] += (target - birdTrailP[i]) * (target > birdTrailP[i] ? birdRise : birdFall);
+    if (birdTrailP[i] <= 0.13) continue;
+    if (now < trailNextAt[i]) continue;
+    // 间隔带随机抖动：整群同时爆发时不会在同一处堆成一条实线
+    trailNextAt[i] = now + 22 + Math.random() * 18;
+    emitTrail(pos[k], pos[k + 1], vel[k], vel[k + 1], now,
+      TRAIL_LIFE_BIRD, TRAIL_LEN_BIRD, trailBaseW, bR, bG, bB);
   }
 
-  // ---- 捕食者拖尾：由加速度驱动 ----
-  // 加速度越大 → 尾巴越长、越亮；几乎匀速时完全不出现。
-  // 这样它只在扑击起步、急转、从巡游切回追击这几下「闪现」，平时是干净的。
+  // 捕食者：加速度驱动。加速度是尖峰式的（扑击起步只有两三帧），
+  // 所以先用「快起慢落」包络把它摊成约半秒的窗口，再从窗口里匀速撒粒子。
   const trailPN = predCountNow();   // 含鼠标捕食者：手划得快时它也会留下尾迹
   if (trailPN > 0) {
-    for (let p = 0; p < trailPN && tc < MAX_TRAILS; p++) {
-      // 加速度是尖峰式的（扑击起步只有两三帧），所以这里用「快起慢落」包络：
-      // 冲上去 30ms 就到，落下来要 0.4s——一次冲刺能留下约半秒可见的尾巴，
-      // 否则尾迹还没亮就灭了，看起来就像没生效。
+    const predW = predLeg() * 0.34;
+    for (let p = 0; p < trailPN; p++) {
       const target = Math.min(1, predAccel[p] / PRED_TRAIL_REF);
       const kEnv = target > predTrailP[p] ? (1 - Math.exp(-dt / 0.03)) : (1 - Math.exp(-dt / 0.40));
       predTrailP[p] += (target - predTrailP[p]) * kEnv;
-      const power = predTrailP[p];
-      const on = power > 0.18;   // 约等于加速度 > 8：匀速直线与普通续航转向不出拖尾
-      const want = on ? Math.min(1, (power - 0.18) / 0.5) : 0;
-      const wasOff = predTrailAmt[p] < 0.02;   // 上一帧还没拖尾 → 本次从身体重新拉起
-      predTrailAmt[p] += (want - predTrailAmt[p]) * (1 - Math.exp(-dt / (want > predTrailAmt[p] ? 0.05 : 0.30)));
-      if (predTrailAmt[p] <= 0.02) { predTrailAmt[p] = 0; continue; }
-      const hx2 = predPos[p * 3], hy2 = predPos[p * 3 + 1];
-      if (wasOff) {   // 尾巴贴住身体，否则会用上一次拖尾的旧尾巴点，瞬间拉出一条长线
-        predTrailTail[p * 2] = hx2; predTrailTail[p * 2 + 1] = hy2;
-      }
-      // 尾巴的长度也随加速度变化：加速越猛，跟随时间常数越大 → 尾巴越长
-      const tk = 1 - Math.exp(-dt / (0.02 + 0.22 * power));
-      predTrailTail[p * 2] += (hx2 - predTrailTail[p * 2]) * tk;
-      predTrailTail[p * 2 + 1] += (hy2 - predTrailTail[p * 2 + 1]) * tk;
-      const o = tc * 3;
-      trHead[o] = hx2; trHead[o + 1] = hy2; trHead[o + 2] = 0;
-      trTail[o] = predTrailTail[p * 2]; trTail[o + 1] = predTrailTail[p * 2 + 1]; trTail[o + 2] = 0;
-      trCol[o] = tmpTrailPred.r; trCol[o + 1] = tmpTrailPred.g; trCol[o + 2] = tmpTrailPred.b;
-      trWid[tc] = predLeg() * 0.5;
-      trAlp[tc] = predTrailAmt[p] * 0.9;
-      tc++;
+      if (predTrailP[p] <= 0.18) continue;      // 匀速直线与普通续航转向不出尾迹
+      if (now < predTrailNextAt[p]) continue;
+      predTrailNextAt[p] = now + 14 + Math.random() * 10;
+      const q = p * 3;
+      emitTrail(predPos[q], predPos[q + 1], predVel[q], predVel[q + 1], now,
+        TRAIL_LIFE_PRED, TRAIL_LEN_PRED, predW, pR, pG, pB);
     }
   }
-  trailGeo.instanceCount = tc;
-  if (tc > 0) {
-    aTrHead.needsUpdate = true; aTrTail.needsUpdate = true;
-    aTrCol.needsUpdate = true; aTrWid.needsUpdate = true; aTrAlp.needsUpdate = true;
+
+  trailMat.uniforms.uTime.value = now;      // 顶点着色器用绝对时间算 age
+  trailGeo.instanceCount = MAX_TRAILS;      // 恒定：过期粒子在顶点着色器里被裁掉
+  if (trailDirty) {
+    aTrPos.needsUpdate = true; aTrDir.needsUpdate = true; aTrCol.needsUpdate = true;
+    aTrBirth.needsUpdate = true; aTrLife.needsUpdate = true;
+    aTrLen.needsUpdate = true; aTrWid.needsUpdate = true;
+    trailDirty = false;
   }
 
   // 捕食者：GPU 属性更新 + 威胁圈跟随相机
@@ -2864,7 +2965,7 @@ function render(now) {
       }
       // 鼠标捕食者：冷却、体色都按玩家驾驶的那套处理（更亮的金橙，一眼分得清）
       const isMouse = mouseHunter && p === PN - 1;
-      const cdMs = isMouse ? MOUSE_FEED_MS : cdNormal;
+      const cdMs = isMouse ? mouseFeedMs() : cdNormal;
       const k = p * 3;
       ring.position.set(predPos[k], predPos[k + 1], predPos[k + 2]);
       ring.quaternion.copy(camera.quaternion);
@@ -3081,6 +3182,19 @@ window.FlockLab = {
   get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
   get count() { return activeCount; },
   get paused() { return !!params.paused; },
+  get nbrCap() { return dbgNbrCap || NEIGHBOR_CAP; },
+  get sepCap() { return sepCapFor(activeCount); },
+  set sepCap(v) { dbgSepCap = Math.max(0, Math.round(v)); return sepCapFor(activeCount); },
+  // 局部密度（颜色色阶）的分位数：验证色相是否铺满青蓝→紫，而不是卡在一处。
+  get localDenStats() {
+    const v = [];
+    for (let i = 0; i < activeCount; i++) if (!caught[i] && !resting[i]) v.push(localDen[i]);
+    if (!v.length) return null;
+    v.sort((a, b) => a - b);
+    const q = (f) => +v[Math.min(v.length - 1, (v.length * f) | 0)].toFixed(3);
+    return { n: v.length, p05: q(0.05), p25: q(0.25), p50: q(0.5), p75: q(0.75), p95: q(0.95) };
+  },
+  set nbrCap(v) { dbgNbrCap = Math.max(0, Math.round(v)); return dbgNbrCap || NEIGHBOR_CAP; },
   get velocities() { return Array.from(vel.slice(0, activeCount * 3)); },
   get renderVelocities() { return Array.from(rVel.slice(0, activeCount * 3)); },
   get predatorCount() { return params.predatorOn ? activeP : 0; },
@@ -3216,13 +3330,27 @@ window.FlockLab = {
     const sum = grass.reduce((a, g) => a + inFieldArea(g, g.R, bd, 900), 0);
     return +(sum / (2 * bd.hx * 2 * bd.hy)).toFixed(3);
   },
-  get maxTrailSpan() {
-    let m = 0;
-    for (let i = 0; i < trailGeo.instanceCount; i++) {
-      const dx = trHead[i * 3] - trTail[i * 3], dy = trHead[i * 3 + 1] - trTail[i * 3 + 1];
-      m = Math.max(m, Math.hypot(dx, dy));
+  // 尾迹粒子的「历史长度」：沿航迹最老那颗到最新那颗的距离。
+  // 转弯时它应该明显大于首尾直线距离（说明粒子是沿弧线铺开的，不是一条直线）。
+  get trailStats() {
+    const now = performance.now();
+    let live = 0, oldest = 0;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < MAX_TRAILS; i++) {
+      const age = (now - trBirth[i]) / Math.max(1, trLife[i]);
+      if (age < 0 || age >= 1) continue;
+      live++;
+      if (age > oldest) oldest = age;
+      const x = trPos[i * 2], y = trPos[i * 2 + 1];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
     }
-    return +m.toFixed(2);
+    return {
+      live, oldestAge: +oldest.toFixed(2),
+      spanX: live ? +(maxX - minX).toFixed(2) : 0,
+      spanY: live ? +(maxY - minY).toFixed(2) : 0,
+      capacity: MAX_TRAILS
+    };
   },
   // 体色与冷却状态：g 分量 0.30=深橙（随时能扑），0.78=浅橙黄（刚吃饱）
   get predatorColors() {
@@ -3245,13 +3373,18 @@ window.FlockLab = {
       accel: +predAccel[p].toFixed(1), power: +predTrailP[p].toFixed(2), amt: +predTrailAmt[p].toFixed(2)
     }));
   },
+  // 最近生成的几颗粒子：用来验证「每颗粒子位置固定、朝向是生成瞬间的航向」
   get trailSample() {
+    const now = performance.now();
     const out = [];
-    for (let i = 0; i < Math.min(3, trailGeo.instanceCount); i++) {
+    for (let k = 0; k < Math.min(4, MAX_TRAILS); k++) {
+      const i = (trailCursor - 1 - k + MAX_TRAILS * 2) % MAX_TRAILS;
+      const age = (now - trBirth[i]) / Math.max(1, trLife[i]);
       out.push({
-        head: [+trHead[i * 3].toFixed(2), +trHead[i * 3 + 1].toFixed(2)],
-        tail: [+trTail[i * 3].toFixed(2), +trTail[i * 3 + 1].toFixed(2)],
-        w: +trWid[i].toFixed(3), a: +trAlp[i].toFixed(3)
+        pos: [+trPos[i * 2].toFixed(2), +trPos[i * 2 + 1].toFixed(2)],
+        dir: [+trDir[i * 2].toFixed(2), +trDir[i * 2 + 1].toFixed(2)],
+        age: +age.toFixed(2),
+        len: +trLen[i].toFixed(2), wid: +trWid[i].toFixed(3)
       });
     }
     return out;
