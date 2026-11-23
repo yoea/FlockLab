@@ -10,6 +10,11 @@ export class FlockAudio {
     this.enabled = false;
     this.muted = false;
     this.outputConnected = false;
+    this.suspendedByVisibility = false;
+    // 静音是「用户意图」，必须跨刷新记住。否则刷新时 enable() 会擅自开声，
+    // 看起来就像「明明静音了还有声音」。
+    this.mutedPref = false;
+    try { this.mutedPref = localStorage.getItem('flocklab.audio.muted') === '1'; } catch (e) {}
     this.lastSprint = 0; this.sprintWindow = 0; this.sprintCount = 0;
     this.lastPred = 0;   this.predWindow = 0;   this.predCount = 0;
     this.lastBirth = 0;  this.birthWindow = 0;  this.birthCount = 0;
@@ -18,6 +23,59 @@ export class FlockAudio {
     this.lastSprintDur = 0;
     this.total = { sprint: 0, predate: 0, birth: 0, land: 0, takeoff: 0 };
     this.music = null;   // 由构造函数末尾创建（音乐与音效共用同一套音频上下文）
+    // 切到后台 / 页面被隐藏：主动断开并挂起。浏览器标签页静音由浏览器负责，
+    // 但 AudioContext 自己仍在 running、音乐调度器仍每 25ms 排音符——一旦静音
+    // 被解除或静音的是别的标签，声音就会继续漏出来。这里从源头掐掉。
+    document.addEventListener('visibilitychange', () => this.handleVisibility());
+    addEventListener('pagehide', () => {
+      if (this.ctx) this.ctx.suspend().catch(() => {});
+    });
+  }
+
+  // 唯一的音频出口。所有层（事件音 fxBus、音乐 bus）最终都汇到 master → destination，
+  // 所以只要这一个开关断开，任何声音都不可能绕过到达扬声器。
+  connectOutput() {
+    if (!this.master || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.master.gain.cancelScheduledValues(t);
+    this.master.gain.value = this.p.master;
+    this.master.disconnect();
+    this.master.connect(this.ctx.destination);
+    this.outputConnected = true;
+  }
+  disconnectOutput() {
+    if (!this.master || !this.ctx) return;
+    this.master.gain.cancelScheduledValues(this.ctx.currentTime);
+    this.master.gain.value = 0;
+    this.master.disconnect();
+    this.outputConnected = false;
+  }
+
+  // 所有发声路径的统一闸门：除了「用户没静音」，还要求上下文真的在跑、
+  // 出口真的连着、页面真的可见。任何一环不满足都不排新节点。
+  // 顺带做一次自愈：从后台回来若出口还没接上，且用户并未静音，就接回来。
+  canPlay() {
+    if (!this.enabled || this.muted || !this.ctx || document.hidden || this.suspendedByVisibility) return false;
+    if (this.ctx.state !== 'running') return false;
+    if (!this.outputConnected) this.connectOutput();
+    return true;
+  }
+
+  handleVisibility() {
+    if (!this.ctx) return;
+    if (document.hidden) {
+      this.suspendedByVisibility = true;
+      this.disconnectOutput();
+      this.ctx.suspend().catch(() => {});
+      if (this.music) this.music.pauseScheduler();
+    } else {
+      this.suspendedByVisibility = false;
+      if (this.enabled && !this.muted && !this.mutedPref) {
+        this.ctx.resume().catch(() => {});
+        this.connectOutput();
+        if (this.music) this.music.resumeScheduler();
+      }
+    }
   }
 
   async enable() {
@@ -44,12 +102,24 @@ export class FlockAudio {
       const data = this.noise.getChannelData(0);
       for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
     }
-    await this.ctx.resume();
+    // 先把「允许发声 / 静音」的状态定下来，再尝试 resume。
+    // 关键：resume() 在没有用户手势时会被浏览器拒绝（抛出 NotAllowedError）。
+    // 旧代码先 await resume()，一旦被拒就整段中断，静音偏好没来得及应用——
+    // master 仍连着 destination、增益还是满的，等用户随便点一下触发 resume，
+    // 声音就直接漏出来了，看起来就是「明明静音了还有声音」。
     this.enabled = true;
-    this.muted = false;
     this.p.enabled = true;
-    if (this.music) this.music.start();   // 音乐跟着声音一起开
-    this.refreshButton();
+    if (this.mutedPref) {
+      this.setMuted(true);                       // 先断开出口并挂起，再 resume
+      try { await this.ctx.resume(); } catch (e) {}
+      this.ctx.suspend().catch(() => {});        // resume 成功也要立刻压回去
+    } else {
+      this.muted = false;
+      this.connectOutput();
+      try { await this.ctx.resume(); } catch (e) {}
+      if (this.music) this.music.start();        // 音乐跟着声音一起开
+      this.refreshButton();
+    }
   }
 
   refreshButton() {
@@ -62,26 +132,18 @@ export class FlockAudio {
     btn.setAttribute('aria-label', label);
   }
 
-  // 彻底静音：增益归零 + 断开主输出 + 暂停整个 AudioContext。
-  // 只把增益降到 0 仍可能让已排队的碰撞/琶音节点漏出残响，所以必须同时断开到 destination 的连接。
+  // 彻底静音：主增益归零 + 断开到 destination 的唯一出口 + 挂起整个 AudioContext。
+  // 只把增益降到 0 不够——已排队的节点与后台调度器仍会漏声，所以三件事一起做。
   setMuted(m) {
     this.muted = m;
-    if (this.master) {
-      const t = this.ctx.currentTime;
-      this.master.gain.cancelScheduledValues(t);
-      this.master.gain.value = m ? 0 : this.p.master;
-      if (m) {
-        this.master.disconnect();
-        this.outputConnected = false;
-      } else {
-        this.master.disconnect();
-        this.master.connect(this.ctx.destination);
-        this.outputConnected = true;
-      }
-    }
-    if (this.ctx) {
-      if (m) this.ctx.suspend().catch(() => {});
-      else this.ctx.resume().catch(() => {});
+    this.mutedPref = m;
+    try { localStorage.setItem('flocklab.audio.muted', m ? '1' : '0'); } catch (e) {}
+    if (m) {
+      this.disconnectOutput();
+      if (this.ctx) this.ctx.suspend().catch(() => {});
+    } else if (this.ctx) {
+      this.ctx.resume().catch(() => {});
+      this.connectOutput();
     }
     if (this.music) this.music.mute(m);   // 事件音与音乐共用这一个开关
     this.refreshButton();
@@ -101,7 +163,7 @@ export class FlockAudio {
   //      · 整组串 700Hz 高通，把所有低频浑浊切掉；声像每次随机
   //      · 严格限流：间隔 55ms、每秒最多 12 组，密集爆发时是成串的清脆振翅
   sprint(intensity = 0) {
-    if (!this.enabled || this.muted || !this.p.predatorOn) return;
+    if (!this.canPlay() || !this.p.predatorOn) return;
     const now = performance.now();
     if (now - this.lastSprint < 55) return;
     if (now > this.sprintWindow) { this.sprintWindow = now + 1000; this.sprintCount = 0; }
@@ -163,7 +225,7 @@ export class FlockAudio {
   // 2) 被吃掉：三段音与捕杀动画同步——
   //    0ms 亮核闪光=低频撞击；90ms 内环扩张=撕裂噪声；240ms 外环与火花=低沉余波。
   predate(J) {
-    if (!this.enabled || this.muted || !this.p.predatorOn) return;
+    if (!this.canPlay() || !this.p.predatorOn) return;
     const now = performance.now();
     if (now - this.lastPred < 120) return;
     if (now > this.predWindow) { this.predWindow = now + 1000; this.predCount = 0; }
@@ -219,7 +281,7 @@ export class FlockAudio {
   // 4) 降落：一声很轻的低频「嗒」+ 一下收翅的气流声。
   //    用窄带噪声做收翅气流，保证每只鸟的声音是独立颗粒，多了也不会糊。
   land() {
-    if (!this.enabled || this.muted) return;
+    if (!this.canPlay()) return;
     const now = performance.now();
     if (now - this.lastLand < 110) return;
     if (now > this.landWindow) { this.landWindow = now + 1000; this.landCount = 0; }
@@ -255,7 +317,7 @@ export class FlockAudio {
 
   // 5) 起飞：一小段向上的扑翅声，比降落亮一点，暗示「离地」
   takeoff() {
-    if (!this.enabled || this.muted) return;
+    if (!this.canPlay()) return;
     const now = performance.now();
     if (now - this.lastTake < 110) return;
     if (now > this.takeWindow) { this.takeWindow = now + 1000; this.takeCount = 0; }
@@ -292,7 +354,7 @@ export class FlockAudio {
 
   // 3) 新生：两声短促上行的清亮提示音，捕获后被吃的声音之后响起。
   birth() {
-    if (!this.enabled || this.muted) return;
+    if (!this.canPlay()) return;
     const now = performance.now();
     if (now - this.lastBirth < 90) return;
     if (now > this.birthWindow) { this.birthWindow = now + 1000; this.birthCount = 0; }
@@ -354,7 +416,9 @@ export class FlockMusic {
     this.nextTime = 0;
     this.step = 0;
     this.timer = 0;
-    this.counts = { chord: 0, pulse: 0, shimmer: 0 };
+    this.counts = { chord: 0, pulse: 0, shimmer: 0, bass: 0 };
+    // 捕食者状态（由 main.js 每帧喂标量，音频参数的平滑与写入只在 25ms 调度器里做）
+    this.pred = { active: false, x: 0, heat: 0, dist: 100 };
   }
 
   // 建图：四层都汇到 bus，bus 再进 audio.master——于是右下角那个声音开关
@@ -412,7 +476,55 @@ export class FlockMusic {
     const shimmerGain = ctx.createGain(); shimmerGain.gain.value = 0;
     shimmerGain.connect(bus);
 
-    this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, shimmerGain };
+    // ⑤ bass：若隐若现的低音。常驻 A1(55Hz) 正弦 + 极轻的五度，先过低通把谐波磨圆，
+    //    再由「0.043Hz 呼吸」和「浮现门」两级控制音量。电平只有主层的 1/3 左右，
+    //    绝大多数时候几乎听不到，平均每二十来秒慢慢浮上来十秒左右又沉下去。
+    const bassHp = ctx.createBiquadFilter();
+    bassHp.type = 'highpass'; bassHp.frequency.value = 38; bassHp.Q.value = 0.6;
+    const bassLp = ctx.createBiquadFilter();
+    bassLp.type = 'lowpass'; bassLp.frequency.value = 130; bassLp.Q.value = 0.5;
+    const bassBreath = ctx.createGain(); bassBreath.gain.value = 0.6;
+    const bassGate = ctx.createGain(); bassGate.gain.value = 0.0001;
+    const bassGain = ctx.createGain(); bassGain.gain.value = 0;
+    bassHp.connect(bassLp); bassLp.connect(bassBreath);
+    bassBreath.connect(bassGate); bassGate.connect(bassGain); bassGain.connect(bus);
+    const bassLfo = ctx.createOscillator();
+    bassLfo.type = 'sine'; bassLfo.frequency.value = 0.043;
+    const bassLfoGain = ctx.createGain(); bassLfoGain.gain.value = 0.32;
+    bassLfo.connect(bassLfoGain); bassLfoGain.connect(bassBreath.gain); bassLfo.start();
+    for (const [f, g, det] of [[55, 0.9, -4], [82.41, 0.16, 5]]) {
+      const o = ctx.createOscillator();
+      o.type = 'sine'; o.frequency.value = f; o.detune.value = det;
+      const gg = ctx.createGain(); gg.gain.value = g;
+      o.connect(gg); gg.connect(bassHp); o.start();
+    }
+
+    // ⑥ orbit：捕食者盘旋声。两个微失谐低频正弦 + 一丝窄带气流，过低通后由
+    //    StereoPanner 极慢地左右游走（盘旋感）。音量随「饥饿度」和「离群体的远近」
+    //    变化：进入捕食阶段且逼近时最容易细听出来，饱食巡游时几乎融进背景。
+    const orbitLp = ctx.createBiquadFilter();
+    orbitLp.type = 'lowpass'; orbitLp.frequency.value = 220; orbitLp.Q.value = 0.7;
+    const orbitGain = ctx.createGain(); orbitGain.gain.value = 0;
+    const orbitPan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+    orbitLp.connect(orbitGain);
+    if (orbitPan) { orbitGain.connect(orbitPan); orbitPan.connect(bus); }
+    else orbitGain.connect(bus);
+    for (const [f, g, det] of [[82.41, 0.8, -6], [123.47, 0.22, 7]]) {
+      const o = ctx.createOscillator();
+      o.type = 'sine'; o.frequency.value = f; o.detune.value = det;
+      const gg = ctx.createGain(); gg.gain.value = g;
+      o.connect(gg); gg.connect(orbitLp); o.start();
+    }
+    const air = ctx.createBufferSource();
+    air.buffer = this.a.noise; air.loop = true;
+    const airBp = ctx.createBiquadFilter();
+    airBp.type = 'bandpass'; airBp.frequency.value = 380; airBp.Q.value = 2.4;
+    const airGain = ctx.createGain(); airGain.gain.value = 0.0014;
+    air.connect(airBp); airBp.connect(airGain); airGain.connect(orbitGain);
+    air.start();
+
+    this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, shimmerGain,
+                   bassGain, bassGate, orbitGain, orbitLp, orbitPan };
   }
 
   start() {
@@ -426,14 +538,18 @@ export class FlockMusic {
     this.nextTime = ctx.currentTime + 0.12;
     this.nodes.bus.gain.cancelScheduledValues(ctx.currentTime);
     this.nodes.bus.gain.setTargetAtTime(this.level, ctx.currentTime, 0.9);
-    if (!this.timer) this.timer = setInterval(() => this.tick(), 25);
+    this.resumeScheduler();
   }
 
   stop() {
     this.running = false;
-    if (this.timer) { clearInterval(this.timer); this.timer = 0; }
+    this.pauseScheduler();
     if (this.nodes) this.nodes.bus.gain.setTargetAtTime(0, this.a.ctx.currentTime, 0.12);
   }
+
+  // 静音 / 切后台时连 25ms 的调度器一起停，避免后台空转继续排音符
+  pauseScheduler() { if (this.timer) { clearInterval(this.timer); this.timer = 0; } }
+  resumeScheduler() { if (this.running && !this.timer) this.timer = setInterval(() => this.tick(), 25); }
 
   // 与声音总开关联动：静音时整个音乐总线归零，恢复时把调度指针拉回当前时刻，
   // 否则会把暂停期间「欠下」的音符一次性补排出来。
@@ -441,7 +557,48 @@ export class FlockMusic {
     if (!this.nodes || !this.a.ctx) return;
     const ctx = this.a.ctx;
     this.nodes.bus.gain.setTargetAtTime(m ? 0 : this.level, ctx.currentTime, 0.12);
-    if (!m) { this.nextTime = ctx.currentTime + 0.08; this.step = 0; }
+    if (m) this.pauseScheduler();
+    else { this.nextTime = ctx.currentTime + 0.08; this.step = 0; this.resumeScheduler(); }
+  }
+
+  // main.js 每帧只传 4 个标量，不碰任何 AudioParam；真正的平滑写在 25ms 调度器里。
+  setPredator(active, x, heat, dist) {
+    const p = this.pred;
+    p.active = active; p.x = x; p.heat = heat; p.dist = dist;
+  }
+
+  applyPredator() {
+    const n = this.nodes, ctx = this.a.ctx;
+    if (!n || !this.running) return;
+    const t = ctx.currentTime, p = this.pred;
+    const prox = 1 - Math.min(1, Math.max(0, p.dist / 40));
+    // 电平刻意压得极低：最响也只有主层的 1/3，饱食远巡时几乎为零
+    const target = p.active
+      ? 0.0009 + 0.0032 * (0.35 + 0.65 * p.heat) * (0.35 + 0.65 * prox)
+      : 0;
+    n.orbitGain.gain.setTargetAtTime(target, t, 1.1);
+    n.orbitLp.frequency.setTargetAtTime(170 + 210 * p.heat, t, 1.2);
+    if (n.orbitPan) {
+      // 位置决定大致方位，再叠一个 0.31rad/s 的极慢环绕 = 盘旋
+      const pan = Math.max(-0.8, Math.min(0.8, p.x * 0.45 + Math.sin(t * 0.31) * 0.24));
+      n.orbitPan.pan.setTargetAtTime(pan, t, 0.9);
+    }
+  }
+
+  // 让低音「浮上来一会儿」：3~5s 渐入、保持 5~13s、再 3~6s 沉下去。
+  // 两次之间隔得远，所以不会变成持续的低频嗡鸣。
+  bassFlicker(t) {
+    const g = this.nodes.bassGate.gain;
+    const rise = 3.0 + Math.random() * 2.5;
+    const hold = 5 + Math.random() * 8;
+    const fall = 3.5 + Math.random() * 3;
+    const peak = 0.7 + Math.random() * 0.3;
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(Math.max(0.0001, g.value), t);
+    g.linearRampToValueAtTime(peak, t + rise);
+    g.setValueAtTime(peak, t + rise + hold);
+    g.linearRampToValueAtTime(0.0001, t + rise + hold + fall);
+    this.counts.bass++;
   }
 
   // 音乐整体音量（调试接口可实时调：FlockLab.music.setLevel(0~1.5)，与面板同一刻度）
@@ -467,11 +624,13 @@ export class FlockMusic {
     n.padLp.frequency.setTargetAtTime(760 + 2400 * c, t, 0.5);
     n.pulseGain.gain.setTargetAtTime(0.003 + 0.010 * c, t, 0.4);
     n.shimmerGain.gain.setTargetAtTime(0.0012 + 0.012 * Math.max(0, c - 0.28), t, 0.6);
+    n.bassGain.gain.setTargetAtTime(0.0011 + 0.0028 * c, t, 0.9);
   }
 
   tick() {
     const ctx = this.a.ctx;
     if (!this.running || !ctx || ctx.state !== 'running') return;
+    this.applyPredator();
     // 音乐音量拉到 0 时不再排音符，省掉没必要的振荡器创建（默认 0.4 会正常演奏）
     if (this.level < 0.001) { this.nextTime = ctx.currentTime + 0.1; return; }
     const eighth = 30 / this.bpm;          // 八分音符时长 = (60/bpm)/2
@@ -499,6 +658,8 @@ export class FlockMusic {
       else if (cur === 2 && c < 0.58) idx = 1;
       this.chordIdx = idx;
       this.chord(t, idx, 16 * (30 / this.bpm));
+      // 低音的「若隐若现」：每个双小节节点掷一次骰子，群体越抱团越容易出现
+      if (Math.random() < 0.22 + 0.30 * c) this.bassFlicker(t);
     }
     // 节奏：八分音符按聚集度稀疏化。散开时 dens≈0，几乎完全静音
     const dens = Math.max(0, Math.min(1, (c - 0.1) / 0.62));

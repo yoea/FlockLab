@@ -50,7 +50,7 @@ for (const head of document.querySelectorAll('.card > .card-head')) {
 // ---------------------------------------------------------------- 参数
 // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
 const BOUND = 40;
-const MAX_N = 3000;
+const MAX_N = 10000;
 const MAX_P = 10;
 
 // 出厂默认值：只有点击「重新初始化」才会回到这里。
@@ -146,7 +146,11 @@ function saveParams() {
   }, 120);
 }
 
-let activeCount = params.count;
+// 存档里可能存着一个超过当前 MAX_N 的数量（例如旧版本允许更大的上限）：
+// 直接拿来用会让所有定长 TypedArray 越界读写（读到 undefined 变成 NaN），
+// 所以在这里就夹一次，不让脏存档把仿真带崩。
+let activeCount = Math.max(10, Math.min(MAX_N, Math.round(params.count) || 800));
+params.count = activeCount;
 let activeP = params.predatorCount;
 
 // 高速缓存：位置/速度数组直接作为 GPU 实例属性，CPU 只更新数值，不再算矩阵。
@@ -1377,7 +1381,7 @@ fRules.open();
 
 const fMotion = gui.addFolder('飞行与视野');
 bindNum(fMotion, 'count', 10, MAX_N, 10, '元素数量',
-  '元素总数（默认 800，范围 10~3000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域，3000 只时约 30 FPS）。调少：更容易看清单只的行为。',
+  '元素总数（默认 800，范围 10~10000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要遍历邻域并每帧上传实例数据，万只时主线程最吃紧）。调少：更容易看清单只的行为。',
   (v) => setCount(v));
 bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
   '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
@@ -1507,7 +1511,7 @@ function step(dt, time) {
     let near = false;
     for (let p = 0; p < P; p++) {
       const q = p * 3;
-      if (Math.hypot(groupX - predPos[q], groupY - predPos[q + 1]) < fleeR * 2.5) {
+      if (Math.sqrt((groupX - predPos[q]) * (groupX - predPos[q]) + (groupY - predPos[q + 1]) * (groupY - predPos[q + 1])) < fleeR * 2.5) {
         near = true; break;
       }
     }
@@ -1555,22 +1559,22 @@ function step(dt, time) {
         predTarget[p] = -1;
         let wx = predWp[p * 2], wy = predWp[p * 2 + 1];
         let dwx = wx - ppx, dwy = wy - ppy;
-        if (Math.hypot(dwx, dwy) < 5 || time > predWpUntil[p]) {
+        if (Math.sqrt((dwx) * (dwx) + (dwy) * (dwy)) < 5 || time > predWpUntil[p]) {
           let bx = 0, by = 0;
           for (let tries = 0; tries < 10; tries++) {
             bx = (Math.random() * 2 - 1) * hx * 0.62;
             by = (Math.random() * 2 - 1) * hy * 0.62;
-            const dd = Math.hypot(bx - ppx, by - ppy);
+            const dd = Math.sqrt((bx - ppx) * (bx - ppx) + (by - ppy) * (by - ppy));
             if (dd > Math.min(16, hy * 0.6)) break;
           }
           predWp[p * 2] = wx = bx; predWp[p * 2 + 1] = wy = by;
           predWpUntil[p] = time + 6000 + Math.random() * 5000;
           dwx = wx - ppx; dwy = wy - ppy;
         }
-        const dwl = Math.hypot(dwx, dwy) || 1;
+        const dwl = Math.sqrt((dwx) * (dwx) + (dwy) * (dwy)) || 1;
         let tx = dwx / dwl * curSpeed - pvx;
         let ty = dwy / dwl * curSpeed - pvy;
-        const tl = Math.hypot(tx, ty);
+        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty));
         const capF = PRED_FORCE * 0.55;
         if (tl > capF) { const k = capF / tl; tx *= k; ty *= k; }
         ax += tx; ay += ty;
@@ -1622,12 +1626,12 @@ function step(dt, time) {
         const aimy = pos[m + 1] + uy * tau;
         const aimz = pos[m + 2] + uz * tau;
         let tx = aimx - ppx, ty = aimy - ppy, tz = aimz - ppz;
-        const tl = Math.hypot(tx, ty, tz);
+        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
         if (tl > 1e-6) {
           tx = tx / tl * curSpeed - pvx;
           ty = ty / tl * curSpeed - pvy;
           tz = tz / tl * curSpeed - pvz;
-          const sl = Math.hypot(tx, ty, tz);
+          const sl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
           if (sl > PRED_FORCE) { const k = PRED_FORCE / sl; tx *= k; ty *= k; tz *= k; }
           ax += tx * chase; ay += ty * chase; az += tz * chase;
         }
@@ -1646,7 +1650,7 @@ function step(dt, time) {
       }
 
       // 摆尾力：垂直于当前速度方向施加，让追击轨迹是轻微的蛇形而不是一条直线
-      const vlen = Math.hypot(pvx, pvy) || 1;
+      const vlen = Math.sqrt((pvx) * (pvx) + (pvy) * (pvy)) || 1;
       const weave = Math.cos(predWobble[p]) * wobbleAmp;
       ax += (-pvy / vlen) * weave;
       ay += (pvx / vlen) * weave;
@@ -1681,10 +1685,10 @@ function step(dt, time) {
       az = 0;
 
       // 记下这一帧施加的加速度模长：拖尾的长度与显隐都由它决定。
-      predAccel[p] = Math.hypot(ax, ay);
+      predAccel[p] = Math.sqrt((ax) * (ax) + (ay) * (ay));
 
       let nvx = pvx + ax * dt, nvy = pvy + ay * dt;
-      let sp = Math.hypot(nvx, nvy);
+      let sp = Math.sqrt((nvx) * (nvx) + (nvy) * (nvy));
       if (sp > curSpeed) { const k = curSpeed / sp; nvx *= k; nvy *= k; }
       else if (sp < curSpeed * 0.35 && sp > 1e-6) {
         const want = curSpeed * 0.35;
@@ -1748,7 +1752,7 @@ function step(dt, time) {
       }
       // 目标点要在换位之后读取，否则换位那一帧会立刻又站回原地
       const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
-      const dd = Math.hypot(tx - px, ty - py);
+      const dd = Math.sqrt((tx - px) * (tx - px) + (ty - py) * (ty - py));
 
       // 受惊不再让整片草地同一帧起飞：按「离猛禽多远」给 40~560ms 反应延迟，
       // 近的先跑、远的稍后，和飞行个体的反应延迟是同一套逻辑。
@@ -1772,7 +1776,7 @@ function step(dt, time) {
       // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算。
       // 每帧只放行 1 只站定：否则同帧落地的两只鸟互相都还没 settled，
       // 各自的间距检查都会跳过对方，于是贴在一起站定（minSep 掉到 0.6 的元凶）。
-      if (!settled[i] && dd < 0.55 && Math.hypot(vx, vy) < 1.6
+      if (!settled[i] && dd < 0.55 && Math.sqrt((vx) * (vx) + (vy) * (vy)) < 1.6
           && restSettleThisFrame < REST_SETTLE_SOFT_CAP) {
         const gp = grass[restPatch[i]];
         let tooClose = false;
@@ -1795,7 +1799,7 @@ function step(dt, time) {
           settled[i] = 1;
           restSettleThisFrame++;
           // 站定朝向 = 落地瞬间的渲染朝向：箭头不会突然转过去，也不再随机重设朝向。
-          restAng[i] = Math.hypot(rVel[k], rVel[k + 1]) > 1e-4
+          restAng[i] = Math.sqrt((rVel[k]) * (rVel[k]) + (rVel[k + 1]) * (rVel[k + 1])) > 1e-4
             ? Math.atan2(rVel[k + 1], rVel[k]) : wAng[i];
           // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位
           vel[k] = 0; vel[k + 1] = 0;
@@ -1875,29 +1879,29 @@ function step(dt, time) {
 
     let fx = 0, fy = 0, fz = 0;
     if (count > 0) {
-      let len = Math.hypot(ax, ay, az);
+      let len = Math.sqrt((ax) * (ax) + (ay) * (ay) + (az) * (az));
       if (len > 1e-6) {
         const s = desiredSpeed / len;
         let tx = ax * s - vx, ty = ay * s - vy, tz = az * s - vz;
-        const tl = Math.hypot(tx, ty, tz);
+        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
         if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
         fx += tx * params.alignment; fy += ty * params.alignment; fz += tz * params.alignment;
       }
       let tx = sx / count - px, ty = sy / count - py, tz = sz / count - pz;
-      len = Math.hypot(tx, ty, tz);
+      len = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
       if (len > 1e-6) {
         const s = desiredSpeed / len;
         tx = tx * s - vx; ty = ty * s - vy; tz = tz * s - vz;
-        const tl = Math.hypot(tx, ty, tz);
+        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
         if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
         fx += tx * params.cohesion; fy += ty * params.cohesion; fz += tz * params.cohesion;
       }
     }
-    const sl = Math.hypot(dxs, dys, dzs);
+    const sl = Math.sqrt((dxs) * (dxs) + (dys) * (dys) + (dzs) * (dzs));
     if (sl > 1e-6) {
       const s = desiredSpeed / sl;
       let tx = dxs * s - vx, ty = dys * s - vy, tz = dzs * s - vz;
-      const tl = Math.hypot(tx, ty, tz);
+      const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
       if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
       fx += tx * params.separation; fy += ty * params.separation; fz += tz * params.separation;
     }
@@ -1950,13 +1954,13 @@ function step(dt, time) {
         let ex = px - (predPos[q] + predVel[q] * tau);
         let ey = py - (predPos[q + 1] + predVel[q + 1] * tau);
         let ez = pz - (predPos[q + 2] + predVel[q + 2] * tau);
-        const el = Math.hypot(ex, ey, ez);
+        const el = Math.sqrt((ex) * (ex) + (ey) * (ey) + (ez) * (ez));
         if (el < 1e-6) continue;
         const escapeSpeed = sprinting ? sprintSpeed : maxSpeed;
         let tx = ex / el * escapeSpeed - vx;
         let ty = ey / el * escapeSpeed - vy;
         let tz = ez / el * escapeSpeed - vz;
-        const tl = Math.hypot(tx, ty, tz);
+        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
         const fCap = sprinting ? maxForce * 2 : maxForce;
         if (tl > fCap) { const s = fCap / tl; tx *= s; ty *= s; tz *= s; }
         const w = 1 - d / fleeR;                 // 到半径边缘恰好为 0，避免力突变
@@ -1970,10 +1974,10 @@ function step(dt, time) {
         for (let p = 0; p < P; p++) {
           const q = p * 3;
           const gdx = groupX - predPos[q], gdy = groupY - predPos[q + 1];
-          const gl = Math.hypot(gdx, gdy);
+          const gl = Math.sqrt((gdx) * (gdx) + (gdy) * (gdy));
           if (gl < 1e-6) continue;
           const dx = px - predPos[q], dy = py - predPos[q + 1];
-          const d = Math.hypot(dx, dy);
+          const d = Math.sqrt((dx) * (dx) + (dy) * (dy));
           if (d > fleeR * 2.5) continue;
           const w = Math.max(0, 1 - d / (fleeR * 2.5));
           const strength = params.fleeWeight * w * ripple * 1.6;
@@ -1987,7 +1991,7 @@ function step(dt, time) {
         const s = 0.80 / cascadeCount;
         efx += cfx * s; efy += cfy * s; efz += cfz * s;
       }
-      const mag = Math.hypot(efx, efy, efz);
+      const mag = Math.sqrt((efx) * (efx) + (efy) * (efy) + (efz) * (efz));
       if (mag > 1e-6) {
         fleeDir[k] = efx / mag; fleeDir[k + 1] = efy / mag; fleeDir[k + 2] = efz / mag;
         fleeing[i] = 1;
@@ -2027,7 +2031,7 @@ function step(dt, time) {
       // 速率交给后面的限速器保持，所以看到的是一次急转弯，而不是离墙一大截就停住。
       // 旧版提前 9 个单位用二次曲线猛推，等于在真边界内侧又造了一条软边界。
       const m = 2.6;
-      const turn = Math.max(4, Math.hypot(vx, vy));   // 用速率做转向幅度，转向过程中不衰减
+      const turn = Math.max(4, Math.sqrt((vx) * (vx) + (vy) * (vy)));   // 用速率做转向幅度，转向过程中不衰减
       const sgn = wallTurn[i] || 1;
       const band = (d) => Math.min(1, Math.max(0, d) / m);
       if (px > hx - m && vx > 0) {
@@ -2137,7 +2141,7 @@ function step(dt, time) {
         // 赶路：朝落点直飞，速度随剩余距离收敛（远处接近巡航速度，近处慢慢落）
         const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
         const dx = tx - pos[k], dy = ty - pos[k + 1];
-        const dd = Math.hypot(dx, dy) || 1e-4;
+        const dd = Math.sqrt((dx) * (dx) + (dy) * (dy)) || 1e-4;
         const want = Math.min(paceSpeed, Math.max(1.1, dd * 2.2));
         const wx = dx / dd * want, wy = dy / dd * want;
         const kk = 1 - Math.exp(-dt / 0.10);
@@ -2152,13 +2156,13 @@ function step(dt, time) {
         vel[k + 2] = 0;
       }
       pos[k] += vel[k] * dt; pos[k + 1] += vel[k + 1] * dt;
-      const rsp = Math.hypot(vel[k], vel[k + 1]);
+      const rsp = Math.sqrt((vel[k]) * (vel[k]) + (vel[k + 1]) * (vel[k + 1]));
       speedSum += rsp; keSum += 0.5 * rsp * rsp;
       continue;
     }
     let vx = vel[k] + acc[k] * dt;
     let vy = vel[k + 1] + acc[k + 1] * dt;
-    let sp = Math.hypot(vx, vy);
+    let sp = Math.sqrt((vx) * (vx) + (vy) * (vy));
     const sprinting = time < sprintUntil[i];
     // 速度上限：爆发 > 受惊 > 巡航节奏，直接取目标值（不做加速度积分），
     // 起爆即可提速、威胁解除即刻降到巡航。
@@ -2229,7 +2233,7 @@ function step(dt, time) {
         const q = p * 3;
         if (segDist2(pos[k], pos[k + 1], predPrev[q], predPrev[q + 1], predPos[q], predPos[q + 1]) >= catchR2) continue;
         const rvx = vx - predVel[q], rvy = vy - predVel[q + 1];
-        const vrel = Math.max(0.5, Math.hypot(rvx, rvy));
+        const vrel = Math.max(0.5, Math.sqrt((rvx) * (rvx) + (rvy) * (rvy)));
         const J = Math.pow(vrel, 1.2) / predNorm;
         audio.predate(J);
         spawnBurst(pos[k], pos[k + 1], 0, time);
@@ -2267,7 +2271,7 @@ function step(dt, time) {
     else {
       // Vicsek 有序参量：把每只飞行中的鸟的方向单位化后相加，
       // 乱飞时互相抵消（φ→0），整群同向时叠加（φ→1）。
-      const sp = Math.hypot(vel[k], vel[k + 1]);
+      const sp = Math.sqrt((vel[k]) * (vel[k]) + (vel[k + 1]) * (vel[k + 1]));
       if (sp > 0.05) { dirX += vel[k] / sp; dirY += vel[k + 1] / sp; dirN++; }
     }
     // 参考点必须是用质心（cx 此时还是坐标总和，需要除以 aliveN），
@@ -2275,7 +2279,7 @@ function step(dt, time) {
     const dx = pos[k] - groupX, dy = pos[k + 1] - groupY;
     spread += dx * dx + dy * dy;
   }
-  orderParam = dirN > 0 ? Math.hypot(dirX, dirY) / dirN : 0;
+  orderParam = dirN > 0 ? Math.sqrt((dirX) * (dirX) + (dirY) * (dirY)) / dirN : 0;
   waveStartMax = Math.max(waveStartMax, waveStart);
   waveEndMax = Math.max(waveEndMax, waveEnd);
 
@@ -2357,9 +2361,11 @@ function setStat(id, v) {
 
 let last = performance.now();
 let fps = 60, fpsAcc = 0, fpsFrames = 0, hudTimer = 0;
+const perf = { step: 0, prep: 0, draw: 0 };
 
 function render(now) {
   requestAnimationFrame(render);
+  const pT0 = performance.now();
   const rawDt = (now - last) / 1000;
   last = now;
   const dt = Math.min(rawDt, 0.035);
@@ -2367,6 +2373,7 @@ function render(now) {
   if (fpsAcc > 0.5) { fps = fpsFrames / fpsAcc; fpsAcc = 0; fpsFrames = 0; }
 
   if (!params.paused) step(dt, now);
+  const pT1 = performance.now();
 
   // 音乐跟着群体状态走：聚集度决定和声厚度与节奏密度，
   // 正在爆发的比例决定和声是否被「压」下去一点（最多一个半音）。
@@ -2377,6 +2384,15 @@ function render(now) {
     const cMusic = 0.18 + 0.82 * Math.max(0, Math.min(1, (BOUND * 1.2 - groupRms) / (BOUND * 0.55)));
     const tension = Math.min(1, sprintingCount / Math.max(24, activeCount * 0.04));
     music.update(cMusic, tension, dt);
+    // 捕食者盘旋声的输入：位置归一化到声像、饥饿度、离群体的距离（用第一只即可，
+    // 多只时取代表）。每帧只传标量，AudioParam 的平滑与写入在 25ms 调度器里完成。
+    if (params.predatorOn && activeP > 0) {
+      const bd = bounds2D();
+      const dx = predPos[0] - groupX, dy = predPos[1] - groupY;
+      music.setPredator(true, predPos[0] / Math.max(1, bd.hx), predHeat[0], Math.sqrt(dx * dx + dy * dy));
+    } else {
+      music.setPredator(false, 0, 0, 100);
+    }
   }
 
   view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
@@ -2629,7 +2645,9 @@ function render(now) {
     } else b.sparks.visible = false;
   }
 
+  const pT2 = performance.now();
   renderer.render(scene, camera);
+  const pT3 = performance.now();
 
   fxFlash.sprint = Math.max(0, fxFlash.sprint - dt * 2.6);
   fxFlash.birth = Math.max(0, fxFlash.birth - dt * 2.6);
@@ -2681,6 +2699,12 @@ function render(now) {
     $('hPredFx').className = 'dot' + (fxOn && fxFlash.predate > 0.35 ? ' pred' : '');
     $('hBirthFx').className = 'dot' + (fxOn && fxFlash.birth > 0.35 ? ' birth' : '');
   }
+  // 帧内分段耗时（EMA 平滑）：step=Boids 仿真、prep=着色/平滑与实例数据上传、draw=渲染提交。
+  // 两个 performance.now() 每段的开销在微秒级，不影响帧率；FlockLab.perf 可读。
+  const w = 0.05;
+  perf.step += ((pT1 - pT0) - perf.step) * w;
+  perf.prep += ((pT2 - pT1) - perf.prep) * w;
+  perf.draw += ((pT3 - pT2) - perf.draw) * w;
 }
 
 addEventListener('resize', () => {
@@ -2911,10 +2935,26 @@ window.FlockLab = {
   get predatorDrawCount() { return predGeo.instanceCount; },
   get muted() { return audio.muted; },
   music,
+  get perf() {
+    return {
+      step: +perf.step.toFixed(2), prep: +perf.prep.toFixed(2), draw: +perf.draw.toFixed(2),
+      total: +(perf.step + perf.prep + perf.draw).toFixed(2),
+      fps: +fps.toFixed(1), count: activeCount
+    };
+  },
   get musicState() {
     return {
       running: music.running, c: +music.smooth.toFixed(3), tension: +music.tension.toFixed(3),
-      gain: music.nodes ? +music.nodes.bus.gain.value.toFixed(4) : 0, ...music.counts
+      gain: music.nodes ? +music.nodes.bus.gain.value.toFixed(4) : 0,
+      bassLayer: music.nodes ? {
+        gate: +music.nodes.bassGate.gain.value.toFixed(3),
+        gain: +music.nodes.bassGain.gain.value.toFixed(5)
+      } : null,
+      orbitLayer: music.nodes ? {
+        gain: +music.nodes.orbitGain.gain.value.toFixed(5),
+        pan: music.nodes.orbitPan ? +music.nodes.orbitPan.pan.value.toFixed(3) : null
+      } : null,
+      ...music.counts
     };
   },
   get audioState() { return audio.ctx ? audio.ctx.state : null; },
