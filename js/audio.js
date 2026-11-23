@@ -14,7 +14,9 @@ export class FlockAudio {
     // 静音是「用户意图」，必须跨刷新记住。否则刷新时 enable() 会擅自开声，
     // 看起来就像「明明静音了还有声音」。
     this.mutedPref = false;
-    try { this.mutedPref = localStorage.getItem('flocklab.audio.muted') === '1'; } catch (e) {}
+    // v2：v40 之前这个 key 存过实验用的静音状态，会让人「刷新后一直是静音」。
+    // 换 key 等于一次性重置为「默认开声」，之后用户的静音选择照常记住。
+    try { this.mutedPref = localStorage.getItem('flocklab.audio.muted.v2') === '1'; } catch (e) {}
     this.lastSprint = 0; this.sprintWindow = 0; this.sprintCount = 0;
     this.lastPred = 0;   this.predWindow = 0;   this.predCount = 0;
     this.lastBirth = 0;  this.birthWindow = 0;  this.birthCount = 0;
@@ -138,7 +140,7 @@ export class FlockAudio {
   setMuted(m) {
     this.muted = m;
     this.mutedPref = m;
-    try { localStorage.setItem('flocklab.audio.muted', m ? '1' : '0'); } catch (e) {}
+    try { localStorage.setItem('flocklab.audio.muted.v2', m ? '1' : '0'); } catch (e) {}
     if (m) {
       this.disconnectOutput();
       if (this.ctx) this.ctx.suspend().catch(() => {});
@@ -376,49 +378,74 @@ export class FlockAudio {
     }
   }
 
-  // 6) 捕食者加速：和鸟的「高频振翅颗粒」完全不同的音色——
-  //    低频气流「呼——」+ 一声短促下行的锐利嘶鸣，像猛禽收翅俯冲。
-  //    只在加速度包络由低冲高时触发一次（main.js 里做边沿检测 + 每只限流）。
+  // 6) 捕食者加速：刻意做成完全不同、而且一听就知道「猛禽冲过来了」的音色。
+  //    鸟的加速是高频、细碎的振翅颗粒；这一条走「锐鸣 + 气流 + 低频落地感」，
+  //    三个成分同时出现，所以哪怕音乐垫底也切得出来：
+  //      ① 锐鸣：两只微失谐锯齿（±9 音分）从 1.5kHz 快速滑到 0.6kHz，过带通提亮 → 像猛禽叫
+  //      ② 气流：噪声带通 900→240Hz → 收翅切开空气的「唰」
+  //      ③ 落地感：95→52Hz 正弦短促下坠 → 冲刺的「推背感」
+  //    只在加速度包络由低冲高时触发一次（main.js 做边沿检测 + 每只 400ms 限流）。
   predDash(amp) {
     if (!this.canPlay()) return;
     const now = performance.now();
-    if (now - this.lastDash < 150) return;
+    if (now - this.lastDash < 220) return;
     if (now > this.dashWindow) { this.dashWindow = now + 1000; this.dashCount = 0; }
-    if (this.dashCount >= 4) return;
+    if (this.dashCount >= 3) return;
     this.lastDash = now; this.dashCount++;
     this.total.dash = (this.total.dash || 0) + 1;
 
     const ctx = this.ctx, t = ctx.currentTime;
-    const a = Math.max(0.15, Math.min(1, amp));
+    const a = Math.max(0.25, Math.min(1, amp));
 
-    // 气流：窄带噪声从 700Hz 扫到 180Hz，0.22s；冲得越猛越响
+    // ① 锐鸣（主体：音高与时长都随机，避免每次一模一样）
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 2.6;
+    const f0 = (1380 + Math.random() * 260) * (0.9 + a * 0.2);
+    bp.frequency.setValueAtTime(f0, t);
+    bp.frequency.exponentialRampToValueAtTime(f0 * 0.42, t + 0.17);
+    const g1 = ctx.createGain();
+    g1.gain.setValueAtTime(0.0001, t);
+    g1.gain.exponentialRampToValueAtTime(0.050 + 0.030 * a, t + 0.014);
+    g1.gain.exponentialRampToValueAtTime(0.0001, t + 0.20);
+    bp.connect(g1); g1.connect(this.fxBus);
+    for (const det of [-9, 9]) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.detune.value = det;
+      o.frequency.setValueAtTime(f0, t);
+      o.frequency.exponentialRampToValueAtTime(f0 * 0.42, t + 0.17);
+      o.connect(bp);
+      o.start(t); o.stop(t + 0.22);
+    }
+
+    // ② 气流
     const src = ctx.createBufferSource();
     src.buffer = this.noise;
-    const bp = ctx.createBiquadFilter();
-    bp.type = 'bandpass'; bp.Q.value = 0.9;
-    bp.frequency.setValueAtTime(720 + Math.random() * 180, t);
-    bp.frequency.exponentialRampToValueAtTime(170, t + 0.22);
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(0.030 + 0.026 * a, t + 0.03);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
-    src.connect(bp); bp.connect(g); g.connect(this.fxBus);
-    src.start(t, Math.random() * 0.06, 0.28);
-
-    // 嘶鸣：锯齿波下滑，带一点失真感；频率随机，避免每只一模一样
-    const o = ctx.createOscillator();
-    o.type = 'sawtooth';
-    const f = 780 + Math.random() * 260;
-    o.frequency.setValueAtTime(f, t + 0.01);
-    o.frequency.exponentialRampToValueAtTime(f * 0.42, t + 0.16);
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass'; lp.frequency.value = 2600; lp.Q.value = 1.1;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 160; hp.Q.value = 0.6;
+    const nb = ctx.createBiquadFilter();
+    nb.type = 'bandpass'; nb.Q.value = 0.8;
+    nb.frequency.setValueAtTime(900 + Math.random() * 160, t);
+    nb.frequency.exponentialRampToValueAtTime(240, t + 0.24);
     const g2 = ctx.createGain();
-    g2.gain.setValueAtTime(0.0001, t + 0.01);
-    g2.gain.exponentialRampToValueAtTime(0.016 + 0.014 * a, t + 0.03);
-    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.19);
-    o.connect(lp); lp.connect(g2); g2.connect(this.fxBus);
-    o.start(t + 0.01); o.stop(t + 0.2);
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(0.034 + 0.020 * a, t + 0.03);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+    src.connect(nb); nb.connect(hp); hp.connect(g2); g2.connect(this.fxBus);
+    src.start(t, Math.random() * 0.06, 0.3);
+
+    // ③ 低频落地感
+    const lo = ctx.createOscillator();
+    lo.type = 'sine';
+    lo.frequency.setValueAtTime(96, t);
+    lo.frequency.exponentialRampToValueAtTime(52, t + 0.16);
+    const g3 = ctx.createGain();
+    g3.gain.setValueAtTime(0.0001, t);
+    g3.gain.exponentialRampToValueAtTime(0.040 + 0.022 * a, t + 0.012);
+    g3.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    lo.connect(g3); g3.connect(this.fxBus);
+    lo.start(t); lo.stop(t + 0.2);
   }
 
   // 3) 新生：两声短促上行的清亮提示音，捕获后被吃的声音之后响起。

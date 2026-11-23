@@ -67,10 +67,8 @@ function mouseFeedMs() {
 // 速度只用于箭头朝向与音效冲击量（位置完全由光标决定，没有速度上限），
 // 夹到 60 是为了不让甩鼠标时音效爆表。
 const MOUSE_VMAX = 60;
-// 每只鸟只跟「最近的 7 只」打交道（拓扑式邻域，Ballerini 2008 测椋鸟约 7 只）：
-// 不是看见多少算多少，而是按距离由近到远取满 7 个就停。这既符合真实鸟群的注意分配，
-// 也让单帧配对量恒定在 7n（5 万只 = 35 万对），不再随密度平方级上升。
-const NEIGHBOR_CAP = 7;
+// 注意力：v41 起不再限制邻居数——对齐 / 聚合 / 分离都取视野半径内的**全部**同伴，
+// 即最原始的 Boids 涌现规则（v31~v40 的「只注意最近 7 只」已移除，见 step 里邻域扫描）。
 // 分段耗时探针（FlockLab.perf 可读）：定位「哪一段吃掉了这一帧」比猜有用。
 const perfParts = { grid: 0, loop: 0, stats: 0, color: 0 };
 
@@ -111,7 +109,7 @@ const DEFAULTS = {
   // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
   grassOn: true,
   // 屏幕边缘穿越：开=墙不存在（环面平移，飞出对侧回来）；关=墙变实体（反弹）
-  wrapEdges: true
+  wrapEdges: false
 };
 // 运行时参数：先从 localStorage 恢复上次的调整结果，没有存档才用默认值。
 const params = { ...DEFAULTS, enabled: false, paused: false };
@@ -734,15 +732,10 @@ const bgMat = new THREE.ShaderMaterial({
       vec3 col = base + (cool * c1 + violet * c2) * breathe
                + vec3(0.0034, 0.0021, 0.0013) * warm * 0.85;
 
-      // 星点：高频格子里挑极少数（0.6%）点亮，各自相位闪烁，按格子大小给不同亮度
-      vec2 gp = p * 42.0 + vec2(11.0, 7.0);
-      vec2 gi = floor(gp);
-      float rnd = hash(gi);
-      if (rnd > 0.994) {
-        float tw = 0.55 + 0.45 * sin(uTime * (0.8 + rnd * 40.0) + rnd * 97.0);
-        float star = smoothstep(0.40, 0.0, length(fract(gp) - 0.5)) * tw;
-        col += vec3(0.42, 0.58, 0.95) * star * 0.052;
-      }
+      // 极淡的斜向光带：一层沿对角线缓慢漂移的宽条，纯低频、没有任何高频闪烁
+      float band = sin((p.x * 0.75 + p.y * 0.55) * 1.6 - uTime * 0.05);
+      band = smoothstep(0.55, 1.0, band) * 0.9 + smoothstep(0.75, 1.0, band) * 0.5;
+      col += vec3(0.0016, 0.0026, 0.0052) * band * (0.7 + 0.3 * core);
 
       col *= 0.66 + 0.34 * core;               // 暗角：四周压暗，主体更突出
       gl_FragColor = vec4(col, 1.0);
@@ -1578,15 +1571,25 @@ audio.refreshButton();
 // 这两个按钮自己会处理手势，跳过以免「刚点开启又被 toggle 静音」。
 function unlockAudio(e) {
   const t = e && e.target;
-  if (t && t.closest && t.closest('#audioBtn')) return;
-  if (audio.enabled) {
-    if (audio.ctx && audio.ctx.state !== 'running' && !audio.muted) audio.ctx.resume().catch(() => {});
-    for (const ev of ['pointerdown', 'keydown', 'touchstart']) removeEventListener(ev, unlockAudio);
-    return;
+  if (t && t.closest && t.closest('#audioBtn')) return;   // 开关自己处理，别抢它的点击
+  if (!audio.enabled) { audio.enable().catch(() => {}); return; }
+  if (audio.muted) return;                                // 用户主动静音：不动它
+  if (!audio.ctx) return;
+  // 浏览器要求「用户手势」才能出声：第一次手势前 ctx 一定是 suspended。
+  // 只有真的跑起来了才摘监听——早先无论成功与否都摘，导致第一次点击刚好落在
+  // 手势无效的时机（例如滚轮/纯 mousemove 前后）就再也唤不醒，表现就是「刷新后一直没声音」。
+  if (audio.ctx.state !== 'running') {
+    audio.ctx.resume().catch(() => {});
   }
-  audio.enable().catch(() => {});
+  if (audio.ctx.state === 'running') {
+    audio.connectOutput();
+    if (audio.music && !audio.music.running) audio.music.start();
+    audio.refreshButton();
+    for (const ev of ['pointerdown', 'pointerup', 'click', 'keydown', 'touchstart', 'wheel'])
+      removeEventListener(ev, unlockAudio);
+  }
 }
-for (const ev of ['pointerdown', 'keydown', 'touchstart']) {
+for (const ev of ['pointerdown', 'pointerup', 'click', 'keydown', 'touchstart', 'wheel']) {
   addEventListener(ev, unlockAudio, { passive: true });
 }
 audio.enable().catch(() => {});
@@ -1857,20 +1860,8 @@ let cellFill = new Int32Array(0);
 const cellItems = new Int32Array(MAX_N);
 // 邻域扫描的 9 个格：自己格 → 四邻 → 四角。
 const NBR_OFF = [0, 0, 1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 1, -1, -1, 1, -1, -1];
-// 除自己格以外的 8 个方位，供轮转取样用（顺序与 NBR_OFF 后 8 项一致）。
-const RING_OFF = [1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 1, -1, -1, 1, -1, -1];
 // 局部密度（颜色）用同一套 9 格，但只读每格的计数、不遍历成员。
 const DEN_OFF = NBR_OFF;
-// 每帧推进的轮转游标：让「注意力 7 只」不会永远全部来自自己格。
-// 为什么必须轮转：只按「自己格优先、取满 7 只就停」时，实测 800 只就有 78%、
-// 3000 只有 90% 的鸟，7 个邻居全部来自自己所在的那一格（边长 = 感知半径）。
-// 后果是三个叠加的毛病：
-//   ① 聚合力的质心落在自己格中心 → 整群被拽进一个个方块里，聚成一坨；
-//   ② 分离力只看得到格内最近的几只，挤到极近时 1/d² 权重爆炸 → 一坨被炸开；
-//   ③ 炸开后格内不足 7 只、又能看到邻格 → 聚合力把它拉回来。
-// v33 只写了这段说明、没真正实现轮转；v34 补齐：自己格保底 + 其余 8 格按
-// (鸟序号 + 帧号) 错位轮转，配合下面分离力的连续幅值，掐掉「聚→散→聚」极限环。
-let scanTick = 0;
 // 本帧最近一对个体的间距²（只统计 sepRange 内的）：用来验证「鸟不再叠在一起」。
 // 期望值 > 0.02（间距 0.14 以上）；若趋近 0 就是分离力在近距离失效了。
 let minPairD2 = Infinity;
@@ -1879,12 +1870,12 @@ const nearD2A = new Float32Array(MAX_N);
 // 每只鸟每帧最多扫多少个格内成员（含被距离检查筛掉的）。按数量分档：
 // 每帧总成本 ≈ 扫描量 × 鸟数，5 万只时必须收紧。800 只扫 18 个已经覆盖全部近邻。
 let dbgSepCap = 0;   // 调试用：覆盖扫描配额（0 = 用默认分档）
+// 每帧每只鸟最多扫多少个候选。它**不是**注意力上限，只是防炸帧的安全阀：
+// 视野内全部邻居都要算，配额必须远大于真实邻居数（默认 800 只、密集成团时约 250~350）。
+// 数量越大格子里的成员越多，所以按数量分档收紧；真被截断时最先丢的是邻格远端的成员。
 function sepCapFor(n) {
-  // 上限 1 万只后扫描预算更宽裕：多扫几个候选，分离才看得到真正贴身的那几只
-  // （de3717e 是「感知范围内全部」，v31 固定 7 只后正是漏掉近邻导致重叠）。
-  return dbgSepCap || (n > 5000 ? 14 : n > 2000 ? 18 : 24);
+  return dbgSepCap || (n > 5000 ? 90 : n > 2000 ? 110 : 130);
 }
-let dbgNbrCap = 0;   // 调试用：覆盖注意力上限（0 = 用 NEIGHBOR_CAP）
 // 密度归一化基准：3×3 格里的活跃个体数。群体归拢后默认 800 只实测
 // p50 ≈ 115 只、p95 ≈ 200 只 / 9 格，取 224（= 160 × 1.4）让 p50 落在 0.5、
 // p95 落在 0.9，青蓝→紫整条色阶铺得开（用 70/110 时中位以上全部顶格 1.0）。
@@ -1893,10 +1884,12 @@ const LOCAL_DEN_K = 160;
 // ---------------------------------------------------------------- 模拟
 function step(dt, time) {
   const n = activeCount;
-  scanTick++;                                   // 邻域轮转：每帧换一批方位
   minPairD2 = Infinity;                         // 本帧「最近一对」的间距²（验证不重合）
-  const cell = params.perception;
-  const per2 = cell * cell;
+  // 网格边长取感知半径的 1/1.4：3×3 格覆盖 2.14 倍感知半径，仍然「一定覆盖全部邻居」
+  // （鸟在自己格的任意角落都够），但扫描量从 2.9 倍感知面积降到 1.5 倍——
+  // 去掉 7 只上限后每只鸟要看视野内全部同伴，这个比值直接决定单帧耗时。
+  const cell = params.perception / 1.4;
+  const per2 = params.perception * params.perception;
   const sep2 = params.separationRange * params.separationRange;
   // 分离权重恢复 de3717e 的纯 1/d²（不做软化）：贴近时权重按 1/d² 陡增，
   // 拥挤度 crowd 随之趋近 1 → 满力推开。v33 加的 ε 软化把峰值从上百压到 ~20，
@@ -1926,8 +1919,6 @@ function step(dt, time) {
   const predNorm = Math.pow(predSpeed, 1.2);
   const sprintSpeed = maxSpeed * params.sprintFactor;
   const catchR2 = Math.pow(catchRadius(), 2);
-  // 拓扑式邻域：每只鸟只取最近的 7 只（见 NEIGHBOR_CAP），单帧配对量 = 7n。
-  const neighborCap = dbgNbrCap || NEIGHBOR_CAP;
   const sepCap = sepCapFor(n);   // 只跟数量有关，每帧算一次
   // 长程归拢半径按数量开方放大（800 只时就是 FLOCK_KEEP_R），夹在 12~60：
   // 太小在数量大时会把群体压成实心球，太大就等于没有这条力。
@@ -2157,6 +2148,15 @@ function step(dt, time) {
       }
       az = 0;
 
+      // 实体墙时的提前避让（与鸟同一套逻辑，力度小一点：猛禽冲得猛，拐太早追不上猎物）
+      if (!params.wrapEdges) {
+        const m = 8;
+        if (ppx > hx - m) { const k = (ppx - (hx - m)) / m; ax -= k * k * 18; }
+        else if (ppx < -hx + m) { const k = ((-hx + m) - ppx) / m; ax += k * k * 18; }
+        if (ppy > hy - m) { const k = (ppy - (hy - m)) / m; ay -= k * k * 18; }
+        else if (ppy < -hy + m) { const k = ((-hy + m) - ppy) / m; ay += k * k * 18; }
+      }
+
       // 记下这一帧施加的加速度模长：拖尾的长度与显隐都由它决定。
       predAccel[p] = Math.sqrt((ax) * (ax) + (ay) * (ay));
 
@@ -2380,39 +2380,23 @@ function step(dt, time) {
     }
     localDen[i] = nearby > denK ? 1 : nearby / denK;
 
-    // ---- 邻域扫描 ----
-    // 两个要点，都是修 v31「编队不稳 / 聚成一坨再炸开」的关键：
-    //  ① 把「注意力」和「分离」拆开。注意力（对齐 / 聚合）只取前 7 只，相当于盯住最近
-    //    的 7 个同伴（椋鸟实测约 6~7 只）；分离却必须看**所有贴近到安全距离内的个体**。
-    //    v31 把两者都限成 7 只：密集时若这 7 只恰好偏在一侧，分离合力就持续偏斜，
-    //    群体被推向一边、撕成几块；块内挤到极近时纯 1/d² 又把块炸开——于是
-    //    「聚成一坨 → 炸开 → 再聚」，有序度在 0.1~0.6 之间来回摆。
-    //    贴身排斥是物理接触，本来就与「注意力上限」无关（真实椋鸟也一样）。
-    //  ② 扫描配额按「已扫描的成员数」算（cand），不是「已接受数」。若按接受数算，
-    //    四角格里那些超出感知半径的成员会不断被跳过、却不消耗配额，5 万只时每只鸟
-    //    要空扫八九百个成员，单帧直接飙到 400ms。
-    // 扫描顺序：自己格 → 四邻 → 四角（四角排在最后，配额先被有效近邻吃掉）。
-    // 两趟配额：自己格先给一小份（保证贴身分离看得到同格最挤的个体），
-    // 其余 8 格按 (鸟序号 + 帧号) 错位轮转，把注意力 7 只分散到不同方位，
-    // 不再让质心被钉在自己格中心。总扫描量仍受 sepCap 约束，性能不变。
-    const selfQuota = (sepCap * 0.45) | 0;
-    const rot = (i + scanTick) & 7;
+    // ---- 邻域扫描（原始 Reynolds 式：视野内全部同伴）----
+    // v31 曾把「注意力」限成最近的 7 只（Ballerini 2008 的拓扑邻域），代价是：
+    // 密集时这 7 只常常全在自己那一格里，聚合质心被钉在格心、群体被拽成一个个方块，
+    // 挤到极近时纯 1/d² 又把方块炸开，于是「聚成一坨 → 炸开 → 再聚」反复横跳。
+    // v41 去掉这条上限：对齐 / 聚合 / 分离全部用**视野半径内的所有个体**，
+    // 即最原始的 Boids 涌现规则。配对量随密度平方级上升，所以保留一个
+    // 「每帧最多扫多少个候选」的安全阀（sepCap，按数量分档），它只是防炸帧，
+    // 在默认 800 只时远大于真实邻居数，等于没有上限。
     let cand = 0;
     scanCells:
-    for (let pass = 0; pass <= 8; pass++) {
-      const r = (rot + pass - 1) & 7;
-      const ox = pass === 0 ? 0 : RING_OFF[r * 2];
-      const oy = pass === 0 ? 0 : RING_OFF[r * 2 + 1];
-      const cx = ix + ox, cy = iy + oy;
+    for (let pass = 0; pass < 9; pass++) {
+      const cx = ix + NBR_OFF[pass * 2], cy = iy + NBR_OFF[pass * 2 + 1];
       if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) continue;
       const c = cy * gridW + cx;
       const b1 = cellEnd[c];
-      const localCap = pass === 0 ? selfQuota : sepCap;
       for (let b = cellStart[c]; b < b1; b++) {
-        if (cand >= localCap) {
-          if (pass === 0) break;      // 自己格配额用完，接着扫邻格
-          break scanCells;            // 总配额用完
-        }
+        if (cand >= sepCap) break scanCells;
         cand++;
         const j = cellItems[b];
         if (j === i || caught[j]) continue;
@@ -2421,16 +2405,14 @@ function step(dt, time) {
         const d2 = dx * dx + dy * dy + dz * dz;
         if (d2 > per2 || d2 < 1e-8) continue;
 
-        // 前 7 只：对齐与聚合
-        if (count < neighborCap) {
-          count++;
-          sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
-          ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
-          asp2 += vel[m] * vel[m] + vel[m + 1] * vel[m + 1] + vel[m + 2] * vel[m + 2];
-          if (P > 0 && params.infoCascade && fleeing[j]) {
-            cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
-            cascadeCount++;
-          }
+        // 对齐与聚合：视野内每一只都算
+        count++;
+        sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
+        ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
+        asp2 += vel[m] * vel[m] + vel[m + 1] * vel[m + 1] + vel[m + 2] * vel[m + 2];
+        if (P > 0 && params.infoCascade && fleeing[j]) {
+          cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
+          cascadeCount++;
         }
         if (d2 < sep2) {
           // 近邻主导但峰值有界：纯 1/d² 在 d≈0.15 时权重到 44，一次擦身就能把整块炸开；
@@ -2711,6 +2693,18 @@ function step(dt, time) {
         overGrass[i] = 0;
       }
     }
+    // ---- 实体墙的提前避让 ----
+    // 关掉「屏幕边缘穿越」后墙是实体。只在撞上那一刻反弹的话，鸟会贴着墙一路蹭、
+    // 或者满屏往一个角堆——所以提前一个身位带就开始往外拐：边缘 8 个单位内给一个
+    // 指向场内的推力，越贴越强（非线性：远处几乎不管，临近才明显）。
+    // 它只改方向、不瞬移，所以看起来是「有意识地绕开边缘」。
+    if (!params.wrapEdges) {
+      const m = 8;
+      if (px > hx - m) { const k = (px - (hx - m)) / m; fx -= k * k * 26; }
+      else if (px < -hx + m) { const k = ((-hx + m) - px) / m; fx += k * k * 26; }
+      if (py > hy - m) { const k = (py - (hy - m)) / m; fy -= k * k * 26; }
+      else if (py < -hy + m) { const k = ((-hy + m) - py) / m; fy += k * k * 26; }
+    }
     fx += Math.sin(py * 0.11 + flowT) * params.flow;
     fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
     // 个体游走：每只鸟带一条缓慢漂移的私人航向。邻居越多，群体把它「稳住」的力度越大，
@@ -2947,6 +2941,38 @@ function drawSpark() {
 }
 // 事件计数只在数值变化时弹一下，避免每 0.1s 都闪
 const statLast = {};
+// ---- 近 1 秒事件计数（HUD 用）----
+// 传送 / 爆发 / 休憩这三项在 HUD 上只显示「近 1 秒发生了多少次」，不是累计值：
+// 累计数只涨不掉，看久了就没信息量（跑到 3000 次之后和 3001 次一样）。
+// 实现是 10 个 100ms 的滚动桶：每帧按时间推进桶、把本帧新增的事件数塞进当前桶，
+// 显示时把 10 个桶加起来 → 平滑的「每秒速率」，不会出现整秒跳一下的闪烁。
+const RATE_BUCKETS = 10, RATE_MS = 100;
+const rateBuf = [new Float64Array(RATE_BUCKETS), new Float64Array(RATE_BUCKETS), new Float64Array(RATE_BUCKETS)];
+let rateIdx = 0, rateLast = 0;
+let prevTeleports = 0, prevSprints = 0, prevRests = 0;
+function rateAdvance(now) {
+  if (!rateLast) { rateLast = now; return; }
+  let dt = now - rateLast;
+  if (dt < RATE_MS) return;
+  if (dt > RATE_BUCKETS * RATE_MS) {     // 切标签页回来：整段清空，不补算
+    for (const b of rateBuf) b.fill(0);
+    rateLast = now;
+    return;
+  }
+  while (dt >= RATE_MS) {
+    rateIdx = (rateIdx + 1) % RATE_BUCKETS;
+    for (const b of rateBuf) b[rateIdx] = 0;
+    dt -= RATE_MS;
+  }
+  rateLast = now - dt;                   // 保留余数，长期不漂
+}
+function rateAdd(slot, n) { if (n > 0) rateBuf[slot][rateIdx] += n; }
+function rateSum(slot) {
+  let s = 0;
+  for (let i = 0; i < RATE_BUCKETS; i++) s += rateBuf[slot][i];
+  return Math.round(s);
+}
+
 function setStat(id, v) {
   if (statLast[id] === v) return;
   statLast[id] = v;
@@ -3322,11 +3348,19 @@ function render(now) {
     $('hRadius').textContent = groupRms.toFixed(1);
     $('hNeigh').textContent = avgNeighbors.toFixed(1);
     $('hSprint').textContent = sprintingCount;
+    // 三个速率：把累计量的增量塞进当前 100ms 桶
+    rateAdvance(now);
+    rateAdd(0, teleportCount - prevTeleports);
+    rateAdd(1, sprintCount - prevSprints);
+    rateAdd(2, restSessions - prevRests);
+    prevTeleports = teleportCount; prevSprints = sprintCount; prevRests = restSessions;
     setStat('hCatch', predCatches);
-    setStat('hPort', teleportCount);
-    setStat('hBurst', sprintCount);
-    setStat('hRest', restSessions);
-    $('hRest').title = '累计 ' + restSessions + ' 次 · 当前 ' + restingCount + ' 只在草上';
+    setStat('hPort', rateSum(0));
+    setStat('hBurst', rateSum(1));
+    setStat('hRest', rateSum(2));
+    $('hPort').title = '近 1 秒穿墙 ' + rateSum(0) + ' 次（累计 ' + teleportCount + '）';
+    $('hBurst').title = '近 1 秒爆发 ' + rateSum(1) + ' 次（累计 ' + sprintCount + '）';
+    $('hRest').title = '近 1 秒落地 ' + rateSum(2) + ' 次（累计 ' + restSessions + '）· 当前 ' + restingCount + ' 只在草上';
     $('hFps').textContent = Math.round(fps) + ' FPS';
     $('hSprintFx').className = 'dot' + (fxOn && fxFlash.sprint > 0.35 ? ' sprint' : '');
     $('hPredFx').className = 'dot' + (fxOn && fxFlash.predate > 0.35 ? ' pred' : '');
@@ -3400,7 +3434,6 @@ window.FlockLab = {
   get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
   get count() { return activeCount; },
   get paused() { return !!params.paused; },
-  get nbrCap() { return dbgNbrCap || NEIGHBOR_CAP; },
   get sepCap() { return sepCapFor(activeCount); },
   set sepCap(v) { dbgSepCap = Math.max(0, Math.round(v)); return sepCapFor(activeCount); },
   // 局部密度（颜色色阶）的分位数：验证色相是否铺满青蓝→紫，而不是卡在一处。
@@ -3412,7 +3445,6 @@ window.FlockLab = {
     const q = (f) => +v[Math.min(v.length - 1, (v.length * f) | 0)].toFixed(3);
     return { n: v.length, p05: q(0.05), p25: q(0.25), p50: q(0.5), p75: q(0.75), p95: q(0.95) };
   },
-  set nbrCap(v) { dbgNbrCap = Math.max(0, Math.round(v)); return dbgNbrCap || NEIGHBOR_CAP; },
   get velocities() { return Array.from(vel.slice(0, activeCount * 3)); },
   get renderVelocities() { return Array.from(rVel.slice(0, activeCount * 3)); },
   get predatorCount() { return params.predatorOn ? activeP : 0; },
@@ -3706,6 +3738,8 @@ window.FlockLab = {
   get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
   get audioOutputConnected() { return audio.outputConnected; },
   get soundEvents() { return { ...audio.total }; },
+  // 近 1 秒的传送 / 爆发 / 休憩次数（HUD 上显示的就是这三个）
+  get rates() { return { teleport: rateSum(0), sprint: rateSum(1), rest: rateSum(2) }; },
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
   get cursorHidden() { return document.body.classList.contains('cursor-idle'); },
   get eyeFaded() { return uiBtn.classList.contains('faded'); },

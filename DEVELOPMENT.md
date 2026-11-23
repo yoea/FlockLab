@@ -114,6 +114,12 @@ requestAnimationFrame(render)
 > 违反案例：v37 的「位置级软修正」在积分后直接 `pos[k] += ...`，看起来像瞬移，用户立刻看出来了，v39 整块删除。
 > 唯一例外是**穿墙**（`wrapThroughWall`），它是瞬移，但语义上就是「从对侧出现」，且速度方向不变。
 
+### 3.2b 邻域：v41 起没有「注意力上限」
+
+对齐 / 聚合 / 分离都取视野内**全部**同伴（原始 Boids）。`sepCap` 不是注意力上限，是**防炸帧的安全阀**（130/110/90 按数量分档），正常密度下大于真实邻居数。网格边长是 `视野/1.4` 而不是 `视野`——3×3 仍能覆盖任意位置的视野圆，但扫描面积从 2.9 倍降到 1.5 倍；这一条直接决定单帧耗时，改回 `视野` 会让 800 只的 `step` 从 10ms 涨到 26ms。
+
+实测代价（800 只密集成团）：`step ≈ 10ms`（v40 的 7 只上限是 2.8ms）。这是「原始涌现」必须付的账，别再靠加注意力上限去压——那会重新带回「方块化 / 聚散极限环」。
+
 ### 3.2 防重叠靠「提前推开」，不是「事后补位」
 
 参考 `de3717e`（v30，重叠最少的版本）的做法，当前是三件事的组合：
@@ -164,7 +170,7 @@ requestAnimationFrame(render)
 
 鸟、AI 捕食者、鼠标捕食者**完全相同**，无概率、无反射、无贴边急转（那些等于把墙挪进场内侧）。
 
-面板上的 `params.wrapEdges` 可以把它关掉：关掉时走 `bounceOffWall()`——夹回边界 + 反转越界方向的速度分量（保留 92%），三处调用点（鸟 / AI 捕食者 / 鼠标捕食者）都按 `params.wrapEdges` 分支，鼠标捕食者的**光标目标**在关掉时也要夹进场内（否则它会一直贴着墙追一个场外的点）。`bounds2D()` 只是**显示范围**（正交相机视口），不阻挡运动；活动边界 = 屏幕边界（`view2DFitHalfH()` = `BOUND × VIEW2D_MARGIN`）。
+面板上的 `params.wrapEdges`（**默认 false**）可以打开它：关掉时走 `bounceOffWall()`——夹回边界 + 反转越界方向的速度分量（保留 92%），三处调用点（鸟 / AI 捕食者 / 鼠标捕食者）都按 `params.wrapEdges` 分支，鼠标捕食者的**光标目标**在关掉时也要夹进场内（否则它会一直贴着墙追一个场外的点）。`bounds2D()` 只是**显示范围**（正交相机视口），不阻挡运动；活动边界 = 屏幕边界（`view2DFitHalfH()` = `BOUND × VIEW2D_MARGIN`）。
 
 ### 3.5b 群体归拢（长程）与密度配色
 
@@ -236,7 +242,7 @@ requestAnimationFrame(render)
 
 **性能**：`perf` → `{step, prep, draw, total, fps, count, grid, loop, stats, color}`（毫秒，指数平滑）
 
-**邻域扫描配额**：`sepCap`（get/set）/ `nbrCap`（get/set）
+**邻域扫描配额**：`sepCap`（get/set，只是安全阀；v41 起没有注意力上限）
 
 **群体归拢**：`flockKeep`（`{r, f}`）/ `setFlockKeep(r, f)`——长程归拢的半径与力度，调参用、不持久化
 
@@ -350,7 +356,7 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 
 - 滑块范围见 `js/main.js` 顶部 `RANGES`；数量上限是 `MAX_N = 10000`。
 - 存档键 `flocklab.params.v6`；**出厂默认值变更时提升版本号**，让老用户拿到新默认值。
-- 静音偏好单独存 `localStorage['flocklab.audio.muted']`；状态卡图钉存 `flocklab.hud.pinned`。
+- 静音偏好单独存 `localStorage['flocklab.audio.muted.v2']`（v2：v40 那个 key 存过实验状态，会让老用户「刷新后一直静音」）；状态卡图钉存 `flocklab.hud.pinned`。
 - **音量（`musicLevel` / `fxLevel`）不再持久化、不上面板**：固定满刻度 1.5（v40 起）。它们从 `PERSIST_KEYS` 里移除了，所以老存档里的 0.4 不会被读回来；`FlockLab.music.setLevel()` 仍可临时改（调试用）。
 - 脏存档（超过当前 `MAX_N` 的数量）在读取时夹紧，不必迁移。
 
@@ -374,6 +380,7 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 | v37 | 修「鸟会重合」（v34 分离力的 `sl→0` 回归）；引入 `sepStats` |
 | v38 | **墙视为不存在**：统一穿墙（无概率/无反射/无贴边急转）；只删矩形边框；上限收回 1 万 |
 | v39 | 删位置软修正（瞬移）改回运动方式防重叠（重叠减半）；关草地清争斗态；活动边界铺满屏幕 |
+| v41 | 去掉注意力上限（恢复视野内全邻域）+ `sepCap` 安全阀 + 网格 `视野/1.4`；边缘穿越默认关闭 + 实体墙提前避让；捕食者加速音重做；HUD 传送/爆发/休憩改近 1 秒速率；背景改斜向光带（去闪烁星点）；声音默认开 |
 | v40 | 捕食者加速音效 `predDash`（边沿触发 + 400ms/只限流）、草地落地/起飞改轻快双音；动态背景（fbm 星云 + 星点 + 浮尘，`bgMat.uTime` / `dustMat.uTime` 原来没更新）；`wrapEdges` 开关（关=实体墙反弹）；修「不变紫」：色阶改用 `localDen`（原读 `neighbors/24`，被 7 只注意力上限钉死在 0.29）+ 重定 `LOCAL_DEN_K`；修「散成一坨坨」：穿墙不再镜像、质心/半径改最小映像、加弱长程群体归拢；音量滑块移除、固定满刻度 |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
