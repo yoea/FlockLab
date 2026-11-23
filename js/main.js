@@ -50,6 +50,9 @@ for (const head of document.querySelectorAll('.card > .card-head')) {
 // ---------------------------------------------------------------- 参数
 // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
 const BOUND = 40;
+// 相机视口比活动范围大 2%（留少量边距，缩放/平移时不至于一下就贴边）。
+// 注意 bounds2D() 会引用它，所以必须声明在 bounds2D 之前（否则 TDZ）。
+const VIEW2D_MARGIN = 1.02;
 const MAX_N = 10000;
 const MAX_P = 10;              // AI 捕食者上限（GUI 可调范围）
 // 鼠标捕食者单独占一个数组槽位（索引 = 当前 AI 捕食者数量），所以要多留一格。
@@ -378,11 +381,6 @@ const PRED_SEP_RANGE2 = 6 * 6;
 const PRED_SEP_FORCE = 34;
 const COLLIDE_DIST = 0.55;
 const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
-// 位置软修正的间距下界：连续力模型在「速度 15 + 帧间隔 20~30ms」下必然穿模
-// （一帧位移 0.3~0.45，比身位 0.5 还大），所以积分之后再兜一次底。
-// 取略小于 COLLIDE_DIST 的 0.42，只挡穿模、不干扰正常编队间距。
-const MIN_SEP = 0.5;
-const MIN_SEP2 = MIN_SEP * MIN_SEP;
 const BIRTH_TOTAL_MS = 3200;                    // 新生标记总时长：前 1.8s 亮绿，后 1.4s 渐变
 const BIRTH_SOLID_MS = 1800;
 const BURST_MS = 820;                           // 捕杀动画时长，三段音效与其对齐
@@ -559,7 +557,6 @@ const camera = orthoCam;
 // 视图：平移中心 + 缩放
 const view2D = { x: 0, y: 0, zoom: 1, tZoom: 1 };
 // 相机视野固定：世界半高＝活动范围，短边正好铺满屏幕；留 2% 边距让边界线可见。
-const VIEW2D_MARGIN = 1.02;
 function view2DFitHalfH() { return BOUND * VIEW2D_MARGIN; }
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
@@ -645,11 +642,13 @@ cv.addEventListener('wheel', (e) => {
   view2D.tZoom = Math.max(0.5, Math.min(4, view2D.tZoom * Math.exp(-e.deltaY * 0.0012)));
 }, { passive: false });
 
-// 视野边界（贴合屏幕宽高比）：只作为「显示范围 / 穿墙的对称轴」存在。
-// 不再画矩形边框——墙在视觉上不存在，个体越界就从关于中心对称的位置继续出现。
+// 视野边界（贴合屏幕宽高比）：活动范围直接等于屏幕可视范围（zoom=1 时），
+// 所以个体一直飞到画面边缘才穿墙。原先这里用 BOUND（比相机小 VIEW2D_MARGIN=1.02），
+// 去掉矩形框之后就会看到「离屏幕边界还有一点点距离」。
+// 它同时是显示范围（正交相机视口）与穿墙的对称轴，个体运动不受它限制。
 function bounds2D() {
-  // 高度固定为 BOUND，宽度按显示器比例展开 → 场地铺满全屏
-  return { hx: BOUND * (innerWidth / innerHeight), hy: BOUND };
+  const halfH = view2DFitHalfH();
+  return { hx: halfH * (innerWidth / innerHeight), hy: halfH };
 }
 
 // ---------------------------------------------------------------- 背景点缀
@@ -940,10 +939,16 @@ function landHere(i, g, time) {
   return true;
 }
 // 结束休息（起飞或被惊到）
-// 关掉草地：所有正在休息的立刻起飞（不然它们会定在原地不动）
+// 关掉草地：所有正在休息的立刻起飞（不然它们会定在原地不动），
+// 而且**排队 / 争斗态也一并清掉**——否则关了草地还会飘着几只红鸟在
+// 「争夺」一块已经不存在的草地（休息逻辑随 grassOn 一起关闭）。
 function liftAllResting() {
   const now = performance.now();
-  for (let i = 0; i < activeCount; i++) if (resting[i]) endRest(i, now, false);
+  for (let i = 0; i < activeCount; i++) {
+    if (resting[i]) endRest(i, now, false);
+    contending[i] = 0;
+    restWaitFrom[i] = Infinity;
+  }
 }
 function syncGrassVisibility() {
   grassField.setVisible(params.grassOn);
@@ -1794,18 +1799,15 @@ let scanTick = 0;
 // 本帧最近一对个体的间距²（只统计 sepRange 内的）：用来验证「鸟不再叠在一起」。
 // 期望值 > 0.02（间距 0.14 以上）；若趋近 0 就是分离力在近距离失效了。
 let minPairD2 = Infinity;
-// 「最近那只」的跨趟缓存：邻域扫描在力循环里，位置软修正在下一趟积分循环里，
-// 两趟作用域不同，所以每只鸟的结果要存下来。nearD2A[i] = 0 表示身边没有近邻。
-const nearDxA = new Float32Array(MAX_N);
-const nearDyA = new Float32Array(MAX_N);
+// 每只鸟「最近那只」的间距²：仅供 sepStats 统计重叠比例（不参与物理）。
 const nearD2A = new Float32Array(MAX_N);
-const nearVxA = new Float32Array(MAX_N);
-const nearVyA = new Float32Array(MAX_N);
 // 每只鸟每帧最多扫多少个格内成员（含被距离检查筛掉的）。按数量分档：
 // 每帧总成本 ≈ 扫描量 × 鸟数，5 万只时必须收紧。800 只扫 18 个已经覆盖全部近邻。
 let dbgSepCap = 0;   // 调试用：覆盖扫描配额（0 = 用默认分档）
 function sepCapFor(n) {
-  return dbgSepCap || (n > 20000 ? 10 : n > 2000 ? 14 : 18);
+  // 上限 1 万只后扫描预算更宽裕：多扫几个候选，分离才看得到真正贴身的那几只
+  // （de3717e 是「感知范围内全部」，v31 固定 7 只后正是漏掉近邻导致重叠）。
+  return dbgSepCap || (n > 5000 ? 14 : n > 2000 ? 18 : 24);
 }
 let dbgNbrCap = 0;   // 调试用：覆盖注意力上限（0 = 用 NEIGHBOR_CAP）
 // 密度归一化基准：3×3 格计数 ≈ 4.5 × 格内鸟数。取值让默认 800 只的 p10/p50/p90
@@ -1820,7 +1822,10 @@ function step(dt, time) {
   const cell = params.perception;
   const per2 = cell * cell;
   const sep2 = params.separationRange * params.separationRange;
-  const sepSoft = sep2 * 0.015;  // 分离核软化项：见邻域扫描里 1/(d²+ε) 的说明
+  // 分离权重恢复 de3717e 的纯 1/d²（不做软化）：贴近时权重按 1/d² 陡增，
+  // 拥挤度 crowd 随之趋近 1 → 满力推开。v33 加的 ε 软化把峰值从上百压到 ~20，
+  // 反而让「贴身时推不动」成了重叠的根源之一。
+  const sepSoft = 0;
   // 分离力软饱和尺度：sl 的量纲是 1/距离，除以安全距离让 crowd 对滑杆不敏感。
   const SEP_SAT = 4.0 / params.separationRange;
   // 密度基准随数量线性放大：格数固定时 3×3 计数 ∝ n，固定 70 在 2500 只就全体
@@ -2391,9 +2396,10 @@ function step(dt, time) {
         const a = Math.random() * 6.2831853;
         dxs = Math.cos(a); dys = Math.sin(a); dzs = 0; sl = 1;
       }
-      // 0.42 的底数（原来 0.22）让平衡间距明显大于箭头宽度 0.5——否则分离与聚合
-      // 的平衡点落在 0.6~0.7，视觉上两只鸟就是叠在一起的，看不出「涌现」的间距。
-      const s = desiredSpeed * (0.42 + 0.58 * crowd) / sl;
+      // 0.55 的底数（v37 是 0.42）：远距离就有力推开，接近 de3717e 的恒定满推，
+      // 鸟在贴近之前就被挡开——防重叠靠「提前推开」而不是贴身再补救。
+      // crowd 再随贴近程度加码到满力，同时保留连续性（避免 v34 那种开关式极限环）。
+      const s = desiredSpeed * (0.55 + 0.45 * crowd) / sl;
       let tx = dxs * s - vx * crowd, ty = dys * s - vy * crowd, tz = dzs * s - vz * crowd;
       const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
       if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
@@ -2422,9 +2428,7 @@ function step(dt, time) {
       if (hl > hcap) { const q = hcap / hl; hfx *= q; hfy *= q; }
       fx += hfx; fy += hfy;
     }
-    // 存给下一趟的积分循环做位置软修正（见那里的 MIN_SEP 说明）
-    nearDxA[i] = nearDx; nearDyA[i] = nearDy; nearD2A[i] = nearD2 === Infinity ? 0 : nearD2;
-    nearVxA[i] = nearVx; nearVyA[i] = nearVy;
+    nearD2A[i] = nearD2 === Infinity ? 0 : nearD2;   // sepStats 统计用
 
     // ---- 猎物逃逸：预测威胁点 + 距离平方衰减 + 信息级联 ----
     // 白肌式短时爆发：体力满 + 进入危险范围才触发，持续固定时长后体力清零；
@@ -2660,19 +2664,6 @@ function step(dt, time) {
     keSum += 0.5 * sp * sp;
 
     pos[k] += vx * dt; pos[k + 1] += vy * dt;
-
-    // ---- 位置级软修正：间距下界兜底（防穿模）----
-    // 力模型负责「什么时候想分开」，但速度 15、帧间隔 20~30ms 时一帧就位移
-    // 0.3~0.45，靠转向来不及在身位内停住。所以积分之后把「与最近那只」的间距
-    // 不足 MIN_SEP 的部分沿连线推开 1/4，每帧上限 0.04 单位——视觉上是平滑的
-    // 侧滑（等效约 2 单位/秒），不是瞬移，肉眼看不出改写位置。
-    const nd2 = nearD2A[i];
-    if (nd2 > 1e-10 && nd2 < MIN_SEP2) {
-      const d = Math.sqrt(nd2);
-      const step = Math.min((MIN_SEP - d) * 0.6, 0.12);
-      const nx = nearDxA[i] / d, ny = nearDyA[i] / d;
-      pos[k] += nx * step; pos[k + 1] += ny * step;
-    }
 
     // ---- 穿墙：墙视为不存在 ----
     // 越界后统一从「关于场地中心对称」的位置继续出现（左边偏下飞出 → 右边偏上
@@ -3276,6 +3267,13 @@ window.FlockLab = {
   setMouseHunter(on) { setMouseHunter(!!on); return mouseHunter; },
   // 与 GUI 走同一条路径（改数量 / 开关后同步绘制数量与鼠标槽位），供自动化验证
   setPredatorCount(n) { setPredCount(n); return activeP; },
+  // 同上：开关草地走 GUI 回调的同一条路径（关掉时同步起飞 + 清掉排队/争斗态）
+  setGrassOn(on) {
+    params.grassOn = !!on;
+    syncGrassVisibility();
+    if (!on) liftAllResting();
+    return params.grassOn;
+  },
   setPredatorOn(on) {
     params.predatorOn = !!on;
     if (on) { initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0); }
