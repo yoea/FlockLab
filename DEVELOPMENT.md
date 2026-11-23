@@ -125,7 +125,7 @@ requestAnimationFrame(render)
 参考 `de3717e`（v30，重叠最少的版本）的做法，当前是三件事的组合：
 
 1. **分离权重纯 `1/d²`、不软化**（`sepSoft = 0`）：贴近时权重陡增，`crowd` 随之趋近 1 → 满力推开。
-   > v33 加过 `sepSoft = sep2*0.015`，把贴近时的权重峰值从上百压到 ~20，结果「贴身推不动」，是重叠的主因之一。
+   > v33 加过 `sepSoft = sep2*0.015`，把贴近时的权重峰值从上百压到 –20，结果「贴身推不动」，是重叠的主因之一。
 2. **分离力底数 0.55**（`desiredSpeed * (0.55 + 0.45*crowd) / sl`）：远距离就有力推开，鸟在贴近之前就被挡开。
    > 低底数（0.22 / 0.42）会让鸟一路贴近才补救，来不及。
 3. **贴身碰撞响应**：挤进 `COLLIDE_DIST(0.55)` 时除强推外，把「朝对方去」的速度分量直接掐掉（`kill = -closing/dt * 0.85`，**不受 `maxForce` 限制**）——速度 15、相对速度 30 时靠 22 的转向力要 20 多帧才停得住，期间早穿过去了。
@@ -143,7 +143,7 @@ requestAnimationFrame(render)
 3. **合力一阶低通**（`FSM = 0.55`，约 2 帧时间常数）：只盯 7 只邻居时逐帧合力抖动大，直接积分会让群体来回摆。
 4. **对齐一致性加权**：`agree = |Σv| / sqrt(n·Σv²)`，散乱时对齐力只有约四成、齐飞时才接近满力（否则把方向噪声放大成满力，群体被随机推力搅成块）。
 
-判断指标：`orderParam` 的标准差（不是均值——v30 时 `0.524±0.176`，sd 极大正是抖动）与 `groupRms` 序列的方向翻转次数。健康值：800 只 `order ≈ 0.24~0.35`、sd < 0.12，16 秒内半径只 2~3 次翻转。
+判断指标：`orderParam` 的标准差（不是均值——v30 时 `0.524±0.176`，sd 极大正是抖动）与 `groupRms` 序列的方向翻转次数。健康值：800 只 `order ≈ 0.24–0.35`、sd < 0.12，16 秒内半径只 2–3 次翻转。
 
 ### 3.3 拥挤度用 `maxW`，不要用 `sl`
 
@@ -164,7 +164,7 @@ requestAnimationFrame(render)
 
 `wrapThroughWall(x, y, hx, hy)`：越界后从**对侧同高度**继续出现（右边飞出 → 左边界同 y 处进来），速度方向不变，等价于把场地当环面。
 
-⚠️ **不要改回「关于场地中心对称」**（v38/v39 的写法：`x = -hx; y = -y`）。它会让跨边界的一坨鸟变成两份镜像：已穿过去的一半在 `-y`、还没穿的一半在 `+y`，相距 `2y` 且互不可见，于是每次有鸟群跨边界，整坨就被永久撕成两半。实测 25 秒内 800 只累计穿墙 1500 次（平均每只每 13 秒一次），群体从 1 坨碎成 6~8 坨、RMS 半径涨到 42（≈ 铺满全屏）。纯平移下穿过去的那半只是接着往前飞，顺序不乱，鸟群能完整地穿过去再聚回来。
+⚠️ **不要改回「关于场地中心对称」**（v38/v39 的写法：`x = -hx; y = -y`）。它会让跨边界的一坨鸟变成两份镜像：已穿过去的一半在 `-y`、还没穿的一半在 `+y`，相距 `2y` 且互不可见，于是每次有鸟群跨边界，整坨就被永久撕成两半。实测 25 秒内 800 只累计穿墙 1500 次（平均每只每 13 秒一次），群体从 1 坨碎成 6–8 坨、RMS 半径涨到 42（≈ 铺满全屏）。纯平移下穿过去的那半只是接着往前飞，顺序不乱，鸟群能完整地穿过去再聚回来。
 
 配套：群体质心按**最小映像**累计（`pos - 上一帧 groupX`，超出半场就 ±2hx），`groupRms` 也按最小映像算。否则穿墙那一帧质心会跳到对面，把「群体归拢」的方向整个翻过来。
 
@@ -176,10 +176,10 @@ requestAnimationFrame(render)
 
 两条都是 v40 加的，**彼此独立但容易一起踩坑**：
 
-1. **长程归拢**（`FLOCK_KEEP_R = 18` / `FLOCK_KEEP_F = 14`，见 step 里「群体归拢」一段）：只对离质心超过 18 单位的个体施力，力度随超出量线性增长、上限 1.6 倍系数 × 14。它解决的是「局部规则留不住大群」这个结构性问题——感知半径只有 7 个单位，两坨鸟的间距一超过视野就永久互不可见，强分离又把群体压成一个个结晶小团，整屏散着 5~9 坨。**别试图靠调 `cohesion` 解决**：实测 `cohesion=3.2` 反而碎成 17 坨（聚合越强，结晶越小越硬），`separation` 调小也一样（分离越弱，小坨越紧越容易成形）。
+1. **长程归拢**（`FLOCK_KEEP_R = 18` / `FLOCK_KEEP_F = 14`，见 step 里「群体归拢」一段）：只对离质心超过 18 单位的个体施力，力度随超出量线性增长、上限 1.6 倍系数 × 14。它解决的是「局部规则留不住大群」这个结构性问题——感知半径只有 7 个单位，两坨鸟的间距一超过视野就永久互不可见，强分离又把群体压成一个个结晶小团，整屏散着 5–9 坨。**别试图靠调 `cohesion` 解决**：实测 `cohesion=3.2` 反而碎成 17 坨（聚合越强，结晶越小越硬），`separation` 调小也一样（分离越弱，小坨越紧越容易成形）。
 2. **密度配色**：颜色色阶必须用 `localDen`（3×3 格计数），**不能用 `neighbors[i]`**。`neighbors` 是注意力邻居数、v31 起上限 7，`neighbors/24` 最多 0.29，色相只能到 `0.52 + 0.29×0.4 ≈ 0.64`（蓝绿）——这就是「再怎么聚集也不变紫」的根因，而 `localDen` 当时算了却没人用（死代码）。归一化基准 `LOCAL_DEN_K = 110`（`denK = 110 × 1.4 × max(1, n/800)`），默认 800 只实测 p50 ≈ 0.5、p95 ≈ 0.95。
 
-调这两个数用 `FlockLab.setFlockKeep(r, f)`，判定用 `FlockLab.positions` 做单链接聚类（阈值 6~12）+ `localDenStats` 分位，别凭肉眼。
+调这两个数用 `FlockLab.setFlockKeep(r, f)`，判定用 `FlockLab.positions` 做单链接聚类（阈值 6–12）+ `localDenStats` 分位，别凭肉眼。
 
 ### 3.6 休息逻辑随 `grassOn` 一起开/关
 
@@ -188,7 +188,7 @@ requestAnimationFrame(render)
 ### 3.7 其他约定
 
 - **热路径不新建对象/数组**：`step`/`render` 里禁止 `new`、数组字面量、`Math.hypot`（用 `Math.sqrt`）、闭包。跨趟传数据用模块级 `TypedArray`。
-- **随机化要带个体相位**：任何「定时/重试/错峰」都要叠 `restPhase[i]`（0~1），否则一批个体会在同一秒同步动作。
+- **随机化要带个体相位**：任何「定时/重试/错峰」都要叠 `restPhase[i]`（0–1），否则一批个体会在同一秒同步动作。
 - **软错峰**：每帧放行少量个体（出发 2 只 / 站定 1 只），超出的顺延而不是取消需求。
 - **颜色走调色表**：`palFly`/`palRest`/`sprintPal` 预计算 32×16，运行期不调 `THREE.Color.setHSL`。
 - **存档**：`localStorage['flocklab.params.v6']`；出厂默认值变更时**必须提升版本号**，否则老用户永远拿不到新默认值。
@@ -232,7 +232,7 @@ requestAnimationFrame(render)
 - `minNeighborDist`：瞬时最近一对间距（**仅供参考，会被一对擦身打到 0.01**）
 - `localDenStats` → `{p05...p95}`：局部密度分位，用于判断颜色色阶是否铺开（别全体顶格 1.0）
 
-**草地与休息**：`grassInfo` / `grassRatio`（应恒为 **0.15**）/ `grassBunch`（`frameStartMax`/`frameEndMax` 是真正同帧出发/离场峰值）/ `restingCount` / `restSessions` / `restPhaseStats` / `grassStats` → `{patches[{x,y,R,cap,count,settled}], waiting, contending, resting, evicted, waitMaxMs}`
+**草地与休息**：`restDebug()`（逐只快照：`r` 在休息、`s` 已停稳、`c` 争斗红、`dd` 到落点距离、`tries` 重试次数）/ `grassInfo` / `grassRatio`（应恒为 **0.15**）/ `grassBunch`（`frameStartMax`/`frameEndMax` 是真正同帧出发/离场峰值）/ `restingCount` / `restSessions` / `restPhaseStats` / `grassStats` → `{patches[{x,y,R,cap,count,settled}], waiting, contending, resting, evicted, waitMaxMs}`
 
 **捕食者**：`predatorCount` / `predatorPositions` / `predatorSpeeds` / `predatorCaps` / `predatorCooling` / `predatorTargets` / `catches` / `deadCount` / `respawnDelays` / `catchRadius` / `predShape` / `reaction` / `ringState` / `mouseHunter` / `mousePredator` / `mouseDrawCount`
 
@@ -246,7 +246,7 @@ requestAnimationFrame(render)
 
 **群体归拢**：`flockKeep`（`{r, f}`）/ `setFlockKeep(r, f)`——长程归拢的半径与力度，调参用、不持久化
 
-**音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0~1.5)` / `music.running`
+**音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0–1.5)` / `music.running`
 
 **UI**：`uiHidden` / `eyeFaded` / `hudPinned`
 
@@ -348,7 +348,7 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 
 用 `minNeighborDist`（瞬时最小）判断「有没有重叠」会反复误判——一对瞬时擦身就把它打到 0.01。**用 `sepStats` 的分布**。
 同理「颜色不变紫」要同时看两处：`localDenStats` 的分位（是否全体顶格 1.0 或全体趴底），以及**渲染到底读的是不是 `localDen`**（v40 之前读的是被 7 只上限钉死的 `neighbors`，分位再漂亮也不会变紫）。
-判断「群体散成几坨」也不要用 `groupRms` 或状态卡的「群半径」——单个数字分不清「1 坨大群」和「5 坨小群」。用 `FlockLab.positions` 做单链接聚类数连通块（阈值 6~12，只数 ≥20 只的块）。
+判断「群体散成几坨」也不要用 `groupRms` 或状态卡的「群半径」——单个数字分不清「1 坨大群」和「5 坨小群」。用 `FlockLab.positions` 做单链接聚类数连通块（阈值 6–12，只数 ≥20 只的块）。
 
 ---
 
@@ -380,6 +380,7 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 | v37 | 修「鸟会重合」（v34 分离力的 `sl→0` 回归）；引入 `sepStats` |
 | v38 | **墙视为不存在**：统一穿墙（无概率/无反射/无贴边急转）；只删矩形边框；上限收回 1 万 |
 | v39 | 删位置软修正（瞬移）改回运动方式防重叠（重叠减半）；关草地清争斗态；活动边界铺满屏幕 |
+| v41a | 修「草地上的红鸟左右闪」：① 休息间隔改为按「鸟数 / 草地总容量」自适应（原来固定 20–53 秒，800 只时需求是容量的 4 倍，队列从第一秒就清不空）；② 排队 20 秒进不去就认输褪红、隔一大段再来（不再永久红鸟）；③ 到点速度随距离收敛到 0.35（原来下限 1.1，会冲过落点再掉头，渲染朝向跟着 180° 翻）；④ 绕草地的切向力改连续值，停住时不再每帧翻向 |
 | v41 | 去掉注意力上限（恢复视野内全邻域）+ `sepCap` 安全阀 + 网格 `视野/1.4`；边缘穿越默认关闭 + 实体墙提前避让；捕食者加速音重做；HUD 传送/爆发/休憩改近 1 秒速率；背景改斜向光带（去闪烁星点）；声音默认开 |
 | v40 | 捕食者加速音效 `predDash`（边沿触发 + 400ms/只限流）、草地落地/起飞改轻快双音；动态背景（fbm 星云 + 星点 + 浮尘，`bgMat.uTime` / `dustMat.uTime` 原来没更新）；`wrapEdges` 开关（关=实体墙反弹）；修「不变紫」：色阶改用 `localDen`（原读 `neighbors/24`，被 7 只注意力上限钉死在 0.29）+ 重定 `LOCAL_DEN_K`；修「散成一坨坨」：穿墙不再镜像、质心/半径改最小映像、加弱长程群体归拢；音量滑块移除、固定满刻度 |
 

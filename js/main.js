@@ -256,6 +256,21 @@ const REST_WAIT_FORCE = 10000;     // 排队多久后变红强行驱赶（不限
 const REST_MIN_EVICT_DWELL = 5000; // 可被「礼貌请走」的最短已休时长
 const REST_EVICT_GUARD = 12000;    // 被赶走后的保护期
 const REST_CONTENTION_FADE = 2500; // 抢到位子后争斗色再保留 2.5 秒才褪
+// 一直挤不进去就「放弃这一轮」：清掉争斗红、把下次休息往后推一大截。
+// 否则鸟会在草地边上永远保持红色、每 1~2 秒回来碰一次壁（用户看到的「红鸟一直在闪」）。
+const REST_GIVEUP = 20000;
+// 休息节奏必须跟「草地总容量」匹配：每只鸟平均 40 秒占一个位子，
+// 容量 237 个位子 / 800 只鸟 → 平均每只每 135 秒才轮得上一次。
+// 早先固定写死 20~53 秒，等于需求是容量的 4 倍，排队永远清不空（3000 只时 1300 只在排队）。
+// 草地总容量。它要等 createGrass() 之后才知道（initBoids 在更早就跑了），
+// 所以用一个可写的模块变量，草地建好后写进来再重铺一次休息时刻（见草地那一节）。
+let grassCapTotal = 0;
+function restIntervalMs() {
+  const ratio = activeCount / Math.max(1, grassCapTotal || 1);
+  // 55 秒 × 比值：一次停留均值约 44 秒，乘 55 让整体负载落在容量的八成左右
+  // （留一点余量，排队才不会越积越长）。上限 15 分钟：数量上万时也允许「很久才轮到一次」。
+  return Math.max(20000, Math.min(900000, 55000 * ratio));
+}
 // 落点微调只用「速度积分走过去」，绝不直接写 pos——那一下就是肉眼可见的瞬移。
 // 半径放大到 1.25 仍能保持连续：鸟会花 1~2 秒慢慢走过去，而不是一帧跳过去。
 const REST_NUDGE_MIN = 0.45, REST_NUDGE_MAX = 1.25;
@@ -444,8 +459,9 @@ function initBoids(from, to, isBirth = false) {
     restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
     contending[i] = 0; restWaitFrom[i] = Infinity; restEvictAt[i] = 0;
     rollTraits(i);
-    // 首次「想休息」的时刻铺到 3~35 秒（含个体相位），避免开局一波同时出发
-    restDue[i] = performance.now() + 3000 + Math.random() * 22000 + restPhase[i] * 10000;
+    // 首次「想休息」的时刻按自适应间隔铺开（含个体相位），避免开局一波同时出发
+    const gap0 = restIntervalMs();
+    restDue[i] = performance.now() + 3000 + Math.random() * gap0 + restPhase[i] * gap0 * 0.3;
     caught[i] = 0; respawnAt[i] = 0; fleeing[i] = 0;
   }
 }
@@ -486,7 +502,8 @@ function spawnFar(i, now) {
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
   contending[i] = 0; restWaitFrom[i] = Infinity; restEvictAt[i] = 0;
   rollTraits(i);   // 重生等于换一只新个体：速度脾气、游走相位和作息相位都重新抽
-  restDue[i] = now + 4000 + Math.random() * 20000 + restPhase[i] * 8000;
+  const gapR = restIntervalMs();
+  restDue[i] = now + 4000 + Math.random() * gapR + restPhase[i] * gapR * 0.3;
 }
 
 function initPredators(from, to) {
@@ -933,6 +950,14 @@ function startRest(i, time) {
   if (best < 0) {
     if (restWaitFrom[i] === Infinity) restWaitFrom[i] = time;
     const waited = time - restWaitFrom[i];
+    if (waited > REST_GIVEUP) {
+      // 这一轮认输：褪掉争斗红，隔一大段再来（避免永久红鸟 + 每 1~2 秒撞一次门）
+      contending[i] = 0;
+      restWaitFrom[i] = Infinity;
+      const gap0 = restIntervalMs();
+      restDue[i] = time + gap0 * (0.5 + Math.random() * 0.8) + restPhase[i] * gap0 * 0.2;
+      return;
+    }
     if (waited > REST_WAIT_FORCE) contending[i] = 1;   // 变红：争夺地盘
     if (waited >= REST_WAIT_NUDGE) {
       const force = contending[i] === 1;
@@ -968,8 +993,9 @@ function startRest(i, time) {
   const approach = travel * 1000 + 15000 + restPhase[i] * 3000;
   restApproachUntil[i] = time + approach;
   restUntil[i] = time + approach;              // 到点后会重设成 28~60 秒
-  // 下次出发：20~53 秒 + 个体相位，绝不与同批鸟同步
-  restDue[i] = time + 20000 + Math.random() * 24000 + restPhase[i] * 9000;
+  // 下次出发：按容量的自适应间隔 + 个体相位，绝不与同批鸟同步
+  const gap = restIntervalMs();
+  restDue[i] = time + gap * (0.75 + Math.random() * 0.5) + restPhase[i] * gap * 0.2;
   // 有新的鸟降落到这片草地：已经休息 5~60 秒的老住客有 10% 概率往旁边挪个位置。
   // 关键改动：只登记一个 0~4 秒内的随机「起身时刻」，不立刻 unsettle、也不改朝向，
   // 于是一批老住客不会在同一帧齐刷刷动起来；到点后也只挪半步（见 nearbyRestPoint）。
@@ -1009,7 +1035,8 @@ function landHere(i, g, time) {
   waveStart++;
   restApproachUntil[i] = time + 2500;     // 已经在草地上方，很快就能停稳
   restUntil[i] = time + 2500;
-  restDue[i] = time + 20000 + Math.random() * 24000 + restPhase[i] * 9000;
+  const gap2 = restIntervalMs();
+  restDue[i] = time + gap2 * (0.75 + Math.random() * 0.5) + restPhase[i] * gap2 * 0.2;
   flyLandings++;
   return true;
 }
@@ -1042,15 +1069,28 @@ function endRest(i, time, scared) {
   // 没停稳（还在赶路）或没待够就被赶走，都当作这次没休成，隔几秒重来。
   // 两种重排都叠加个体作息相位，避免一批同时被惊走的鸟又约好一起回来。
   const dwell = wasSettled ? time - restSince[i] : 0;
+  const gap3 = restIntervalMs();
   restDue[i] = (scared && dwell < 5000)
     ? time + 5000 + Math.random() * 9000 + restPhase[i] * 7000
-    : time + 20000 + Math.random() * 24000 + restPhase[i] * 9000;
+    : time + gap3 * (0.75 + Math.random() * 0.5) + restPhase[i] * gap3 * 0.2;
 }
 
 // ---------------------------------------------------------------- 草地
 const grassField = createGrass({ THREE, scene, params, bounds2D });
 const grass = grassField.patches;
 const buildGrass = grassField.build;
+// 草地建好 → 拿到真实总容量 → 把开局用临时值铺的休息时刻按真实节奏重铺一遍。
+// 不这么做的话，开局那一波会在同一分钟里全冲向草地，队列从第一秒就清不空。
+{
+  grassCapTotal = 0;
+  for (const gp of grass) grassCapTotal += gp.cap;
+  const gap = restIntervalMs();
+  const t0 = performance.now();
+  for (let i = 0; i < activeCount; i++) {
+    if (resting[i]) continue;
+    restDue[i] = t0 + Math.random() * gap + restPhase[i] * gap * 0.3;
+  }
+}
 const inFieldArea = grassField.inFieldArea;
 
 // ---------------------------------------------------------------- GPU 箭头
@@ -2303,7 +2343,7 @@ function step(dt, time) {
       // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算。
       // 每帧只放行 1 只站定：否则同帧落地的两只鸟互相都还没 settled，
       // 各自的间距检查都会跳过对方，于是贴在一起站定（minSep 掉到 0.6 的元凶）。
-      if (!settled[i] && dd < 0.55 && Math.sqrt((vx) * (vx) + (vy) * (vy)) < 1.6
+      if (!settled[i] && dd < 0.7 && Math.sqrt((vx) * (vx) + (vy) * (vy)) < 2.2
           && restSettleThisFrame < REST_SETTLE_SOFT_CAP) {
         const gp = grass[restPatch[i]];
         let tooClose = false;
@@ -2666,7 +2706,10 @@ function step(dt, time) {
           const w = 1 - (gd - rr) / 7;          // 0~1，越靠近边缘越强
           if (w <= 0) continue;
           const tx2 = -ny, ty2 = nx;
-          const sgn = (vx * tx2 + vy * ty2) >= 0 ? 1 : -1;   // 往自己正在走的那一侧绕
+          // 往自己正在走的那一侧绕。用「切向速度 / 速率」的连续值而不是 ±1：
+          // 鸟在边缘几乎停住时切向速度≈0，若还按符号硬选边，力会每帧左右翻，看着就是抖。
+          const tv = vx * tx2 + vy * ty2;
+          const sgn = tv / (Math.sqrt((vx) * (vx) + (vy) * (vy)) + 0.8);
           fx += (nx * 9 + tx2 * sgn * 7) * w;
           fy += (ny * 9 + ty2 * sgn * 7) * w;
         }
@@ -2751,7 +2794,9 @@ function step(dt, time) {
         const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
         const dx = tx - pos[k], dy = ty - pos[k + 1];
         const dd = Math.sqrt((dx) * (dx) + (dy) * (dy)) || 1e-4;
-        const want = Math.min(paceSpeed, Math.max(1.1, dd * 2.2));
+        // 速度随剩余距离连续收敛到 0.35：早先下限是 1.1，鸟到了落点还在以 1.1 往前冲，
+        // 一帧就越过靶点、下一帧再掉头回来，于是原地左右抖（渲染朝向跟着 180° 翻）。
+        const want = Math.min(paceSpeed, Math.max(0.35, dd * 3.0));
         const wx = dx / dd * want, wy = dy / dd * want;
         const kk = 1 - Math.exp(-dt / 0.10);
         vel[k] += (wx - vel[k]) * kk;
@@ -3738,6 +3783,26 @@ window.FlockLab = {
   get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
   get audioOutputConnected() { return audio.outputConnected; },
   get soundEvents() { return { ...audio.total }; },
+  // 休息 / 争斗状态的逐只快照：排查「草地上的红鸟左右乱闪」这类问题用。
+  // resting=在去草地的路上或已停稳；settled=真的停稳了；c=争斗红；dd=到落点距离
+  restDebug() {
+    const now = performance.now();
+    const out = [];
+    for (let i = 0; i < activeCount; i++) {
+      if (!resting[i] && !contending[i]) continue;
+      const k = i * 3;
+      const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
+      out.push({
+        i, patch: restPatch[i],
+        x: +pos[k].toFixed(2), y: +pos[k + 1].toFixed(2),
+        vx: +vel[k].toFixed(2), vy: +vel[k + 1].toFixed(2),
+        r: resting[i], s: settled[i], c: contending[i], tries: restTries[i],
+        dd: +Math.sqrt((tx - pos[k]) * (tx - pos[k]) + (ty - pos[k + 1]) * (ty - pos[k + 1])).toFixed(2),
+        since: restSince[i] > 0 ? Math.round(now - restSince[i]) : 0,
+      });
+    }
+    return out;
+  },
   // 近 1 秒的传送 / 爆发 / 休憩次数（HUD 上显示的就是这三个）
   get rates() { return { teleport: rateSum(0), sprint: rateSum(1), rest: rateSum(2) }; },
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
