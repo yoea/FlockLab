@@ -110,6 +110,25 @@
   /* 闲置数秒后隐藏光标，任何鼠标移动 / 按键 / 触摸都会立刻恢复 */
   body.cursor-idle, body.cursor-idle * { cursor: none !important; }
 
+  /* 鼠标捕食者模式：画布上藏掉系统箭头（捕食者本身就是指针），
+     UI 面板上仍是正常指针，所以「变成捕食者期间照样能点击操作」。 */
+  body.mouse-hunter #scene canvas { cursor: none; }
+
+  /* 模式切换的轻提示：下方居中，2.4 秒后淡出，不拦截任何鼠标事件 */
+  #toast {
+    position: fixed; left: 50%; bottom: 26px; z-index: 9;
+    transform: translate(-50%, 10px);
+    padding: 9px 18px; border-radius: 999px;
+    background: rgba(9, 15, 29, 0.72);
+    border: 1px solid var(--line);
+    color: var(--ink); font-size: 12.5px; letter-spacing: 0.05em; white-space: nowrap;
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    opacity: 0; pointer-events: none;
+    transition: opacity .3s ease, transform .3s ease;
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+
   /* 隐藏全部界面后，小眼睛自身也会淡出；晃动鼠标或按键再显现 */
   #uiBtn.faded { opacity: 0; pointer-events: none; }
 

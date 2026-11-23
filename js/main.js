@@ -51,7 +51,17 @@ for (const head of document.querySelectorAll('.card > .card-head')) {
 // 活动范围固定 40（世界半高），宽度按显示器比例推出 → 场地正好铺满全屏，不再提供滑块。
 const BOUND = 40;
 const MAX_N = 50000;
-const MAX_P = 10;
+const MAX_P = 10;              // AI 捕食者上限（GUI 可调范围）
+// 鼠标捕食者单独占一个数组槽位（索引 = 当前 AI 捕食者数量），所以要多留一格。
+// GUI 的「捕食者数量」仍以 MAX_P 为上限，两者互不挤占。
+const MAX_SLOT = MAX_P + 1;
+// 鼠标捕食者的捕食冷却：人控制时移动极快，沿用 AI 那套长冷却会完全吃不到东西。
+// 90ms ≈ 每秒最多 11 只：快速划过鸟群会留下一串小爆发，又不至于一下清空全场
+// （被吃的个体 1 秒后照常重生，数量会自动补回来）。
+const MOUSE_FEED_MS = 90;
+// 速度只用于箭头朝向与音效冲击量（位置完全由光标决定，没有速度上限），
+// 夹到 60 是为了不让甩鼠标时音效爆表。
+const MOUSE_VMAX = 60;
 // 每只鸟只跟「最近的 7 只」打交道（拓扑式邻域，Ballerini 2008 测椋鸟约 7 只）：
 // 不是看见多少算多少，而是按距离由近到远取满 7 个就停。这既符合真实鸟群的注意分配，
 // 也让单帧配对量恒定在 7n（5 万只 = 35 万对），不再随密度平方级上升。
@@ -260,37 +270,53 @@ let restingCount = 0;  // 当前在草地上休息的数量（HUD/调试用）
 let groupRms = 12;
 
 // 捕食者独立数组，与 boid 数组完全隔离，不影响元素数量语义。
-const predPos = new Float32Array(MAX_P * 3);
-const predVel = new Float32Array(MAX_P * 3);
-const rPredVel = new Float32Array(MAX_P * 3);   // 捕食者渲染速度，同样做低通
-const predCol = new Float32Array(MAX_P * 3);
-const predSiz = new Float32Array(MAX_P);
-const predFeedAt = new Float64Array(MAX_P);    // 饱腹冷却时间戳
-const predTarget = new Int16Array(MAX_P);      // 锁定的目标编号，-1 为未锁定
+const predPos = new Float32Array(MAX_SLOT * 3);
+const predVel = new Float32Array(MAX_SLOT * 3);
+const rPredVel = new Float32Array(MAX_SLOT * 3);   // 捕食者渲染速度，同样做低通
+const predCol = new Float32Array(MAX_SLOT * 3);
+const predSiz = new Float32Array(MAX_SLOT);
+const predFeedAt = new Float64Array(MAX_SLOT);    // 饱腹冷却时间戳
+const predTarget = new Int16Array(MAX_SLOT);      // 锁定的目标编号，-1 为未锁定
 predTarget.fill(-1);
-const predLockUntil = new Float64Array(MAX_P); // 锁定到期时间（ms）
-const predPulseAt = new Float64Array(MAX_P);   // 扑击瞬间，用于箭头脉冲
+const predLockUntil = new Float64Array(MAX_SLOT); // 锁定到期时间（ms）
+const predPulseAt = new Float64Array(MAX_SLOT);   // 扑击瞬间，用于箭头脉冲
 predPulseAt.fill(-Infinity);
 // 捕食者当前生效的速度上限（追击 / 冷却巡游切换时直接生效）
-const predCap = new Float32Array(MAX_P);
+const predCap = new Float32Array(MAX_SLOT);
 predCap.fill(params.predSpeed);
 // 冷却期的巡逻：不再用「随机航向 + 碰墙反弹」，而是选一个场地内部的目标点，
 // 朝它滑过去，到点或超时再换——这样吃饱后不会一头扎到墙上反复弹。
-const predWp = new Float32Array(MAX_P * 2);      // 巡逻目标点（世界坐标）
-const predWpUntil = new Float64Array(MAX_P);     // 目标点过期时间
+const predWp = new Float32Array(MAX_SLOT * 2);      // 巡逻目标点（世界坐标）
+const predWpUntil = new Float64Array(MAX_SLOT);     // 目标点过期时间
 // 捕食者拖尾：由「加速度」驱动——加速度越大，尾巴越长越亮；
 // 几乎不加速（匀速直线）时完全不出拖尾，所以它只在扑击、急转时闪现。
-const predAccel = new Float32Array(MAX_P);       // 当帧加速度大小（转向力模长）
-const predTrailP = new Float32Array(MAX_P);      // 平滑后的加速度强度 0~1
-const predTrailAmt = new Float32Array(MAX_P);    // 拖尾强度 0~1
-const predHeat = new Float32Array(MAX_P);        // 饥饿度 0~1：决定警戒圈是暗色（饱食）还是亮色（捕食）
-const predTrailTail = new Float32Array(MAX_P * 2);
+const predAccel = new Float32Array(MAX_SLOT);       // 当帧加速度大小（转向力模长）
+const predTrailP = new Float32Array(MAX_SLOT);      // 平滑后的加速度强度 0~1
+const predTrailAmt = new Float32Array(MAX_SLOT);    // 拖尾强度 0~1
+const predHeat = new Float32Array(MAX_SLOT);        // 饥饿度 0~1：决定警戒圈是暗色（饱食）还是亮色（捕食）
+const predTrailTail = new Float32Array(MAX_SLOT * 2);
 let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即视为「全力冲刺」（实测中位数 12、峰值 64）
 // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
-const predSpdJit = new Float32Array(MAX_P);
-const predWobble = new Float32Array(MAX_P);
-const predWallTurn = new Float32Array(MAX_P);  // 贴边掉头时往哪一侧沿墙拐（±1）
-const predPrev = new Float32Array(MAX_P * 3);  // 上一帧位置，用于「扫掠」碰撞检测
+const predSpdJit = new Float32Array(MAX_SLOT);
+const predWobble = new Float32Array(MAX_SLOT);
+const predWallTurn = new Float32Array(MAX_SLOT);  // 贴边掉头时往哪一侧沿墙拐（±1）
+const predPrev = new Float32Array(MAX_SLOT * 3);  // 上一帧位置，用于「扫掠」碰撞检测
+
+// ---------------------------------------------------------------- 鼠标捕食者
+// 双击画布：光标变成一只完全由人驾驶的捕食者（无速度上限、沿鼠标轨迹走，
+// 箭头朝向 = 光标移动方向）；右键恢复成普通箭头。
+// 它不跑 AI，位置每帧直接朝光标对应的世界坐标追，所以「快慢」全看手。
+let mouseHunter = false;            // 光标是否正在扮演捕食者
+let mouseSlot = -1;                 // 它当前占用的槽位（AI 数量或开关变化时会挪）
+const mouseTgt = { x: 0, y: 0 };    // 光标对应的世界坐标
+let mouseDirX = 1, mouseDirY = 0;   // 最后一次有效移动方向：静止时用它保持箭头朝向
+let lastCX = 0, lastCY = 0;         // 最近一次光标屏幕坐标（双击开场时用来定位）
+
+// 本帧参与物理与渲染的 AI 捕食者数量（鼠标捕食者另加 1，见 predCountNow）。
+function predBaseCount() { return params.predatorOn ? activeP : 0; }
+// 含鼠标捕食者的总数。鼠标永远排在最后一个槽位（= AI 数量），
+// 所以所有 `for (p = 0; p < P; p++)` 的循环天然把它一起算进逃逸、捕食与渲染。
+function predCountNow() { return predBaseCount() + (mouseHunter ? 1 : 0); }
 
 const MAX_FORCE = 14;
 // 捕食者外形：锐角等腰三角形。腰长 = 鸟的 1.4 倍、底 = 0.7 倍，再整体 ×2。
@@ -375,7 +401,8 @@ function spawnFar(i, now) {
     const x = (Math.random() * 2 - 1) * bd.hx * (1 - inset);
     const y = (Math.random() * 2 - 1) * bd.hy * (1 - inset);
     let minD2 = Infinity;
-    for (let p = 0; p < activeP; p++) {
+    const pn = predCountNow();   // 含鼠标捕食者：别让新鸟直接出生在光标底下
+    for (let p = 0; p < pn; p++) {
       const q = p * 3;
       const dx = x - predPos[q], dy = y - predPos[q + 1];
       const d2 = dx * dx + dy * dy;
@@ -441,6 +468,31 @@ const resetBoids = () => {
   predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
   clearBursts();
 };
+// 鼠标捕食者永远占「AI 数量」这个槽位：数量或开关一变就要搬一次。
+// 直接在光标处重建（不搬旧位置），同时重置扫掠用的上一帧点——
+// 否则会从旧槽位的位置拉出一条长线，沿线吃掉一整排鸟。
+function syncMouseSlot() {
+  if (!mouseHunter) { mouseSlot = -1; return; }
+  const slot = predBaseCount();
+  if (mouseSlot === slot) return;
+  mouseSlot = slot;
+  const q = slot * 3;
+  predPos[q] = mouseTgt.x; predPos[q + 1] = mouseTgt.y; predPos[q + 2] = 0;
+  predVel[q] = 0; predVel[q + 1] = 0; predVel[q + 2] = 0;
+  predPrev[q] = predPos[q]; predPrev[q + 1] = predPos[q + 1]; predPrev[q + 2] = 0;
+  predTrailAmt[slot] = 0; predTrailP[slot] = 0; predAccel[slot] = 0;
+  predSiz[slot] = predLeg();
+}
+
+// 统一的「画几只捕食者 + 显示几个警戒圈」同步点。
+// 鼠标捕食者永远排在最后一个槽位（索引 = AI 数量），所以 p < P 就把它一起覆盖了。
+function syncPredDraw() {
+  syncMouseSlot();
+  const P = predCountNow();
+  if (predGeo) predGeo.instanceCount = P;
+  for (let p = 0; p < MAX_SLOT; p++) threatRings[p].visible = p < P;
+  predMesh.visible = P > 0;
+}
 function setPredCount(v) {
   const next = Math.max(1, Math.min(MAX_P, Math.round(v)));
   if (next > activeP) initPredators(activeP, next);
@@ -449,8 +501,8 @@ function setPredCount(v) {
   for (let p = next; p < MAX_P; p++) predTarget[p] = -1;
   // 关键：控制绘制数量的是几何体的 instanceCount，不是 Mesh 的。
   // 之前误写 predMesh.instanceCount 导致减少数量后旧捕食者仍被绘制且不更新（定住）。
-  if (predGeo) predGeo.instanceCount = next;
-  for (let p = 0; p < MAX_P; p++) threatRings[p].visible = params.predatorOn && p < next;
+  // 现在统一走 syncPredDraw()：数量一变，鼠标捕食者的槽位也跟着挪到队尾。
+  syncPredDraw();
   document.getElementById('hPred').textContent = params.predatorOn ? next : '0';
 }
 function setCount(v) {
@@ -1093,7 +1145,8 @@ scene.add(predMesh);
 // 这样既不会「吃饱了圈就消失」，又能在远处一眼读出它现在有没有威胁。
 const ringGeo = new THREE.PlaneGeometry(2, 2);   // 局部坐标 -1~1，正好对应半径 1
 const threatRings = [];
-for (let p = 0; p < MAX_P; p++) {
+// 多造一个：最后一格留给鼠标捕食者（索引 = AI 数量）。
+for (let p = 0; p < MAX_SLOT; p++) {
   const mat = new THREE.ShaderMaterial({
     uniforms: { uAlpha: { value: 0 }, uPhase: { value: Math.random() * 6.283 }, uHeat: { value: 1 } },
     vertexShader: `
@@ -1141,6 +1194,109 @@ for (let p = 0; p < MAX_P; p++) {
   predCol[p * 3] = 0.72; predCol[p * 3 + 1] = 0.15; predCol[p * 3 + 2] = 0.03;
   predSiz[p] = predLeg();
 }
+
+// ---------------------------------------------------------------- 鼠标即是捕食者
+// 双击画布开启：光标变成一只完全由人驾驶的捕食者，位置沿光标轨迹走、
+// 箭头朝向即光标移动方向；右键恢复成普通箭头。
+// 期间左键拖拽平移、点按钮、滚轮缩放全部照旧——只把画布上的系统光标藏起来，
+// UI 面板上仍是正常指针，所以「变成捕食者期间仍然可以操作」。
+function screenToWorld(cx, cy) {
+  const rect = cv.getBoundingClientRect();
+  const scale = (2 * view2DFitHalfH() / view2D.zoom) / Math.max(1, rect.height);
+  return {
+    x: view2D.x + (cx - (rect.left + rect.width * 0.5)) * scale,
+    y: view2D.y - (cy - (rect.top + rect.height * 0.5)) * scale,
+  };
+}
+
+let toastTimer = 0;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+function setMouseHunter(on) {
+  if (on === mouseHunter) return;
+  mouseHunter = on;
+  document.body.classList.toggle('mouse-hunter', on);
+  const slot = predBaseCount();
+  const q = slot * 3;
+  mouseSlot = on ? slot : -1;
+  if (on) {
+    const w = screenToWorld(lastCX, lastCY);
+    // 直接从光标处出现：不要从上一次占用的槽位的旧位置飞过来
+    predPos[q] = w.x; predPos[q + 1] = w.y; predPos[q + 2] = 0;
+    predVel[q] = 0; predVel[q + 1] = 0; predVel[q + 2] = 0;
+    rPredVel[q] = mouseDirX; rPredVel[q + 1] = mouseDirY; rPredVel[q + 2] = 0;
+    predPrev[q] = w.x; predPrev[q + 1] = w.y; predPrev[q + 2] = 0;
+    predFeedAt[slot] = -Infinity;      // 一上线就能捕食
+    predPulseAt[slot] = -Infinity;
+    predTrailAmt[slot] = 0; predTrailP[slot] = 0; predHeat[slot] = 1;
+    predCol[q] = 0.95; predCol[q + 1] = 0.52; predCol[q + 2] = 0.18;
+    predSiz[slot] = predLeg();
+    mouseTgt.x = w.x; mouseTgt.y = w.y;
+    toast('已化身捕食者 · 右键恢复箭头');
+  } else {
+    // 从画面里撤掉：p >= P 的槽位渲染时会被隐藏，这里顺手把尺寸清零
+    predSiz[slot] = 0;
+    toast('已恢复常规箭头');
+  }
+  syncPredDraw();
+}
+
+// 双击画布开启。这里自己判定双击，不监听 dblclick——
+// 双击状态卡的标题时，第一次点击就把卡片折叠、卡片因此变矮移位，
+// 浏览器仍会把第二次点击补成 dblclick，但事件已经落到下面的画布上，
+// 于是「双击状态卡」会误开捕食者。所以要求连续两次「干净点击」都落在画布上。
+let tapAt = 0, tapX = 0, tapY = 0, tapMoved = 0, tapDownAt = 0, tapOnCanvas = false;
+let tapLastX = 0, tapLastY = 0;
+addEventListener('pointerdown', (e) => {
+  lastCX = e.clientX; lastCY = e.clientY;
+  if (e.pointerType === 'touch') return;          // 触屏不参与，避免和双击缩放冲突
+  if (e.button === 2) {                            // 右键：随时退出（capture 阶段，面板上也不漏）
+    if (mouseHunter) setMouseHunter(false);
+    return;
+  }
+  if (e.button !== 0) return;
+  tapDownAt = performance.now(); tapMoved = 0;
+  tapX = e.clientX; tapY = e.clientY;
+  tapOnCanvas = e.target === cv;
+}, true);
+addEventListener('pointermove', (e) => {
+  if (!tapDownAt) return;
+  tapMoved = Math.max(tapMoved, Math.abs(e.clientX - tapX) + Math.abs(e.clientY - tapY));
+}, true);
+addEventListener('pointerup', (e) => {
+  if (e.button !== 0 || !tapDownAt) return;
+  const clean = tapMoved < 8 && performance.now() - tapDownAt < 320;   // 拖拽平移不算点击
+  const onCanvas = tapOnCanvas;
+  tapDownAt = 0;
+  if (!clean || !onCanvas) { tapAt = 0; return; }
+  const now = performance.now();
+  // 两次点击还得落在近处，避免「点一下这里、马上点一下那里」被当成双击
+  const near = Math.abs(e.clientX - tapLastX) + Math.abs(e.clientY - tapLastY) < 24;
+  if (now - tapAt < 380 && near) {
+    tapAt = 0;
+    lastCX = e.clientX; lastCY = e.clientY;
+    const w = screenToWorld(e.clientX, e.clientY);
+    mouseTgt.x = w.x; mouseTgt.y = w.y;
+    setMouseHunter(true);
+  } else {
+    tapAt = now; tapLastX = e.clientX; tapLastY = e.clientY;
+  }
+}, true);
+// 光标移动：只更新目标点。绑在 window 上，所以移出窗口再回来依然跟着走
+//（在 UI 面板上方移动时也照样跟随，捕食者不会卡在半路）。
+addEventListener('pointermove', (e) => {
+  lastCX = e.clientX; lastCY = e.clientY;
+  if (!mouseHunter) return;
+  const w = screenToWorld(e.clientX, e.clientY);
+  mouseTgt.x = w.x; mouseTgt.y = w.y;
+}, { passive: true });
 
 // 捕杀特效三段式：0ms 亮核爆闪 → 90ms 内环扩张 + 火花 → 240ms 外环余波。
 // 三段分别对应 predate() 的三段音。
@@ -1426,8 +1582,8 @@ const fPred = gui.addFolder('捕食与逃逸');
 bindBool(fPred, 'predatorOn', '开启捕食者',
   '开启捕食者｜打开后出现橙红色锐角三角形，接触即捕获；鸟会逃逸，危险时会短时爆发加速。',
   (v) => {
-    predMesh.visible = v;
-    for (let p = 0; p < MAX_P; p++) threatRings[p].visible = v && p < activeP;
+    // 关掉 AI 捕食者不影响鼠标捕食者：那是玩家自己，开关只管 AI 那几只。
+    syncPredDraw();
     document.getElementById('hPred').textContent = v ? activeP : '0';
     if (v) {
       initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0);
@@ -1489,8 +1645,7 @@ function applyDefaults() {
   syncPauseBtn();
   setCount(params.count);
   setPredCount(params.predatorCount);
-  predMesh.visible = params.predatorOn;
-  for (let p = 0; p < MAX_P; p++) threatRings[p].visible = params.predatorOn && p < activeP;
+  syncPredDraw();
   document.getElementById('hPred').textContent = params.predatorOn ? activeP : '0';
   arrowMat.uniforms.uMaxSpeed.value = params.maxSpeed;
   predMat.uniforms.uMaxSpeed.value = params.predSpeed;
@@ -1531,7 +1686,11 @@ function step(dt, time) {
   const bd = bounds2D();                        // 矩形半宽/半高
   const hx = bd.hx, hy = bd.hy;
   const flowT = time * 0.00022;
-  const P = params.predatorOn ? activeP : 0;
+  // 本帧参与物理的捕食者数量：AI 捕食者（开关打开时）+ 鼠标捕食者（若有）。
+  // 鼠标永远排在队尾（索引 = baseP），所以下面所有 `p < P` 的循环都自动把它算进去，
+  // 鸟的逃逸、草地的惊飞、捕获判定都不需要另开分支。
+  const baseP = params.predatorOn ? activeP : 0;
+  const P = baseP + (mouseHunter ? 1 : 0);
   const fleeR = params.fleeRange;
   const fleeR2 = fleeR * fleeR;
   const predSpeed = params.predSpeed;
@@ -1607,8 +1766,9 @@ function step(dt, time) {
   perfParts.grid = tGrid1 - tGrid0;
 
   // ---- 捕食者：Reynolds 预测拦截 + 相互分离 + 边界约束 ----
-  if (P > 0) {
-    for (let p = 0; p < P; p++) {
+  // 只跑 AI 那几只；鼠标捕食者不跑这套，单独在下面由光标驱动。
+  if (baseP > 0) {
+    for (let p = 0; p < baseP; p++) {
       const q = p * 3;
       const ppx = predPos[q], ppy = predPos[q + 1], ppz = predPos[q + 2];
       predPrev[q] = ppx; predPrev[q + 1] = ppy; predPrev[q + 2] = 0;
@@ -1790,6 +1950,44 @@ function step(dt, time) {
         if (cooling) { predWpUntil[p] = 0; }
       }
     }
+  }
+
+  // ---- 鼠标捕食者：位置由光标决定，没有速度上限 ----
+  // 这里不做任何「AI 决策」：它朝光标对应的世界坐标做指数追赶（约 45ms 时间常数，
+  // 跟手但不会因为一次甩动而瞬移），位置本身的快慢完全取决于手速。
+  if (mouseHunter) {
+    syncMouseSlot();               // 槽位可能在暂停期间被改过（改数量 / 开关 AI）
+    const slot = baseP;
+    const q = slot * 3;
+    const px = predPos[q], py = predPos[q + 1];
+    predPrev[q] = px; predPrev[q + 1] = py; predPrev[q + 2] = 0;
+    const follow = 1 - Math.exp(-dt / 0.045);
+    let nx = px + (mouseTgt.x - px) * follow;
+    let ny = py + (mouseTgt.y - py) * follow;
+    // 夹在场地内：光标跑到窗口边缘外时，捕食者贴着边界走，不会飞出画面。
+    if (nx > hx) nx = hx; else if (nx < -hx) nx = -hx;
+    if (ny > hy) ny = hy; else if (ny < -hy) ny = -hy;
+    // 单帧跨得太远（切标签页回来、缩放/平移后光标位置突变）就不做扫掠：
+    // 否则判定会用「上一帧 → 这一帧」这条长线，沿途吃掉一整排鸟。
+    if ((nx - px) * (nx - px) + (ny - py) * (ny - py) > 36) {
+      predPrev[q] = nx; predPrev[q + 1] = ny;
+    }
+    let vx = (nx - px) / Math.max(dt, 1e-4);
+    let vy = (ny - py) / Math.max(dt, 1e-4);
+    let sp = Math.sqrt(vx * vx + vy * vy);
+    if (sp > MOUSE_VMAX) { const k = MOUSE_VMAX / sp; vx *= k; vy *= k; sp = MOUSE_VMAX; }
+    if (sp > 1.5) { mouseDirX = vx / sp; mouseDirY = vy / sp; }
+    else {
+      // 停住时保留最后一次移动方向并给一个极小的速度：箭头不会突然转回 0°，
+      // 速度还参与音效冲击量，所以不能是 0。
+      vx = mouseDirX * 0.7; vy = mouseDirY * 0.7; sp = 0.7;
+    }
+    predVel[q] = vx; predVel[q + 1] = vy; predVel[q + 2] = 0;
+    predPos[q] = nx; predPos[q + 1] = ny; predPos[q + 2] = 0;
+    // 拖尾：复用捕食者的「加速度」通道——手划得越快尾巴越长，停住就消失。
+    predAccel[slot] += (sp * 0.55 - predAccel[slot]) * (1 - Math.exp(-dt / 0.08));
+  } else {
+    mouseSlot = -1;
   }
 
   let sumNeighbors = 0;
@@ -2303,7 +2501,10 @@ function step(dt, time) {
     // 用上一帧到当前帧的线段做扫掠判定：高速追击时不会一帧跨过猎物。
     if (P > 0 && !caught[i]) {
       for (let p = 0; p < P; p++) {
-        if (time - predFeedAt[p] < params.feedCooldown * 1000) continue;
+        // 鼠标捕食者冷却远短于 AI：人控制时是「划过就吃」，
+        // 若沿用 AI 那套几十秒的冷却，整个玩法就完全没手感。
+        const cdMs = p === baseP ? MOUSE_FEED_MS : params.feedCooldown * 1000;
+        if (time - predFeedAt[p] < cdMs) continue;
         const q = p * 3;
         if (segDist2(pos[k], pos[k + 1], predPrev[q], predPrev[q + 1], predPos[q], predPos[q + 1]) >= catchR2) continue;
         const rvx = vx - predVel[q], rvy = vy - predVel[q + 1];
@@ -2463,12 +2664,15 @@ function render(now) {
     const cMusic = 0.18 + 0.82 * Math.max(0, Math.min(1, (BOUND * 1.2 - groupRms) / (BOUND * 0.55)));
     const tension = Math.min(1, sprintingCount / Math.max(24, activeCount * 0.04));
     music.update(cMusic, tension, dt);
-    // 捕食者盘旋声的输入：位置归一化到声像、饥饿度、离群体的距离（用第一只即可，
-    // 多只时取代表）。每帧只传标量，AudioParam 的平滑与写入在 25ms 调度器里完成。
-    if (params.predatorOn && activeP > 0) {
+    // 捕食者盘旋声的输入：位置归一化到声像、饥饿度、离群体的距离。
+    // 鼠标捕食者优先当声源——你自己在哪儿，那层盘旋声就从哪儿（声像左右）飘过来。
+    const musicPN = predCountNow();
+    if (musicPN > 0) {
+      const mSlot = mouseHunter ? musicPN - 1 : 0;
+      const ms = mSlot * 3;
       const bd = bounds2D();
-      const dx = predPos[0] - groupX, dy = predPos[1] - groupY;
-      music.setPredator(true, predPos[0] / Math.max(1, bd.hx), predHeat[0], Math.sqrt(dx * dx + dy * dy));
+      const dx = predPos[ms] - groupX, dy = predPos[ms + 1] - groupY;
+      music.setPredator(true, predPos[ms] / Math.max(1, bd.hx), predHeat[mSlot], Math.sqrt(dx * dx + dy * dy));
     } else {
       music.setPredator(false, 0, 0, 100);
     }
@@ -2601,8 +2805,9 @@ function render(now) {
   // ---- 捕食者拖尾：由加速度驱动 ----
   // 加速度越大 → 尾巴越长、越亮；几乎匀速时完全不出现。
   // 这样它只在扑击起步、急转、从巡游切回追击这几下「闪现」，平时是干净的。
-  if (params.predatorOn) {
-    for (let p = 0; p < activeP && tc < MAX_TRAILS; p++) {
+  const trailPN = predCountNow();   // 含鼠标捕食者：手划得快时它也会留下尾迹
+  if (trailPN > 0) {
+    for (let p = 0; p < trailPN && tc < MAX_TRAILS; p++) {
       // 加速度是尖峰式的（扑击起步只有两三帧），所以这里用「快起慢落」包络：
       // 冲上去 30ms 就到，落下来要 0.4s——一次冲刺能留下约半秒可见的尾巴，
       // 否则尾迹还没亮就灭了，看起来就像没生效。
@@ -2639,17 +2844,27 @@ function render(now) {
   }
 
   // 捕食者：GPU 属性更新 + 威胁圈跟随相机
-  predMesh.visible = params.predatorOn;
-  if (params.predatorOn) {
-    for (let i = 0; i < activeP * 3; i++) rPredVel[i] += (predVel[i] - rPredVel[i]) * SMOOTH;
+  // PN 含鼠标捕食者（它永远排在最后一个槽位），所以这一趟天然把它一起画出来。
+  const PN = predCountNow();
+  predMesh.visible = PN > 0;
+  if (PN > 0) {
+    for (let i = 0; i < PN * 3; i++) rPredVel[i] += (predVel[i] - rPredVel[i]) * SMOOTH;
     pPos.needsUpdate = true;
     pVel.needsUpdate = true;
     pCol.needsUpdate = true;
     pSiz.needsUpdate = true;
-    const cdMs = params.feedCooldown * 1000;
-    for (let p = 0; p < MAX_P; p++) {
+    const cdNormal = params.feedCooldown * 1000;
+    for (let p = 0; p < MAX_SLOT; p++) {
       const ring = threatRings[p];
-      if (p >= activeP) { ring.visible = false; continue; }
+      if (p >= PN) {
+        ring.visible = false;
+        // 缩小到 0 再隐藏：数量调小后旧实例会立刻消失，不会定在画面上
+        predSiz[p] = 0;
+        continue;
+      }
+      // 鼠标捕食者：冷却、体色都按玩家驾驶的那套处理（更亮的金橙，一眼分得清）
+      const isMouse = mouseHunter && p === PN - 1;
+      const cdMs = isMouse ? MOUSE_FEED_MS : cdNormal;
       const k = p * 3;
       ring.position.set(predPos[k], predPos[k + 1], predPos[k + 2]);
       ring.quaternion.copy(camera.quaternion);
@@ -2676,13 +2891,20 @@ function render(now) {
       }
       // 着色器内部还有约 1.4 倍的亮度合成（fill+rim+glow），所以这里要给低一些，
       // 否则两个通道一起削顶，浅橙黄会糊成奶白。
-      predCol[k] = 0.72;
-      predCol[k + 1] = 0.15 + 0.28 * kk;   // 0.15（深橙）→ 0.43（浅橙黄）
-      predCol[k + 2] = 0.03 + 0.13 * kk;   // 0.03 → 0.16
+      if (isMouse) {
+        predCol[k] = 0.95;
+        predCol[k + 1] = 0.50 + 0.26 * kk;
+        predCol[k + 2] = 0.16 + 0.18 * kk;
+      } else {
+        predCol[k] = 0.72;
+        predCol[k + 1] = 0.15 + 0.28 * kk;   // 0.15（深橙）→ 0.43（浅橙黄）
+        predCol[k + 2] = 0.03 + 0.13 * kk;   // 0.03 → 0.16
+      }
 
-      // 扑击瞬间箭头放大脉冲，与冲击波同步。
+      // 扑击瞬间箭头放大脉冲，与冲击波同步；玩家驾驶的那只再略大一圈，
+      // 和 AI 猛禽混在一起时也能一眼找到自己。
       const pulse = Math.max(0, 1 - (now - predPulseAt[p]) / 280);
-      predSiz[p] = predLeg() * (1 + 0.32 * pulse);
+      predSiz[p] = predLeg() * (isMouse ? 1.12 : 1) * (1 + 0.32 * pulse);
     }
   } else {
     for (const ring of threatRings) ring.visible = false;
@@ -2858,9 +3080,37 @@ window.FlockLab = {
   },
   get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
   get count() { return activeCount; },
+  get paused() { return !!params.paused; },
   get velocities() { return Array.from(vel.slice(0, activeCount * 3)); },
   get renderVelocities() { return Array.from(rVel.slice(0, activeCount * 3)); },
   get predatorCount() { return params.predatorOn ? activeP : 0; },
+  // ---- 鼠标捕食者（玩家驾驶的那只，独立于 AI 捕食者计数）----
+  get mouseHunter() { return mouseHunter; },
+  setMouseHunter(on) { setMouseHunter(!!on); return mouseHunter; },
+  // 与 GUI 走同一条路径（改数量 / 开关后同步绘制数量与鼠标槽位），供自动化验证
+  setPredatorCount(n) { setPredCount(n); return activeP; },
+  setPredatorOn(on) {
+    params.predatorOn = !!on;
+    if (on) { initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0); }
+    syncPredDraw();
+    return params.predatorOn;
+  },
+  toWorld: (cx, cy) => screenToWorld(cx, cy),
+  get mousePredator() {
+    const slot = predBaseCount();
+    const q = slot * 3;
+    return {
+      active: mouseHunter, slot,
+      x: +predPos[q].toFixed(2), y: +predPos[q + 1].toFixed(2),
+      vx: +predVel[q].toFixed(2), vy: +predVel[q + 1].toFixed(2),
+      speed: +Math.hypot(predVel[q], predVel[q + 1]).toFixed(2),
+      dirDeg: +(Math.atan2(mouseDirY, mouseDirX) * 180 / Math.PI).toFixed(1),
+      target: { x: +mouseTgt.x.toFixed(2), y: +mouseTgt.y.toFixed(2) },
+      size: +predSiz[slot].toFixed(3),
+      drawCount: predGeo.instanceCount,
+      cursor: getComputedStyle(cv).cursor,
+    };
+  },
   get predatorPositions() {
     return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
       x: +predPos[p * 3].toFixed(2), y: +predPos[p * 3 + 1].toFixed(2), z: +predPos[p * 3 + 2].toFixed(2)

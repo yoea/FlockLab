@@ -14,6 +14,8 @@
 <body>
   <noscript><div style="position:fixed;inset:0;z-index:40;display:grid;place-items:center;background:#05070f;color:#dce9ff;font:14px/1.8 sans-serif;text-align:center">需要启用 JavaScript 才能运行 FlockLab 模拟并显示界面。</div></noscript>
   <div id="scene"></div>
+  <!-- 模式切换的轻提示（双击 / 右键切换鼠标捕食者时出现） -->
+  <div id="toast" role="status" aria-live="polite"></div>
 
   <button id="brand" type="button" title="关于 FlockLab" aria-label="关于 FlockLab">
     <img class="mark" src="assets/logo.svg" alt="" width="19" height="19" />
@@ -85,6 +87,7 @@
         <li><b>反应延迟</b>看到猛禽不会立刻爆发：贴身约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像涟漪从捕食者身边扩散开。</li>
         <li><b>草地</b>2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 1 分钟）；落地变苔绿色、彼此保持间距，飞行中的鸟会绕开草地，并有轻微的起降音效。</li>
         <li><b>音乐</b>六层生成式音景随聚集度变化：散开时几乎无声，抱团后和声变厚、节拍渐起；另有一层若隐若现的低音，和一层跟着猛禽位置缓慢左右游走的盘旋声，都很轻，细听才辨得出。</li>
+        <li><b>自己下场抓一次</b>：在画面上双击左键，光标就变成一只「鼠标捕食者」，完全跟着手走（没有速度上限，箭头朝向就是移动方向），鸟群会像躲猛禽一样散开；划得快会留下尾迹。移出窗口再回来它还在，期间点击、拖拽、滚轮都照常可用；点一下右键恢复成普通箭头。</li>
         <li><b>操作</b>进入页面先显示完整界面，约 1 秒后带动画自动收起、只留小眼睛；任意操作让小眼睛显现，点它再展开完整界面。拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。左下角状态卡可折叠，点右上角图钉「钉住」后，一键隐藏界面时它会继续留在屏幕上。</li>
       </ul>
       <p class="about-foot">Three.js · WebGL · HTML / CSS / JS / SVG 模块化</p>
