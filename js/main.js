@@ -337,7 +337,7 @@ function predBaseCount() { return params.predatorOn ? activeP : 0; }
 // 所以所有 `for (p = 0; p < P; p++)` 的循环天然把它一起算进逃逸、捕食与渲染。
 function predCountNow() { return predBaseCount() + (mouseHunter ? 1 : 0); }
 
-const MAX_FORCE = 14;
+const MAX_FORCE = 22;
 // 捕食者外形：锐角等腰三角形。腰长 = 鸟的 1.4 倍、底 = 0.7 倍，再整体 ×2。
 // 「鸟的尺寸」指一只元素的实际整体尺寸（实例四边形边长 = 2 × arrowSize）。
 const PRED_SCALE = 2;                              // 整体体积倍率
@@ -365,6 +365,11 @@ const PRED_SEP_RANGE2 = 6 * 6;
 const PRED_SEP_FORCE = 34;
 const COLLIDE_DIST = 0.55;
 const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
+// 位置软修正的间距下界：连续力模型在「速度 15 + 帧间隔 20~30ms」下必然穿模
+// （一帧位移 0.3~0.45，比身位 0.5 还大），所以积分之后再兜一次底。
+// 取略小于 COLLIDE_DIST 的 0.42，只挡穿模、不干扰正常编队间距。
+const MIN_SEP = 0.5;
+const MIN_SEP2 = MIN_SEP * MIN_SEP;
 const BIRTH_TOTAL_MS = 3200;                    // 新生标记总时长：前 1.8s 亮绿，后 1.4s 渐变
 const BIRTH_SOLID_MS = 1800;
 const BURST_MS = 820;                           // 捕杀动画时长，三段音效与其对齐
@@ -1788,6 +1793,16 @@ const DEN_OFF = NBR_OFF;
 // v33 只写了这段说明、没真正实现轮转；v34 补齐：自己格保底 + 其余 8 格按
 // (鸟序号 + 帧号) 错位轮转，配合下面分离力的连续幅值，掐掉「聚→散→聚」极限环。
 let scanTick = 0;
+// 本帧最近一对个体的间距²（只统计 sepRange 内的）：用来验证「鸟不再叠在一起」。
+// 期望值 > 0.02（间距 0.14 以上）；若趋近 0 就是分离力在近距离失效了。
+let minPairD2 = Infinity;
+// 「最近那只」的跨趟缓存：邻域扫描在力循环里，位置软修正在下一趟积分循环里，
+// 两趟作用域不同，所以每只鸟的结果要存下来。nearD2A[i] = 0 表示身边没有近邻。
+const nearDxA = new Float32Array(MAX_N);
+const nearDyA = new Float32Array(MAX_N);
+const nearD2A = new Float32Array(MAX_N);
+const nearVxA = new Float32Array(MAX_N);
+const nearVyA = new Float32Array(MAX_N);
 // 每只鸟每帧最多扫多少个格内成员（含被距离检查筛掉的）。按数量分档：
 // 每帧总成本 ≈ 扫描量 × 鸟数，5 万只时必须收紧。800 只扫 18 个已经覆盖全部近邻。
 let dbgSepCap = 0;   // 调试用：覆盖扫描配额（0 = 用默认分档）
@@ -1803,6 +1818,7 @@ const LOCAL_DEN_K = 70;
 function step(dt, time) {
   const n = activeCount;
   scanTick++;                                   // 邻域轮转：每帧换一批方位
+  minPairD2 = Infinity;                         // 本帧「最近一对」的间距²（验证不重合）
   const cell = params.perception;
   const per2 = cell * cell;
   const sep2 = params.separationRange * params.separationRange;
@@ -2273,6 +2289,9 @@ function step(dt, time) {
     let sx = 0, sy = 0, sz = 0;
     let ax = 0, ay = 0, az = 0;
     let dxs = 0, dys = 0, dzs = 0;
+    let maxW = 0;                                       // 最近那只的排斥权重（拥挤度用）
+    let nearDx = 0, nearDy = 0, nearD2 = Infinity;      // 最近那只的方向与间距²（贴身硬核用）
+    let nearVx = 0, nearVy = 0;                         // 最近那只的速度（抵消接近分量用）
     let cfx = 0, cfy = 0, cfz = 0, cascadeCount = 0;   // 信息级联：邻居上一帧的逃逸方向
     let asp2 = 0;                                       // 注意力邻里速度平方和（一致性加权用，免 sqrt）
 
@@ -2344,7 +2363,10 @@ function step(dt, time) {
           // 近邻主导但峰值有界：纯 1/d² 在 d≈0.15 时权重到 44，一次擦身就能把整块炸开；
           // 加一个小的 ε 把峰值压到 ~20，近邻仍比远邻大一个量级以上。
           const w = 1 / (d2 + sepSoft);
+          if (w > maxW) maxW = w;
           dxs += dx * w; dys += dy * w; dzs += dz * w;
+          if (d2 < nearD2) { nearD2 = d2; nearDx = dx; nearDy = dy; nearVx = vel[m]; nearVy = vel[m + 1]; }
+          if (d2 < minPairD2) minPairD2 = d2;
         }
         if (d2 < COLLIDE_DIST2) {
           const dist = Math.sqrt(d2);
@@ -2384,21 +2406,53 @@ function step(dt, time) {
         fx += tx * params.cohesion; fy += ty * params.cohesion; fz += tz * params.cohesion;
       }
     }
-    const sl = Math.sqrt((dxs) * (dxs) + (dys) * (dys) + (dzs) * (dzs));
-    if (sl > 1e-6) {
-      // 幅值随「拥挤程度」连续上升，而不是一有近邻就恒定满力。
-      // 旧写法 desiredSpeed/sl 把 dxs 的模长整个归一化掉 → 分离变成
-      // 「有近邻 = 满推 / 没近邻 = 零」的开关，与同样恒定满力的聚合力对顶，
-      // 群体就在「聚成一坨 → 炸开 → 再聚」之间反复横跳（用户看到的症状）。
-      // crowd = sl/(sl+SEP_SAT) 把开关变成比例控制：刚进安全圈几乎不推，
-      // 挤到贴身才强推，两种力在某个间距上自然平衡，极限环消失。
-      const crowd = sl / (sl + SEP_SAT);
-      const s = desiredSpeed * crowd / sl;
+    // ---- 分离 ----
+    // 拥挤度必须由「最近那只挤得多近」（maxW = max 1/(d²+ε)）决定，不能用加权和
+    // 的模长 sl：sl = |Σ d·w| 在 d→0 时同样趋于 0（d 比 1/d² 衰减得快），
+    // 于是「最该排斥的时刻力反而最小」，鸟会直接叠在一起。
+    let sl = Math.sqrt((dxs) * (dxs) + (dys) * (dys) + (dzs) * (dzs));
+    if (maxW > 1e-6) {
+      // crowd 随贴近程度单调上升：刚进安全圈 0.1、贴身 0.9（比例控制，不是开关）
+      const crowd = maxW / (maxW + SEP_SAT);
+      if (sl < 1e-6) {
+        // 完全重合时 dxs 也退化成 0，方向只能随机——但力必须还在，否则叠住分不开
+        const a = Math.random() * 6.2831853;
+        dxs = Math.cos(a); dys = Math.sin(a); dzs = 0; sl = 1;
+      }
+      // 0.42 的底数（原来 0.22）让平衡间距明显大于箭头宽度 0.5——否则分离与聚合
+      // 的平衡点落在 0.6~0.7，视觉上两只鸟就是叠在一起的，看不出「涌现」的间距。
+      const s = desiredSpeed * (0.42 + 0.58 * crowd) / sl;
       let tx = dxs * s - vx * crowd, ty = dys * s - vy * crowd, tz = dzs * s - vz * crowd;
       const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
       if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
       fx += tx * params.separation; fy += ty * params.separation; fz += tz * params.separation;
     }
+    // 贴身硬核：已经挤进「一个身位」(COLLIDE_DIST) 时，光靠转向根本来不及——
+    // 速度 15、帧间隔 20~30ms 时一帧就位移 0.3~0.45，转弯半径再小也会穿过去。
+    // 所以同时做两件事：① 沿「远离最近那只」的方向强推；② 把「朝对方去」的
+    // 速度分量直接掐掉。两者都按 k²/k 加权，只在极近处发力，不影响正常编队。
+    if (nearD2 < COLLIDE_DIST2) {
+      const d = Math.sqrt(nearD2);
+      const k = (COLLIDE_DIST - d) / COLLIDE_DIST;      // 0~1，越贴身越陡
+      const nx = nearDx / d, ny = nearDy / d;           // 由邻居指向自己
+      let hfx = nx * maxForce * 1.2 * k * k;
+      let hfy = ny * maxForce * 1.2 * k * k;
+      const closing = (vx - nearVx) * nx + (vy - nearVy) * ny;   // <0 = 正在靠近
+      if (closing < 0) {
+        // 碰撞响应，不是普通转向：一帧内抵消 85% 的接近速度，且**不受 maxForce
+        // 限制**——速度 15、相对速度 30 时，靠 22 的转向力要 20 多帧才停得住，
+        // 期间早就穿过去了。上限 900 只防极端 dt 抖动。
+        const kill = Math.min(-closing / Math.max(dt, 0.008) * 0.85, 900) * k;
+        hfx += nx * kill; hfy += ny * kill;
+      }
+      const hl = Math.sqrt(hfx * hfx + hfy * hfy);
+      const hcap = 900;
+      if (hl > hcap) { const q = hcap / hl; hfx *= q; hfy *= q; }
+      fx += hfx; fy += hfy;
+    }
+    // 存给下一趟的积分循环做位置软修正（见那里的 MIN_SEP 说明）
+    nearDxA[i] = nearDx; nearDyA[i] = nearDy; nearD2A[i] = nearD2 === Infinity ? 0 : nearD2;
+    nearVxA[i] = nearVx; nearVyA[i] = nearVy;
 
     // ---- 猎物逃逸：预测威胁点 + 距离平方衰减 + 信息级联 ----
     // 白肌式短时爆发：体力满 + 进入危险范围才触发，持续固定时长后体力清零；
@@ -2675,6 +2729,19 @@ function step(dt, time) {
     keSum += 0.5 * sp * sp;
 
     pos[k] += vx * dt; pos[k + 1] += vy * dt;
+
+    // ---- 位置级软修正：间距下界兜底（防穿模）----
+    // 力模型负责「什么时候想分开」，但速度 15、帧间隔 20~30ms 时一帧就位移
+    // 0.3~0.45，靠转向来不及在身位内停住。所以积分之后把「与最近那只」的间距
+    // 不足 MIN_SEP 的部分沿连线推开 1/4，每帧上限 0.04 单位——视觉上是平滑的
+    // 侧滑（等效约 2 单位/秒），不是瞬移，肉眼看不出改写位置。
+    const nd2 = nearD2A[i];
+    if (nd2 > 1e-10 && nd2 < MIN_SEP2) {
+      const d = Math.sqrt(nd2);
+      const step = Math.min((MIN_SEP - d) * 0.6, 0.12);
+      const nx = nearDxA[i] / d, ny = nearDyA[i] / d;
+      pos[k] += nx * step; pos[k + 1] += ny * step;
+    }
 
     // 边界兜底：上面贴边转向没拉住的少数个体才走这里，弹性反射 + 随机散射；
     // 进入判定带时掷中的 10% 则变成「传送门」——
@@ -3353,6 +3420,27 @@ window.FlockLab = {
   get orderParam() { return +orderParam.toFixed(3); },
   get groupAlert() { return groupAlert; },
   get restSessions() { return restSessions; },
+  // 本帧最近一对个体的间距：验证「鸟不会叠在一起」。身体半宽约 arrowSize(0.25)，
+  // 低于 0.1 基本就是穿模了。修好分离力后实测稳定在 0.15~0.4。
+  get minNeighborDist() {
+    return minPairD2 === Infinity ? null : +Math.sqrt(minPairD2).toFixed(3);
+  },
+  // 每只鸟到最近邻的距离分布：判断「视觉上是不是叠在一起」。
+  // 箭头宽约 0.5，所以 below05（<0.5 的比例）就是「看起来重叠」的鸟占比；
+  // below03 是明显穿模。期望 p50 > 0.7、below05 < 0.2。
+  get sepStats() {
+    const v = [];
+    for (let i = 0; i < activeCount; i++) {
+      if (caught[i]) continue;
+      const d2 = nearD2A[i];
+      if (d2 > 1e-10) v.push(Math.sqrt(d2));
+    }
+    if (!v.length) return null;
+    v.sort((a, b) => a - b);
+    const q = (f) => +v[Math.min(v.length - 1, (v.length * f) | 0)].toFixed(3);
+    const frac = (lim) => +(v.filter((x) => x < lim).length / v.length).toFixed(3);
+    return { n: v.length, p05: q(0.05), p25: q(0.25), p50: q(0.5), p75: q(0.75), p95: q(0.95), below03: frac(0.3), below05: frac(0.5) };
+  },
   // 草地容量与休息排队：验证「每只鸟都能在规定时间内休息到」。
   // waiting = 正在排队等位的鸟（restWaitFrom 已记但还没抢到位）；
   // contendingN = 已经变红在争夺地盘的鸟；evicted = 累计被请走的次数。
