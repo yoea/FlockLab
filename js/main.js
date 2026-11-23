@@ -1006,7 +1006,7 @@ scene.add(arrows);
 // 所以转弯会自然弯曲、留下一串彼此独立的痕迹；每个粒子有自己的寿命，靠顶点着色器
 // 按 age 收缩+淡出，CPU 每帧不需要再遍历它们（只在新粒子生成时写一个槽）。
 // 鸟和捕食者走同一套 emitTrail()，只是寿命/尺寸/颜色不同。
-const MAX_TRAILS = 2400;      // 环形槽位，写满就覆盖最旧的（视觉上看不出来）
+const MAX_TRAILS = 4800;      // 环形槽位，写满就覆盖最旧的（视觉上看不出来）
 const trailGeo = new THREE.InstancedBufferGeometry();
 // 单位短条：aLocal.x 0=尾 1=头，aLocal.y 横向 ±1
 trailGeo.setAttribute('position', new THREE.Float32BufferAttribute([
@@ -1041,17 +1041,26 @@ trailGeo.instanceCount = MAX_TRAILS;
 
 let trailCursor = 0;
 let trailDirty = false;
-// 寿命/尺寸：鸟的尾迹短促细淡，捕食者的更长更亮（它本来就是画面主角）
-const TRAIL_LIFE_BIRD = 300, TRAIL_LEN_BIRD = 0.62;
+// 寿命/尺寸：鸟的尾迹是「细密颗粒」——短、窄、淡、撒得密（否则断成一截截的虚线）；
+// 捕食者更长更亮（它本来就是画面主角）。
+const TRAIL_LIFE_BIRD = 340, TRAIL_LEN_BIRD = 0.30;
 const TRAIL_LIFE_PRED = 460, TRAIL_LEN_PRED = 1.25;
 
-function emitTrail(x, y, vx, vy, now, life, len, wid, r, g, b) {
+// tailOff：从实体尾部（而不是质心）发射的回退距离，按实体各自的「尾部中点」算——
+//   鸟       尾角连线中点 = 局部 x = -0.42  →  0.42 × 个体尺寸
+//   捕食者   等腰三角形底边中点 = 局部 x = -0.3227486 → 0.3227486 × 腰长
+// 粒子是「短条」：aPos 是它的尾端，向航向伸展出 len。所以锚点再沿航向反方向退一个
+// len，粒子的亮端就正好贴在尾部底边、整体拖在实体后方——不会从头部冒出来把
+// 三角形整个盖住（之前就是这样）。
+function emitTrail(x, y, vx, vy, now, life, len, wid, r, g, b, tailOff) {
   const sp = Math.sqrt(vx * vx + vy * vy);
   const i = trailCursor;
   trailCursor = (trailCursor + 1) % MAX_TRAILS;
-  trPos[i * 2] = x; trPos[i * 2 + 1] = y;
-  if (sp > 1e-4) { trDir[i * 2] = vx / sp; trDir[i * 2 + 1] = vy / sp; }
-  else { trDir[i * 2] = 1; trDir[i * 2 + 1] = 0; }
+  let dx, dy;
+  if (sp > 1e-4) { dx = vx / sp; dy = vy / sp; } else { dx = 1; dy = 0; }
+  const back = len + tailOff;
+  trPos[i * 2] = x - dx * back; trPos[i * 2 + 1] = y - dy * back;
+  trDir[i * 2] = dx; trDir[i * 2 + 1] = dy;
   trBirth[i] = now; trLife[i] = life; trLen[i] = len; trWid[i] = wid;
   trCol[i * 3] = r; trCol[i * 3 + 1] = g; trCol[i * 3 + 2] = b;
   trailDirty = true;
@@ -2894,9 +2903,12 @@ function render(now) {
   // 两边都先过一道「快起慢落」包络把尖峰摊成约半秒窗口，再按个体节流撒点；
   // 撒下之后位置/朝向就冻结，不会再跟着实体走，所以转弯会自然弯曲成弧。
   tmpTrail.setHSL(0.928, 0.9, 0.62);
-  const bR = tmpTrail.r, bG = tmpTrail.g, bB = tmpTrail.b;
+  // 鸟的尾迹整体压暗（加法混合下乘亮度 ≈ 降透明度）：颗粒又细又淡才像尾迹，
+  // 保持原来的饱和度只会变成一根根扎眼的亮线段（用户看到的「画虚线」）。
+  const BIRD_DIM = 0.62;
+  const bR = tmpTrail.r * BIRD_DIM, bG = tmpTrail.g * BIRD_DIM, bB = tmpTrail.b * BIRD_DIM;
   const pR = tmpTrailPred.r, pG = tmpTrailPred.g, pB = tmpTrailPred.b;
-  const trailBaseW = params.arrowSize * 0.42;
+  const birdTrailW = params.arrowSize * 0.24;
   const cruiseRef = currentPace;   // step 里算好的本帧巡航速度
   const birdRise = 1 - Math.exp(-dt / 0.035);
   const birdFall = 1 - Math.exp(-dt / 0.34);
@@ -2911,10 +2923,12 @@ function render(now) {
     birdTrailP[i] += (target - birdTrailP[i]) * (target > birdTrailP[i] ? birdRise : birdFall);
     if (birdTrailP[i] <= 0.13) continue;
     if (now < trailNextAt[i]) continue;
-    // 间隔带随机抖动：整群同时爆发时不会在同一处堆成一条实线
-    trailNextAt[i] = now + 22 + Math.random() * 18;
+    // 密度换颗粒感：13~24ms 一颗（原来是 22~40ms），配合更短更窄的单颗，
+    // 尾迹才会连成细密的烟粒，而不是断断续续的粗虚线。
+    trailNextAt[i] = now + 13 + Math.random() * 11;
     emitTrail(pos[k], pos[k + 1], vel[k], vel[k + 1], now,
-      TRAIL_LIFE_BIRD, TRAIL_LEN_BIRD, trailBaseW, bR, bG, bB);
+      TRAIL_LIFE_BIRD, TRAIL_LEN_BIRD, birdTrailW, bR, bG, bB,
+      0.42 * siz[i]);   // 从尾角连线中点出发，不是质心
   }
 
   // 捕食者：加速度驱动。加速度是尖峰式的（扑击起步只有两三帧），
@@ -2931,7 +2945,8 @@ function render(now) {
       predTrailNextAt[p] = now + 14 + Math.random() * 10;
       const q = p * 3;
       emitTrail(predPos[q], predPos[q + 1], predVel[q], predVel[q + 1], now,
-        TRAIL_LIFE_PRED, TRAIL_LEN_PRED, predW, pR, pG, pB);
+        TRAIL_LIFE_PRED, TRAIL_LEN_PRED, predW, pR, pG, pB,
+        0.3227486 * predSiz[p]);   // 从等腰三角形的底边（尾巴）出发，不压住三角形
     }
   }
 
