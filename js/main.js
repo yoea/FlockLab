@@ -103,24 +103,29 @@ const DEFAULTS = {
   sprintFactor: 1.7,
   sprintDuration: 1.0,
   sprintRecovery: 3.0,
-  // 音量直接就是增益（0~1.5，1.0 为标准响度），面板上看到的数字就是它：
-  // 默认音乐 0.4（能听见但不会压住画面），音效 1.0。
-  musicLevel: 0.4,
-  fxLevel: 1.0,
+  // 音量固定为满刻度（1.5 = 面板刻度的上限），不再提供滑块：
+  // 仪表盘只保留顶部/右下角那一个声音开关（静音 / 开声），音量本身不给调。
+  // master 0.38 只是总线预留的余量，不在这两个值里体现。
+  musicLevel: 1.5,
+  fxLevel: 1.5,
   // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
-  grassOn: true
+  grassOn: true,
+  // 屏幕边缘穿越：开=墙不存在（环面平移，飞出对侧回来）；关=墙变实体（反弹）
+  wrapEdges: true
 };
 // 运行时参数：先从 localStorage 恢复上次的调整结果，没有存档才用默认值。
 const params = { ...DEFAULTS, enabled: false, paused: false };
 
 // 只持久化「用户可调」的参数；enabled / paused 属于会话状态，不写入存档。
+// 音量（musicLevel / fxLevel）已经不给用户调了，固定满刻度，所以不进存档：
+// 老存档里的 0.4 也就不会被读回来（否则「默认最大」对老用户不生效）。
 const PERSIST_KEYS = [
   'count', 'separation', 'alignment', 'cohesion', 'perception', 'separationRange',
   'flow', 'maxSpeed', 'minSpeed', 'arrowSize',
   'predatorOn', 'predatorCount', 'fleeWeight', 'fleeRange', 'predict',
   'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
   'sprintFactor', 'sprintDuration', 'sprintRecovery',
-  'musicLevel', 'fxLevel', 'grassOn'
+  'grassOn', 'wrapEdges'
 ];
 // v6：出厂默认值改为 对齐 1.8 / 视野 7 / 元素 800，音乐音量改回 0~1.5 增益刻度（默认 0.4）；
 // 音量刻度与默认值都变了，旧存档不能沿用，否则刷新后仍是旧数值。
@@ -132,8 +137,7 @@ const PARAM_RANGE = {
   predatorCount: [1, MAX_P], fleeWeight: [0, 6], fleeRange: [3, 24],
   predict: [0, 1.5], chaseWeight: [0, 4], predSpeed: [2, 36],
   lockTime: [0, 5], feedCooldown: [0.3, 60],
-  sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12],
-  musicLevel: [0, 1.5], fxLevel: [0, 1.5]
+  sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12]
 };
 const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function loadParams() {
@@ -315,6 +319,7 @@ const predAccel = new Float32Array(MAX_SLOT);       // 当帧加速度大小（�
 const predTrailP = new Float32Array(MAX_SLOT);      // 平滑后的加速度强度 0~1
 const predTrailAmt = new Float32Array(MAX_SLOT);    // 拖尾强度 0~1（保留给音乐/调试用）
 const predTrailNextAt = new Float64Array(MAX_SLOT);  // 下一颗尾迹粒子的生成时刻
+const predSoundAt = new Float64Array(MAX_SLOT);      // 加速音效的按只限流时刻
 const predHeat = new Float32Array(MAX_SLOT);        // 饥饿度 0~1：决定警戒圈是暗色（饱食）还是亮色（捕食）
 let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即视为「全力冲刺」（实测中位数 12、峰值 64）
 // 捕食者的个体差异：速度系数 + 追击时持续漂移的摆尾角度，让它不是一条死直线。
@@ -339,6 +344,11 @@ function predBaseCount() { return params.predatorOn ? activeP : 0; }
 function predCountNow() { return predBaseCount() + (mouseHunter ? 1 : 0); }
 
 const MAX_FORCE = 22;
+// 长程归拢（见 step 里「群体归拢」一段）：超出这个半径才开始拉。
+// 9 会让群体长期停在 3~5 坨；14 实测稳定在 1~2 大团（偶发 3~4），分离指标不变。
+// 通过 FlockLab.flockKeep 可在线改（调参用，不持久化、不上面板）。
+// FLOCK_KEEP_R 是「800 只时的半径」，step 里按 sqrt(n/800) 放大后再用。
+let FLOCK_KEEP_R = 18, FLOCK_KEEP_F = 14;
 // 捕食者外形：锐角等腰三角形。腰长 = 鸟的 1.4 倍、底 = 0.7 倍，再整体 ×2。
 // 「鸟的尺寸」指一只元素的实际整体尺寸（实例四边形边长 = 2 × arrowSize）。
 const PRED_SCALE = 2;                              // 整体体积倍率
@@ -358,22 +368,38 @@ function segDist2(px, py, ax, ay, bx, by) {
   return qx * qx + qy * qy;
 }
 // ---- 穿墙：墙视为不存在 ----
-// 越界后统一从「关于场地中心对称」的位置继续出现：右边飞出 → 从左边界进、
-// y 同时翻转（左边偏下飞出 → 右边偏上飞进）。速度方向保持不变，所以刚进场的
-// 个体一定是朝场内飞的。鸟、AI 捕食者、鼠标捕食者都走这一套——无概率、
-// 无弹性反射、无随机散射、也不再有贴边急转（那等于把墙挪进场内）。
-// 斜角同时越界时两次镜像都会做，最后夹回场内防止退化成死循环。
+// 越界后从「对侧同高度」继续出现：右边飞出 → 左边界同 y 处进来，速度方向不变。
+// 这等价于把场地当成环面（torus）。
+// 曾经的写法是「关于中心点对称」（右边飞出 → 左边进、同时 y 取反），看着更"玄"，
+// 但它会把穿过边界的一坨鸟在 y 方向复制成两份镜像：已经穿过去的一半在 -y、还没穿的
+// 一半在 +y，两半相距 2y 且互不可见 → 每次有鸟群跨边界，整坨就被撕成两半，
+// 再也不合并（实测 25 秒内 800 只累计穿墙 1500 次，群体从 1 坨碎成 6~8 坨）。
+// 现在只做平移不做镜像，穿过去的那半只是接着往前飞，位置顺序不变，所以鸟群能完整地
+// 「穿过去再聚回来」。鸟、AI 捕食者、鼠标捕食者都走这一套——无概率、无弹性反射、
+// 无随机散射、也没有贴边急转（那等于把墙挪进场内）。
 let wrapX = 0, wrapY = 0;
 function wrapThroughWall(x, y, hx, hy) {
-  const outX = x > hx ? 1 : (x < -hx ? -1 : 0);
-  const outY = y > hy ? 1 : (y < -hy ? -1 : 0);
-  if (!outX && !outY) return false;
-  if (outX) { x = -outX * hx; y = -y; }
-  if (outY) { y = -outY * hy; x = -x; }
+  let hit = false;
+  if (x > hx) { x -= 2 * hx; hit = true; } else if (x < -hx) { x += 2 * hx; hit = true; }
+  if (y > hy) { y -= 2 * hy; hit = true; } else if (y < -hy) { y += 2 * hy; hit = true; }
+  if (!hit) return false;
+  // 极端 dt（切标签页回来一帧跳很远）时可能一次越界超过一个场宽，夹回场内防死循环
   if (x > hx) x = hx; else if (x < -hx) x = -hx;
   if (y > hy) y = hy; else if (y < -hy) y = -hy;
   wrapX = x; wrapY = y;
   return true;
+}
+
+// 反射撞击：面板上关掉「屏幕边缘穿越」时用的实体墙。
+// 只夹回边界并反转越界方向的速度分量（保留 92% 速率），
+// 不做切向加速、不瞬移——鸟会真的「撞到墙然后弹开」，而不是贴边急转。
+let bounceX = false, bounceY = false;
+function bounceOffWall(x, y, hx, hy) {
+  bounceX = false; bounceY = false;
+  if (x > hx) { x = hx; bounceX = true; } else if (x < -hx) { x = -hx; bounceX = true; }
+  if (y > hy) { y = hy; bounceY = true; } else if (y < -hy) { y = -hy; bounceY = true; }
+  wrapX = x; wrapY = y;
+  return bounceX || bounceY;
 }
 let teleportCount = 0;   // 累计穿墙次数（状态卡「穿越」计数）
 const PRED_FORCE = 24;
@@ -651,12 +677,18 @@ function bounds2D() {
   return { hx: halfH * (innerWidth / innerHeight), hy: halfH };
 }
 
-// ---------------------------------------------------------------- 背景点缀
-// 纯粹是氛围：一层挂在相机上的极淡径向渐变 + 会缓慢漂移的尘埃点。
-// 都压得很暗（亮度 0.01~0.06 量级），并且不参与任何仿真，不影响主体观感。
+// ---------------------------------------------------------------- 背景
+// 氛围层，不参与任何仿真。三层叠起来（全部挂在相机上 / 世界坐标里，缩放平移都跟着走）：
+//   ① 星云底：全屏 quad，两层不同尺度、方向的 fbm 噪声缓慢漂移 → 像有一层极淡的云在动
+//   ② 星点：同一张 shader 里用高频格子撒稀疏亮点，各自按相位呼吸
+//   ③ 尘埃：世界坐标里的点精灵，缓慢漂移 + 呼吸（原来 uTime 从没被更新，所以一动不动）
+// 亮度都压在 0.003~0.02（线性空间），转成 sRGB 后是近黑的深蓝，不抢鸟群。
 const bgGeo = new THREE.PlaneGeometry(1, 1);
 const bgMat = new THREE.ShaderMaterial({
-  uniforms: { uHalf: { value: new THREE.Vector2(1, 1) } },
+  uniforms: {
+    uHalf: { value: new THREE.Vector2(1, 1) },
+    uTime: { value: 0 }
+  },
   vertexShader: `
     varying vec2 vUv;
     void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
@@ -664,18 +696,55 @@ const bgMat = new THREE.ShaderMaterial({
   fragmentShader: `
     varying vec2 vUv;
     uniform vec2 uHalf;
+    uniform float uTime;
+
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+    float vnoise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      float a = hash(i), b = hash(i + vec2(1.0, 0.0));
+      float c = hash(i + vec2(0.0, 1.0)), d = hash(i + vec2(1.0, 1.0));
+      return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    }
+    float fbm(vec2 p) {
+      float s = 0.0, a = 0.5;
+      for (int i = 0; i < 5; i++) { s += a * vnoise(p); p = p * 2.03 + 5.7; a *= 0.5; }
+      return s;
+    }
+
     void main() {
       vec2 p = (vUv - 0.5) * 2.0;              // -1~1
-      float d = length(p * vec2(1.0, 0.85));
-      // 中心微微亮一点的冷调，向外压暗，再叠一点极轻的右上暖光
-      float core = smoothstep(1.15, 0.0, d);
+      float t = uTime * 0.02;
+      float core = smoothstep(1.15, 0.0, length(p * vec2(1.0, 0.85)));
       float warm = smoothstep(1.2, 0.2, length(p - vec2(0.55, 0.45)));
-      // 注意：这里是线性空间，经过 colorspace_fragment 转 sRGB 后会被提亮，
-      // 所以数值必须压到 0.003 量级，最终观感才是近黑的深蓝。
-      vec3 col = mix(vec3(0.0030, 0.0042, 0.0072), vec3(0.0055, 0.0082, 0.0130), core);
-      col += vec3(0.0035, 0.0022, 0.0014) * warm * 0.9;
-      // 暗角：边缘再压一层，避免画面四周发灰
-      col *= 0.72 + 0.28 * core;
+
+      // 两层云：冷蓝一层、偏紫一层，速度与尺度都不同，叠出来的斑块不是同一个源头
+      vec2 q1 = p * 1.55 + vec2(t * 0.55, -t * 0.38);
+      float n1 = fbm(q1 + fbm(q1 * 0.8 + t * 0.25) * 0.9);
+      vec2 q2 = p * 2.60 + vec2(-t * 0.42, t * 0.61);
+      float n2 = fbm(q2 + t * 0.15);
+      // 再压一层极慢的「大块呼吸」，让整片底子亮度以 40 秒级周期轻微起伏
+      float breathe = 0.86 + 0.14 * sin(uTime * 0.16);
+
+      vec3 base = mix(vec3(0.0026, 0.0038, 0.0070), vec3(0.0050, 0.0076, 0.0126), core);
+      vec3 cool = vec3(0.0026, 0.0068, 0.0140);
+      vec3 violet = vec3(0.0092, 0.0034, 0.0128);
+      float c1 = pow(smoothstep(0.34, 0.96, n1), 1.7) * 0.95;
+      float c2 = pow(smoothstep(0.44, 0.96, n2), 2.1) * 0.62;
+      vec3 col = base + (cool * c1 + violet * c2) * breathe
+               + vec3(0.0034, 0.0021, 0.0013) * warm * 0.85;
+
+      // 星点：高频格子里挑极少数（0.6%）点亮，各自相位闪烁，按格子大小给不同亮度
+      vec2 gp = p * 42.0 + vec2(11.0, 7.0);
+      vec2 gi = floor(gp);
+      float rnd = hash(gi);
+      if (rnd > 0.994) {
+        float tw = 0.55 + 0.45 * sin(uTime * (0.8 + rnd * 40.0) + rnd * 97.0);
+        float star = smoothstep(0.40, 0.0, length(fract(gp) - 0.5)) * tw;
+        col += vec3(0.42, 0.58, 0.95) * star * 0.052;
+      }
+
+      col *= 0.66 + 0.34 * core;               // 暗角：四周压暗，主体更突出
       gl_FragColor = vec4(col, 1.0);
       #include <colorspace_fragment>
     }
@@ -691,22 +760,33 @@ bgMesh.position.set(0, 0, -60);
 scene.add(camera);
 scene.background = null;      // 让这层渐变接管背景
 
-// 尘埃：世界坐标里的一小把点，缓慢漂移 + 呼吸式明暗，撞到边界就绕回
-const DUST_N = 260;
+// 尘埃：世界坐标里的一小把点，缓慢上浮 + 横向游走 + 呼吸式明暗，越界自然绕回。
+// 漂移放在顶点着色器里算（CPU 不动这些点），中断/后台回来也不会跳。
+const DUST_N = 380;
 const dustPos = new Float32Array(DUST_N * 3);
 const dustSeed = new Float32Array(DUST_N);
 const dustGeo = new THREE.BufferGeometry();
 dustGeo.setAttribute('position', new THREE.BufferAttribute(dustPos, 3).setUsage(THREE.DynamicDrawUsage));
 dustGeo.setAttribute('aSeed', new THREE.BufferAttribute(dustSeed, 1));
 const dustMat = new THREE.ShaderMaterial({
-  uniforms: { uTime: { value: 0 }, uHalfH: { value: BOUND }, uPR: { value: 1 } },
+  uniforms: {
+    uTime: { value: 0 }, uHalfH: { value: BOUND }, uPR: { value: 1 },
+    uHalf: { value: new THREE.Vector2(BOUND, BOUND) }
+  },
   vertexShader: `
     attribute float aSeed;
     uniform float uTime;
     uniform float uPR;
+    uniform vec2 uHalf;
     varying float vAlpha;
     void main() {
-      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vec3 p = position;
+      // 上浮 + 缓慢横向摆动：每颗有自己的速度与相位，整体像一层极慢的浮尘
+      float sp = 0.18 + fract(aSeed * 5.0) * 0.55;
+      p.y = mod(p.y + uTime * sp + uHalf.y, uHalf.y * 2.0) - uHalf.y;
+      p.x += sin(uTime * (0.05 + fract(aSeed * 9.0) * 0.06) + aSeed * 6.2831)
+             * (0.6 + fract(aSeed * 17.0) * 2.2);
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
       gl_Position = projectionMatrix * mv;
       // 每颗尘埃自己呼吸，周期 6~14 秒，明暗只在 0.35~1 之间
       float ph = aSeed * 6.2831;
@@ -745,6 +825,8 @@ function seedDust() {
   }
   dustGeo.attributes.position.needsUpdate = true;
   dustGeo.attributes.aSeed.needsUpdate = true;
+  // 漂移范围也跟着场地走：窗口比例变了，浮尘不会全挤到一边
+  dustMat.uniforms.uHalf.value.set(bd.hx, bd.hy);
 }
 seedDust();
 
@@ -1687,6 +1769,8 @@ bindNum(fMotion, 'flow', 0, 4, 0.05, '气流扰动',
   '气流扰动｜调大：鸟更容易被随机气流带偏，运动更自然，但队形更松散。调 0：完全按三规则飞行。');
 bindNum(fMotion, 'arrowSize', 0.18, 0.9, 0.01, '元素大小',
   '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍，再整体 ×2），所以它只影响外观，不影响运动规则。');
+bindBool(fMotion, 'wrapEdges', '屏幕边缘穿越',
+  '屏幕边缘穿越｜开启：墙不存在，鸟和猛禽飞出画面后从对侧同一高度飞回来（等价环面，群体能完整地穿过去再聚回来）。关闭：墙变成实体，撞到边缘就弹开（速度损失 8%），捕食者也会被弹回来。');
 fMotion.open();
 
 const fPred = gui.addFolder('捕食与逃逸');
@@ -1740,15 +1824,6 @@ bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
   (v) => { syncGrassVisibility(); if (!v) liftAllResting(); });
 fGrass.open();
 
-const fSound = gui.addFolder('声音');
-bindNum(fSound, 'musicLevel', 0, 1.5, 0.01, '音乐音量',
-  '音乐音量｜0~1.5 的增益刻度，四层生成式音景总音量，默认 0.4（1.0 为标准响度）。嫌低频嗡嗡就往下调，0 完全关掉音乐（提示音仍保留）。',
-  (v) => music.setLevel(v));
-bindNum(fSound, 'fxLevel', 0, 1.5, 0.01, '音效音量',
-  '音效音量｜0~1.5 的增益刻度，事件提示音音量，默认 1.0 为标准响度，与音乐互不影响。',
-  (v) => { if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(v, audio.ctx.currentTime, 0.08); });
-fSound.close();
-
 // 恢复出厂参数：点右下角「重新初始化」才会走到这里，平时刷新都沿用存档。
 function applyDefaults() {
   for (const key of PERSIST_KEYS) params[key] = DEFAULTS[key];
@@ -1760,7 +1835,7 @@ function applyDefaults() {
   document.getElementById('hPred').textContent = params.predatorOn ? activeP : '0';
   arrowMat.uniforms.uMaxSpeed.value = params.maxSpeed;
   predMat.uniforms.uMaxSpeed.value = params.predSpeed;
-  // 音量也回到默认：音乐电平 + 音效总线
+  // 音量不给用户调：始终写回出厂满刻度（musicLevel / fxLevel = 1.5）
   syncGrassVisibility();
   liftAllResting();
   music.setLevel(params.musicLevel);
@@ -1810,9 +1885,10 @@ function sepCapFor(n) {
   return dbgSepCap || (n > 5000 ? 14 : n > 2000 ? 18 : 24);
 }
 let dbgNbrCap = 0;   // 调试用：覆盖注意力上限（0 = 用 NEIGHBOR_CAP）
-// 密度归一化基准：3×3 格计数 ≈ 4.5 × 格内鸟数。取值让默认 800 只的 p10/p50/p90
-// 大约落在 0.2 / 0.45 / 0.87，正好铺满原来的青蓝→紫渐变色阶。
-const LOCAL_DEN_K = 70;
+// 密度归一化基准：3×3 格里的活跃个体数。群体归拢后默认 800 只实测
+// p50 ≈ 115 只、p95 ≈ 200 只 / 9 格，取 224（= 160 × 1.4）让 p50 落在 0.5、
+// p95 落在 0.9，青蓝→紫整条色阶铺得开（用 70/110 时中位以上全部顶格 1.0）。
+const LOCAL_DEN_K = 160;
 
 // ---------------------------------------------------------------- 模拟
 function step(dt, time) {
@@ -1830,7 +1906,9 @@ function step(dt, time) {
   const SEP_SAT = 4.0 / params.separationRange;
   // 密度基准随数量线性放大：格数固定时 3×3 计数 ∝ n，固定 70 在 2500 只就全体
   // 顶格 1.0（用户看到的「不变紫色」）。起步 1.4 让默认 800 只的 p95 也留余量。
-  const denK = LOCAL_DEN_K * 1.4 * Math.max(1, n / 800);
+  // 归拢半径按 sqrt(n) 放大 → 群体密度近似不随数量变，所以基准也按 sqrt(n) 走；
+  // 早先按 n 线性放大是给「铺满全屏」的分布调的，现在会把大数量的色阶压成全蓝。
+  const denK = LOCAL_DEN_K * 1.4 * Math.sqrt(Math.max(1, n / 800));
   const maxSpeed = params.maxSpeed;
   const maxForce = MAX_FORCE;
   const B = BOUND;
@@ -1851,6 +1929,10 @@ function step(dt, time) {
   // 拓扑式邻域：每只鸟只取最近的 7 只（见 NEIGHBOR_CAP），单帧配对量 = 7n。
   const neighborCap = dbgNbrCap || NEIGHBOR_CAP;
   const sepCap = sepCapFor(n);   // 只跟数量有关，每帧算一次
+  // 长程归拢半径按数量开方放大（800 只时就是 FLOCK_KEEP_R），夹在 12~60：
+  // 太小在数量大时会把群体压成实心球，太大就等于没有这条力。
+  const keepR = Math.min(60, Math.max(12, FLOCK_KEEP_R * Math.sqrt(n / 800)));
+  const keepR2 = keepR * keepR;
   // 群体巡航节奏：无威胁时统一收敛到巡航速度的 78%，受惊/爆发才放开到上限。
   const paceSpeed = maxSpeed * 0.78;
   currentPace = paceSpeed;
@@ -2089,14 +2171,20 @@ function step(dt, time) {
       predPos[q] = ppx + nvx * dt;
       predPos[q + 1] = ppy + nvy * dt;
       predPos[q + 2] = 0;
-      // 穿墙：与鸟完全相同的规则——越界后从关于中心对称的位置继续出现，
-      // 速度方向不变（所以进场时一定朝场内），不反射、不散射、不夹紧。
-      if (wrapThroughWall(predPos[q], predPos[q + 1], hx, hy)) {
+      // 边界：与鸟完全相同的规则。开穿越 → 对侧同高度继续飞（速度方向不变）；
+      // 关穿越 → 撞到实体墙，越界方向的速度分量反转（保留 92%）。
+      if (params.wrapEdges) {
+        if (wrapThroughWall(predPos[q], predPos[q + 1], hx, hy)) {
+          predPos[q] = wrapX; predPos[q + 1] = wrapY;
+          predVel[q] = nvx; predVel[q + 1] = nvy;
+          teleportCount++;
+          // 尾迹粒子留在旧位置（历史航迹），但发射包络要清零，免得落点凭空接一段
+          predTrailP[p] = 0; predTrailNextAt[p] = 0;
+        }
+      } else if (bounceOffWall(predPos[q], predPos[q + 1], hx, hy)) {
         predPos[q] = wrapX; predPos[q + 1] = wrapY;
-        predVel[q] = nvx; predVel[q + 1] = nvy;
-        teleportCount++;
-        // 尾迹粒子留在旧位置（历史航迹），但发射包络要清零，免得落点凭空接一段
-        predTrailP[p] = 0; predTrailNextAt[p] = 0;
+        if (bounceX) { nvx = -nvx * 0.92; predVel[q] = nvx; }
+        if (bounceY) { nvy = -nvy * 0.92; predVel[q + 1] = nvy; }
       }
     }
   }
@@ -2111,17 +2199,25 @@ function step(dt, time) {
     const px = predPos[q], py = predPos[q + 1];
     predPrev[q] = px; predPrev[q + 1] = py; predPrev[q + 2] = 0;
     const follow = 1 - Math.exp(-dt / 0.045);
-    // 光标目标也按穿墙归一化：光标拖到窗口边缘外时，目标落到对侧对应位置，
-    // 捕食者一路飞过去（沿途穿墙），而不是贴着边界来回蹭。
+    // 光标拖到窗口外：开穿越时目标落到对侧（一路飞过去穿墙），关穿越时目标夹在墙内。
     let tgx = mouseTgt.x, tgy = mouseTgt.y;
-    if (wrapThroughWall(tgx, tgy, hx, hy)) { tgx = wrapX; tgy = wrapY; }
+    if (params.wrapEdges) {
+      if (wrapThroughWall(tgx, tgy, hx, hy)) { tgx = wrapX; tgy = wrapY; }
+    } else {
+      tgx = tgx > hx ? hx : (tgx < -hx ? -hx : tgx);
+      tgy = tgy > hy ? hy : (tgy < -hy ? -hy : tgy);
+    }
     let nx = px + (tgx - px) * follow;
     let ny = py + (tgy - py) * follow;
-    // 与鸟完全相同的穿墙规则：越界后从关于中心对称的位置继续出现，不夹紧、不反弹
-    if (wrapThroughWall(nx, ny, hx, hy)) {
+    // 边界规则与 AI 捕食者、鸟完全一致
+    if (params.wrapEdges) {
+      if (wrapThroughWall(nx, ny, hx, hy)) {
+        nx = wrapX; ny = wrapY;
+        teleportCount++;
+        predTrailP[slot] = 0; predTrailNextAt[slot] = 0;
+      }
+    } else if (bounceOffWall(nx, ny, hx, hy)) {
       nx = wrapX; ny = wrapY;
-      teleportCount++;
-      predTrailP[slot] = 0; predTrailNextAt[slot] = 0;
     }
     // 单帧跨得太远（切标签页回来、缩放/平移后光标位置突变）就不做扫掠：
     // 否则判定会用「上一帧 → 这一帧」这条长线，沿途吃掉一整排鸟。
@@ -2356,7 +2452,13 @@ function step(dt, time) {
     }
     neighbors[i] = count;
     sumNeighbors += count;
-    cx += px; cy += py; cz += pz;
+    // 质心累计用「相对上一帧质心的最小映像位移」：鸟穿墙的那一瞬间位置会跳到对侧，
+    // 直接累加坐标会让质心跟着跳、把「群体归拢」的方向整个翻过来（鸟群因此被拉回中场
+    // 而不是顺着速度穿过去）。按最小映像算，跨边界的个体对质心的贡献是连续的。
+    let cdx = px - groupX, cdy = py - groupY;
+    if (cdx > hx) cdx -= 2 * hx; else if (cdx < -hx) cdx += 2 * hx;
+    if (cdy > hy) cdy -= 2 * hy; else if (cdy < -hy) cdy += 2 * hy;
+    cx += cdx; cy += cdy; cz += pz;
 
     let fx = 0, fy = 0, fz = 0;
     if (count > 0) {
@@ -2382,6 +2484,27 @@ function step(dt, time) {
         if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
         fx += tx * params.cohesion; fy += ty * params.cohesion; fz += tz * params.cohesion;
       }
+    }
+    // ---- 群体归拢（长程）----
+    // 局部规则只看 7 只邻居（视野 7），一旦两坨鸟的间距超过视野，它们就永久互不相见：
+    // 强分离把群体压成许多个「结晶小团」，彼此既不吸引也不排斥，于是整屏散着一小坨一小坨
+    // （实测 800 只稳定在 5~9 团，群体 RMS 半径 42 ≈ 铺满全屏）。
+    // 真实的椋鸟群是整群一起转向的：归拢这件事本来就不只发生在最近的 7 只之间。
+    // 这里补一条只对「离群体质心太远」的个体生效的弱长程吸引，把结晶小团慢慢拉回到一起；
+    // 质心附近的个体不受力，所以不会把队伍压成一块实心板。
+    // 力度随超出量线性增长但整体很小（远小于 maxForce）：它只负责「方向上的缓慢修正」，
+    // 真正决定队形的仍是前面三条规则。
+    let rgx = groupX - px, rgy = groupY - py;
+    if (rgx > hx) rgx -= 2 * hx; else if (rgx < -hx) rgx += 2 * hx;
+    if (rgy > hy) rgy -= 2 * hy; else if (rgy < -hy) rgy += 2 * hy;
+    const rg2 = rgx * rgx + rgy * rgy;
+    // 归拢半径随数量放大（面积 ∝ 数量 → 密度不随数量暴涨），否则 3000 只会被压成
+    // 和 800 只同样大小的实心球（实测 rms 都是 22，密度色阶全体顶格）。
+    if (rg2 > keepR2) {
+      const rg = Math.sqrt(rg2);
+      const w = Math.min(1.6, (rg - keepR) / keepR);
+      fx += rgx / rg * FLOCK_KEEP_F * w;
+      fy += rgy / rg * FLOCK_KEEP_F * w;
     }
     // ---- 分离 ----
     // 拥挤度必须由「最近那只挤得多近」（maxW = max 1/(d²+ε)）决定，不能用加权和
@@ -2617,7 +2740,12 @@ function step(dt, time) {
     const FSM = 0.55;
     acc[k] += (fx - acc[k]) * FSM; acc[k + 1] += (fy - acc[k + 1]) * FSM; acc[k + 2] = 0;
   }
-  if (aliveN > 0) { groupX = cx / aliveN; groupY = cy / aliveN; groupZ = 0; }
+  if (aliveN > 0) {
+    groupX += cx / aliveN; groupY += cy / aliveN; groupZ = 0;
+    // 质心也夹回场内：它外面还有「测距、声像、巡逻点」一堆代码按场地坐标在用它。
+    if (groupX > hx) groupX -= 2 * hx; else if (groupX < -hx) groupX += 2 * hx;
+    if (groupY > hy) groupY -= 2 * hy; else if (groupY < -hy) groupY += 2 * hy;
+  }
 
   let speedSum = 0, keSum = 0;
   for (let i = 0; i < n; i++) {
@@ -2665,16 +2793,22 @@ function step(dt, time) {
 
     pos[k] += vx * dt; pos[k + 1] += vy * dt;
 
-    // ---- 穿墙：墙视为不存在 ----
-    // 越界后统一从「关于场地中心对称」的位置继续出现（左边偏下飞出 → 右边偏上
-    // 飞进），速度方向保持不变，所以刚进场的个体一定是朝场内飞的。
-    // 不再有弹性反射、随机散射，也不再按概率触发——所有个体规则一致。
-    if (wrapThroughWall(pos[k], pos[k + 1], hx, hy)) {
+    // ---- 边界：穿墙（面板可关）或实体墙反弹 ----
+    // 开：越界后从对侧同高度继续出现，速度方向不变（刚进场一定朝场内飞），
+    //     无概率、无反射、无散射——所有个体规则一致。
+    // 关：墙变成实体，只反转越界方向的速度分量（保留 92%），鸟是真的「撞一下弹开」。
+    if (params.wrapEdges) {
+      if (wrapThroughWall(pos[k], pos[k + 1], hx, hy)) {
+        pos[k] = wrapX; pos[k + 1] = wrapY;
+        teleportCount++;
+        // 穿墙是瞬移：尾迹粒子留在旧位置是对的（历史航迹），但发射包络要清零，
+        // 免得落点接着撒出一段凭空出现的尾迹。
+        trailNextAt[i] = 0; birdTrailP[i] = 0;
+      }
+    } else if (bounceOffWall(pos[k], pos[k + 1], hx, hy)) {
       pos[k] = wrapX; pos[k + 1] = wrapY;
-      teleportCount++;
-      // 穿墙是瞬移：尾迹粒子留在旧位置是对的（历史航迹），但发射包络要清零，
-      // 免得落点接着撒出一段凭空出现的尾迹。
-      trailNextAt[i] = 0; birdTrailP[i] = 0;
+      if (bounceX) { vx = -vx * 0.92; vel[k] = vx; }
+      if (bounceY) { vy = -vy * 0.92; vel[k + 1] = vy; }
     }
     pos[k + 2] = 0; vel[k + 2] = 0;
 
@@ -2734,7 +2868,10 @@ function step(dt, time) {
     }
     // 参考点必须是用质心（cx 此时还是坐标总和，需要除以 aliveN），
     // 之前直接用总和对减，算出来的半径大了一个数量级，相干度永远是 0。
-    const dx = pos[k] - groupX, dy = pos[k + 1] - groupY;
+    // 跨边界的一对个体按最小映像取近路，否则鸟群压着接缝飞时半径会虚高成整个场宽。
+    let dx = pos[k] - groupX, dy = pos[k + 1] - groupY;
+    if (dx > hx) dx -= 2 * hx; else if (dx < -hx) dx += 2 * hx;
+    if (dy > hy) dy -= 2 * hy; else if (dy < -hy) dy += 2 * hy;
     spread += dx * dx + dy * dy;
   }
   orderParam = dirN > 0 ? Math.sqrt((dirX) * (dirX) + (dirY) * (dirY)) / dirN : 0;
@@ -2879,9 +3016,11 @@ function render(now) {
     rVel[k] += (vel[k] - rVel[k]) * SMOOTH;
     rVel[k + 1] += (vel[k + 1] - rVel[k + 1]) * SMOOTH;
     if (caught[i]) { siz[i] = 0; continue; }   // 等待重生的 1 秒完全隐藏
-    // 沿用原来的密度刻度：7 只拓扑邻居对应 0.29，整体偏青蓝，
-    // 稀疏到看不见同伴时更蓝，不会因为改了邻域规则就整群烧成洋红。
-    const local = Math.min(1, neighbors[i] / 24);
+    // 色阶用局部密度（3×3 格里的活跃个体数），**不是** neighbors[i]。
+    // neighbors[i] 是「注意力邻居数」，v31 把它固定成最多 7 只，所以它最多只能到
+    // 7/24 = 0.29 → 色相永远停在青蓝端，用户看到的「再怎么聚也不变紫」就是这条：
+    // 密度色阶被注意力上限锁死了。localDen 独立于注意力（见 step），才铺得开。
+    const local = localDen[i];
     const vx = vel[k], vy = vel[k + 1];
     const speedRatio = Math.min(1, Math.sqrt(vx * vx + vy * vy) * invMaxSpeed);
     const q = (local * (PAL_Q - 1) + 0.5) | 0;
@@ -2989,7 +3128,15 @@ function render(now) {
     for (let p = 0; p < trailPN; p++) {
       const target = Math.min(1, predAccel[p] / PRED_TRAIL_REF);
       const kEnv = target > predTrailP[p] ? (1 - Math.exp(-dt / 0.03)) : (1 - Math.exp(-dt / 0.40));
+      const prevEnv = predTrailP[p];
       predTrailP[p] += (target - predTrailP[p]) * kEnv;
+      // 加速音效：包络「由低冲高」越过 0.30 时响一次（边沿触发，不是每帧；0.30 ≈ 加速度 13.5，
+      // 也就是扑击起步与急转都会响，匀速巡航不会），
+      // 每只捕食者 400ms 内最多一次，避免扑击时连成一片。
+      if (predTrailP[p] > 0.30 && prevEnv <= 0.30 && now >= predSoundAt[p]) {
+        predSoundAt[p] = now + 400;
+        audio.predDash(predTrailP[p]);
+      }
       if (predTrailP[p] <= 0.18) continue;      // 匀速直线与普通续航转向不出尾迹
       if (now < predTrailNextAt[p]) continue;
       predTrailNextAt[p] = now + 14 + Math.random() * 10;
@@ -3001,6 +3148,10 @@ function render(now) {
   }
 
   trailMat.uniforms.uTime.value = now;      // 顶点着色器用绝对时间算 age
+  // 背景与浮尘的动画时钟（秒）：星云漂移、星点闪烁、浮尘上浮都靠它
+  const bgT = now * 0.001;
+  bgMat.uniforms.uTime.value = bgT;
+  dustMat.uniforms.uTime.value = bgT;
   trailGeo.instanceCount = MAX_TRAILS;      // 恒定：过期粒子在顶点着色器里被裁掉
   if (trailDirty) {
     aTrPos.needsUpdate = true; aTrDir.needsUpdate = true; aTrCol.needsUpdate = true;
@@ -3193,6 +3344,9 @@ addEventListener('resize', () => {
   updateOrthoFrustum();
   renderer.setSize(innerWidth, innerHeight);
   bgMat.uniforms.uHalf.value.set(innerWidth, innerHeight);
+  dustMat.uniforms.uPR.value = Math.min(2, devicePixelRatio || 1);
+  const bdDust = bounds2D();
+  dustMat.uniforms.uHalf.value.set(bdDust.hx, bdDust.hy);
   // 场地宽度随屏幕比例变化：草地若被挤到场地外，就重新长一次
   const bd = bounds2D();
   const out = grass.some((g) => Math.abs(g.x) + g.R * 1.2 > bd.hx || Math.abs(g.y) + g.R * 1.2 > bd.hy);
@@ -3604,6 +3758,12 @@ window.FlockLab = {
   },
   get capSample() { return Array.from(capNow.slice(0, 8)).map((v) => +v.toFixed(2)); },
   get bound() { return BOUND; },
+  // 长程归拢的两个常数（调参用）：半径内不受力，半径外按超出比例拉回群体质心。
+  get flockKeep() { return { r: FLOCK_KEEP_R, f: FLOCK_KEEP_F }; },
+  setFlockKeep(r, f) {
+    FLOCK_KEEP_R = Math.max(1, +r); FLOCK_KEEP_F = Math.max(0, +f);
+    return { r: FLOCK_KEEP_R, f: FLOCK_KEEP_F };
+  },
   get positions() {
     return Array.from({ length: activeCount }, (_, i) => ({
       x: +pos[i * 3].toFixed(2), y: +pos[i * 3 + 1].toFixed(2),
