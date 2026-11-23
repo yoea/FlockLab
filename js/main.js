@@ -230,13 +230,27 @@ const restAng = new Float32Array(MAX_N);            // 站定时保持的朝向 
 const restPhase = new Float32Array(MAX_N);          // 个体作息相位 0~1：把出发 / 离场时间天然错开
 const restSwapAt = new Float64Array(MAX_N).fill(Infinity);  // 老住客换位的错峰起步时刻
 const restFleeAt = new Float64Array(MAX_N).fill(Infinity);  // 受惊后的错峰起飞时刻
+// ---- 休息保障 / 争夺地盘 ----
+// 草地容量有限（grass.js 的 gp.cap），排不上队的鸟不能被无限期晾着：
+//   等待 REST_WAIT_NUDGE 后 → 有权请走「已经休息满 5 秒」的老住客（优先休得最久的）；
+//   等待 REST_WAIT_FORCE 后 → 变红（争斗色），强行驱赶，争夺地盘。
+// 这样每只鸟都能在规定时间内休息到，不会出现「老实鸟永远进不去」。
+const contending = new Uint8Array(MAX_N);                 // 争地盘中：全身泛红
+const restWaitFrom = new Float64Array(MAX_N).fill(Infinity);  // 排队开始时刻（进草地即清）
+const restEvictAt = new Float64Array(MAX_N).fill(0);          // 被赶走的保护期，防两只鸟无限互赶
 let restSessions = 0;   // 累计完成的草地休憩次数（状态卡用）
 let flyLandings = 0;   // 「掠过草地顺手落下」的次数（调试用）
+let restEvictCount = 0;   // 累计「请走/赶走」次数（验证争夺机制真的在跑）
 const overGrass = new Uint8Array(MAX_N);            // 上一帧是否正在草地正上方（用于「掠过」判定）
 const REST_SPACING = 1.5;                           // 草地上个体之间要保持的最小距离（≈6 个身位）
 // 单次停留上限 60 秒：基础 28~50 秒 + 个体作息相位 0~10 秒。
 // 相位让同批落地的鸟不会在同一秒集体起飞（拆分后这两个常量曾漏定义，务必保留）。
 const REST_MAX_MIN = 28000, REST_MAX_SPAN = 22000, REST_PHASE_SPAN = 10000;
+const REST_WAIT_NUDGE = 5000;      // 排队多久后可以礼貌请走老住客（对方须已休息满 5 秒）
+const REST_WAIT_FORCE = 10000;     // 排队多久后变红强行驱赶（不限对方休息时长）
+const REST_MIN_EVICT_DWELL = 5000; // 可被「礼貌请走」的最短已休时长
+const REST_EVICT_GUARD = 12000;    // 被赶走后的保护期
+const REST_CONTENTION_FADE = 2500; // 抢到位子后争斗色再保留 2.5 秒才褪
 // 落点微调只用「速度积分走过去」，绝不直接写 pos——那一下就是肉眼可见的瞬移。
 // 半径放大到 1.25 仍能保持连续：鸟会花 1~2 秒慢慢走过去，而不是一帧跳过去。
 const REST_NUDGE_MIN = 0.45, REST_NUDGE_MAX = 1.25;
@@ -388,6 +402,7 @@ function initBoids(from, to, isBirth = false) {
     alertMs[i] = 0; trailNextAt[i] = 0; birdTrailP[i] = 0;
     resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
     restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
+    contending[i] = 0; restWaitFrom[i] = Infinity; restEvictAt[i] = 0;
     rollTraits(i);
     // 首次「想休息」的时刻铺到 3~35 秒（含个体相位），避免开局一波同时出发
     restDue[i] = performance.now() + 3000 + Math.random() * 22000 + restPhase[i] * 10000;
@@ -429,6 +444,7 @@ function spawnFar(i, now) {
   alertMs[i] = 0; trailNextAt[i] = 0;
   resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
+  contending[i] = 0; restWaitFrom[i] = Infinity; restEvictAt[i] = 0;
   rollTraits(i);   // 重生等于换一只新个体：速度脾气、游走相位和作息相位都重新抽
   restDue[i] = now + 4000 + Math.random() * 20000 + restPhase[i] * 8000;
 }
@@ -804,6 +820,27 @@ function nearbyRestPoint(gp, i, px, py) {
   return [bx, by];
 }
 
+// 从一片草地上请走一位「已经休息够久」的住客，腾出位子给排队的鸟。
+// force=false：只请走已休息满 REST_MIN_EVICT_DWELL 的（礼貌，符合「优先赶走
+//   已在草地休息满 5 秒的鸟」）；force=true（争地盘）时连刚坐下不久的也请走。
+// 挑「休得最久」的那位先让位；被请走的鸟 endRest 会按已休时长重排下次休息，
+// 并有 REST_EVICT_GUARD 保护期，避免两只鸟来回互赶。
+function evictFromGrass(gp, time, force) {
+  let evict = -1, longest = -1;
+  for (const j of gp.members) {
+    if (!settled[j] || time < restEvictAt[j]) continue;
+    const dwell = time - restSince[j];
+    if (force) { if (dwell < 1200) continue; }        // 刚落地 1 秒多的别赶，看着太怪
+    else if (dwell < REST_MIN_EVICT_DWELL) continue;
+    if (dwell > longest) { longest = dwell; evict = j; }
+  }
+  if (evict < 0) return -1;
+  endRest(evict, time, true);
+  restEvictAt[evict] = time + REST_EVICT_GUARD;
+  restEvictCount++;
+  return evict;
+}
+
 function startRest(i, time) {
   const k = i * 3;
   let best = -1, bestD2 = Infinity;
@@ -814,10 +851,23 @@ function startRest(i, time) {
     const d2 = dx * dx + dy * dy;
     if (d2 < bestD2) { bestD2 = d2; best = g; }
   }
-  // 都满了：重试时间必须带随机抖动，否则所有被挡住的鸟会在同一秒再冲一次
+  // 都满了：排队等位，先礼后兵（见 evictFromGrass 与 REST_WAIT_* 的说明）。
+  // 不再像旧版那样干等 1.8~11 秒重试——那会让老实鸟永远排不上。
   if (best < 0) {
-    restDue[i] = time + 1800 + Math.random() * 4200 + restPhase[i] * 5000;
-    return;
+    if (restWaitFrom[i] === Infinity) restWaitFrom[i] = time;
+    const waited = time - restWaitFrom[i];
+    if (waited > REST_WAIT_FORCE) contending[i] = 1;   // 变红：争夺地盘
+    if (waited >= REST_WAIT_NUDGE) {
+      const force = contending[i] === 1;
+      for (let g = 0; g < grass.length; g++) {
+        if (evictFromGrass(grass[g], time, force) >= 0) { best = g; break; }
+      }
+    }
+    if (best < 0) {
+      // 还挤不进去就短间隔再试（抖动避免同批排队的鸟同一秒齐冲）
+      restDue[i] = time + 900 + Math.random() * 1600 + restPhase[i] * 800;
+      return;
+    }
   }
   const gp = grass[best];
   // 软错峰：本帧出发的鸟够多了就顺延 0.25~2 秒，不取消这次休息。
@@ -832,6 +882,7 @@ function startRest(i, time) {
   resting[i] = 1; settled[i] = 0; restPatch[i] = best;
   restMoves[i] = 0; restTries[i] = 0;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
+  restWaitFrom[i] = Infinity;   // 排队结束；争斗色由 restSince 计时自动褪（见 step）
   gp.members.add(i); gp.count = gp.members.size;
   restSince[i] = 0;
   waveStart++;
@@ -876,6 +927,7 @@ function landHere(i, g, time) {
   resting[i] = 1; settled[i] = 0; restPatch[i] = g;
   restMoves[i] = 0; restTries[i] = 0; restSince[i] = 0;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
+  restWaitFrom[i] = Infinity;
   gp.members.add(i); gp.count = gp.members.size;
   waveStart++;
   restApproachUntil[i] = time + 2500;     // 已经在草地上方，很快就能停稳
@@ -898,6 +950,7 @@ function endRest(i, time, scared) {
   const wasSettled = settled[i] === 1;
   resting[i] = 0; settled[i] = 0;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
+  contending[i] = 0; restWaitFrom[i] = Infinity;
   const g = restPatch[i];
   if (g >= 0 && grass[g]) { grass[g].members.delete(i); grass[g].count = grass[g].members.size; }
   restPatch[i] = -1;
@@ -1878,8 +1931,17 @@ function step(dt, time) {
           for (let tries = 0; tries < 10; tries++) {
             bx = (Math.random() * 2 - 1) * hx * 0.62;
             by = (Math.random() * 2 - 1) * hy * 0.62;
+            // 饱食时巡逻点也别落在草地上：路径天然从草地边上绕过去，
+            // 配合上面的避让推力，看上去就是「有意识地避开」而不是硬撞后弹开。
+            let onGrass = false;
+            for (let g = 0; g < grass.length; g++) {
+              const gp = grass[g];
+              const ddx = bx - gp.x, ddy = by - gp.y;
+              const rr = gp.R * 1.15;
+              if (ddx * ddx + ddy * ddy < rr * rr) { onGrass = true; break; }
+            }
             const dd = Math.sqrt((bx - ppx) * (bx - ppx) + (by - ppy) * (by - ppy));
-            if (dd > Math.min(16, hy * 0.6)) break;
+            if (!onGrass && dd > Math.min(16, hy * 0.6)) break;
           }
           predWp[p * 2] = wx = bx; predWp[p * 2 + 1] = wy = by;
           predWpUntil[p] = time + 6000 + Math.random() * 5000;
@@ -1996,6 +2058,27 @@ function step(dt, time) {
         ay += (-pvy) * (4 + 9 * s) * s + 8 * s;
         ax += psgn * pspeed * (2 + 5 * s) * s;
       }
+      // 饱食（进食冷却中）的捕食者会刻意避让草地：还没碰到草地边缘时就沿
+      // 「离开草地」方向施加一个渐强的推力——不是硬性禁止穿行（真撞上也允许
+      // 过去），而是像有意识地绕开正在休息的鸟群。追逐时（不 cooling）不避让，
+      // 免得把猎物赶到草地上就追不下去了。
+      if (cooling) {
+        for (let g = 0; g < grass.length; g++) {
+          const gp = grass[g];
+          const dx = ppx - gp.x, dy = ppy - gp.y;
+          const d2 = dx * dx + dy * dy;
+          const edge = gp.R * 1.3 + 2.5;        // 提前量：还没贴上就先让开
+          const e2 = edge * edge;
+          if (d2 < e2 && d2 > 1e-6) {
+            const d = Math.sqrt(d2);
+            const s = 1 - d / edge;             // 0~1，越贴边越强（已在内部时 s 更大）
+            // 幅度按 s² 陡增：离得远几乎不干预（可以大胆靠近草地），
+            // 只在快贴上的最后几米才用力拐开——所以是「有意识地避开」而不是远远躲着走。
+            const inv = (9 + 44 * s * s) * s / d;
+            ax += dx * inv; ay += dy * inv;
+          }
+        }
+      }
       az = 0;
 
       // 记下这一帧施加的加速度模长：拖尾的长度与显隐都由它决定。
@@ -2090,6 +2173,9 @@ function step(dt, time) {
       acc[k] = 0; acc[k + 1] = 0; acc[k + 2] = 0;
       fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
       fleeing[i] = 0; neighbors[i] = 0;
+      // 争斗色自动褪去：抢到位子坐下 REST_CONTENTION_FADE 后恢复正常体色，
+      // 让「刚争夺成功」这件事在画面上留一下，但不整场都是红鸟。
+      if (contending[i] && settled[i] && restSince[i] > 0 && time - restSince[i] > REST_CONTENTION_FADE) contending[i] = 0;
 
       // 老住客换位：到点才起身，落点只在身边半步内，位移交给速度积分（绝不瞬移）。
       if (settled[i] && time >= restSwapAt[i]) {
@@ -2852,6 +2938,13 @@ function render(now) {
       const o = (q * PAL_S + ((speedRatio * (PAL_S - 1) + 0.5) | 0)) * 3;
       cr = palFly[o]; cg = palFly[o + 1]; cb = palFly[o + 2];
     }
+    // 争地盘的鸟全身泛红（见 startRest 的 REST_WAIT_FORCE）：一眼看出谁在抢位置。
+    if (contending[i]) {
+      const w = 0.78;
+      cr = cr * (1 - w) + 0.95 * w;
+      cg = cg * (1 - w) + 0.18 * w;
+      cb = cb * (1 - w) + 0.14 * w;
+    }
     let size = arrowBase + local * 0.10;
     // 新生个体：亮绿色 + 轻微脉冲，1.8s 后开始渐变为普通色，3.2s 后完全一致。
     const age = now - birthAt[i];
@@ -3260,6 +3353,26 @@ window.FlockLab = {
   get orderParam() { return +orderParam.toFixed(3); },
   get groupAlert() { return groupAlert; },
   get restSessions() { return restSessions; },
+  // 草地容量与休息排队：验证「每只鸟都能在规定时间内休息到」。
+  // waiting = 正在排队等位的鸟（restWaitFrom 已记但还没抢到位）；
+  // contendingN = 已经变红在争夺地盘的鸟；evicted = 累计被请走的次数。
+  get grassStats() {
+    const patches = grass.map((p) => ({
+      x: +p.x.toFixed(1), y: +p.y.toFixed(1), R: +p.R.toFixed(1),
+      cap: p.cap, count: p.count, settled: [...p.members].filter((j) => settled[j]).length
+    }));
+    const t = performance.now();
+    let waiting = 0, contendingN = 0, waitMax = 0;
+    for (let i = 0; i < activeCount; i++) {
+      if (caught[i]) continue;
+      if (!resting[i] && restWaitFrom[i] !== Infinity) {
+        waiting++;
+        if (t - restWaitFrom[i] > waitMax) waitMax = t - restWaitFrom[i];
+      }
+      if (contending[i]) contendingN++;
+    }
+    return { patches, waiting, contending: contendingN, resting: restingCount, evicted: restEvictCount, waitMaxMs: Math.round(waitMax) };
+  },
   get hudPinned() { return hudEl.classList.contains('pinned'); },
   // 作息相位分布：验证出发 / 离场时间确实被逐只打散
   get restPhaseStats() {
