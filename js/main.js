@@ -404,6 +404,20 @@ let PRED_TRAIL_REF = 45;                         // 加速度达到这个值即�
 const predSpdJit = new Float32Array(MAX_SLOT);
 const predWobble = new Float32Array(MAX_SLOT);
 const predPrev = new Float32Array(MAX_SLOT * 3);  // 上一帧位置，用于「扫掠」碰撞检测
+// ---- 猛禽飞行动力学（P0）：朝向 / 角速度 / 飞行档位 ----
+// 旧实现是「力 → 速度」直接积分，速度上限被硬钳、下限被硬抬，
+// 所以既加不起速也减不下来，看上去像贴图在平移。现在拆成两件事：
+//   1) 朝向由一个受角加速度限制的航向角积分（有起转惯性，不能瞬间掉头）；
+//   2) 速率按「档位目标速度」加减速积分（加速有限、减速有限 → 有滑行）。
+const predHeading = new Float32Array(MAX_SLOT);    // 当前航向角（弧度，世界坐标）
+const predTurnRate = new Float32Array(MAX_SLOT);   // 当前角速度 rad/s（转向惯性就靠它）
+const predMode = new Uint8Array(MAX_SLOT);         // 0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲
+const predChaseFrom = new Float64Array(MAX_SLOT);  // 本次追击的起始时刻（放弃判定用）
+const predGiveUpUntil = new Float64Array(MAX_SLOT); // 放弃后到这一刻之前不再锁定目标
+predGiveUpUntil.fill(-Infinity);
+// 本次锁定的起始时刻：给「聚焦框」做收拢动画用（刚咬住目标时框从大收到贴合，
+// 0.2 秒的收拢比静态高亮更能读出「它刚刚盯上了这只」）。
+const predLockFrom = new Float64Array(MAX_SLOT);
 
 // ---------------------------------------------------------------- 鼠标捕食者
 // 双击画布：光标变成一只完全由人驾驶的捕食者（无速度上限、沿鼠标轨迹走，
@@ -479,9 +493,36 @@ function bounceOffWall(x, y, hx, hy) {
   return bounceX || bounceY;
 }
 let teleportCount = 0;   // 累计穿墙次数（状态卡「穿越」计数）
-const PRED_FORCE = 24;
 const PRED_SEP_RANGE2 = 6 * 6;
 const PRED_SEP_FORCE = 34;
+// 主推进不再用「加速度力」的语义：捕食者直接指定期望航向，再由角加速度积分出朝向
+// （见 frameBegin 里的猛禽动力学）。PRED_SEP_FORCE 只保留给捕食者之间的分离偏航。
+
+
+// ---- 猛禽动力学常数（P0）----
+// 这几个数决定「像不像一只鸟」：加速有限 → 起步要几秒；减速有限 → 冲过去还会滑一段；
+// 角速度有限 → 不能原地掉头，只能画一个大弧；角加速度有限 → 转弯是先起转再收住。
+const PRED_MAX_ACCEL = 22;      // 单位/秒²：从巡航加到全速约 0.6s，符合猛禽扑击前的加速段
+const PRED_MAX_DECEL = 30;      // 收速（改出俯冲 / 放弃追击）比加速快，但也不是瞬间
+const PRED_TURN_ACCEL = 7.0;    // 角加速度 rad/s²：转向靠倾斜身体，有惯性
+const PRED_TURN_SOFT = 1.7;     // 急转掉速的软化尺度（rad/s）：超过它的部分按平方扣速度
+const PRED_TURN_PEN = 0.35;     // 急转最多扣掉多少速率（0.35 → 追尾急转时还剩 77%）
+const PRED_MIN_FLY = 0.10;      // 最低飞行速度（相对 predSpeed）：猛禽不会悬停
+// 飞行档位：目标速度倍率 + 该档允许的最大角速度
+// glide 滑翔（吃饱后省力巡游）/ cruise 巡航（丢了目标在找）/ pursue 追击 / dive 俯冲
+const PRED_TIER_V = [0.42, 0.68, 1.00, 1.18];
+const PRED_TIER_TURN = [0.95, 1.55, 2.25, 1.70];   // 俯冲时反而转不动：真实猛禽俯冲是一条线
+const PRED_MODE_GLIDE = 0, PRED_MODE_CRUISE = 1, PRED_MODE_PURSUE = 2, PRED_MODE_DIVE = 3;
+const PRED_DIVE_RANGE = 11.0;   // 进入这个距离且大致对准了，才切俯冲档
+const PRED_DIVE_CONE = 0.70;    // 俯冲的「对准」容差（弧度）：偏太多直接俯冲会白扔高度
+// P1：追击超过这个时长就放弃（真实猛禽追几秒抓不到就走，省体力）
+const PRED_GIVEUP_MS = 5.5;
+const PRED_GIVEUP_JIT_MS = 2.2;
+const PRED_REST_MS = 1400;      // 放弃后短暂「另寻目标」的冷却
+// 目标评分权重：不选「最近的」，选「最划算的」
+const PRED_SCORE_CROWD = 0.85;  // 处在密集群里 → 难抓（会被同伴的警戒带偏，也更容易被绕晕）
+const PRED_SCORE_TIRED = 0.40;  // 体力耗尽的（刚冲刺过）→ 好抓
+const PRED_SCORE_ALERT = 0.35;  // 已经在逃的 → 稍微扣一点，但不像「人群密度」那么致命
 const BIRTH_TOTAL_MS = 3200;                    // 新生标记总时长：前 1.8s 亮绿，后 1.4s 渐变
 const BIRTH_SOLID_MS = 1800;
 const BURST_MS = 820;                           // 捕杀动画时长，三段音效与其对齐
@@ -617,6 +658,13 @@ function initPredators(from, to) {
     predTrailAmt[p] = 0; predTrailP[p] = 0; predHeat[p] = 1;
     predSpdJit[p] = 0.9 + Math.random() * 0.2;
     predWobble[p] = Math.random() * Math.PI * 2;
+    // 动力学状态：出生时按当前速度定朝向，角速度与档位从零开始（首帧会自己起转）。
+    predHeading[p] = Math.atan2(predVel[k + 1], predVel[k]) || 0;
+    predTurnRate[p] = 0;
+    predMode[p] = PRED_MODE_CRUISE;
+    predChaseFrom[p] = 0;
+    predGiveUpUntil[p] = -Infinity;
+    predLockFrom[p] = -Infinity;
   }
 }
 initPredators(0, activeP);
@@ -633,6 +681,7 @@ const resetBoids = () => {
   waveStartMax = 0; waveEndMax = 0;
   caught.fill(0); respawnAt.fill(0);
   predTarget.fill(-1); predLockUntil.fill(0); predPulseAt.fill(-Infinity);
+  predChaseFrom.fill(0); predGiveUpUntil.fill(-Infinity); predLockFrom.fill(-Infinity);
   clearBursts();
 };
 // 鼠标捕食者永远占「AI 数量」这个槽位：数量或开关一变就要搬一次。
@@ -1647,6 +1696,66 @@ for (let p = 0; p < MAX_SLOT; p++) {
   predSiz[p] = predLeg();
 }
 
+// ---------------------------------------------------------------- 锁定聚焦框
+// 被 AI 捕食者锁定的鸟，会在外面套一个极细的四角括号框（正十字形的角线 + 一圈
+// 几乎看不见的整框）。索敌本身是有时效的（lockTime 续期、追不到就放弃），
+// 所以框用一段 0.2 秒的「收拢」动画表达「它刚刚盯上了这只」，丢失目标时再淡出：
+// 一眼就能看出场上现在有没有人在被瞄。
+const lockGeo = new THREE.PlaneGeometry(2, 2);
+const lockFrames = [];
+for (let p = 0; p < MAX_SLOT; p++) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uAlpha: { value: 0 } },
+    vertexShader: `
+      varying vec2 vLocal;
+      void main() {
+        vLocal = position.xy;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vLocal;
+      uniform float uAlpha;
+      void main() {
+        vec2 a = abs(vLocal);
+        // 线宽按半宽比例给：mesh 跟着鸟缩放，看上去始终是「一根极细的线」。
+        float w = 0.028;
+        float al = 0.014;                       // 抗锯齿过渡，避免硬边闪烁
+        float lineX = smoothstep(1.0 - w - al, 1.0 - w, a.x);
+        float lineY = smoothstep(1.0 - w - al, 1.0 - w, a.y);
+        float len = 0.34;                       // 角线长度（相对半宽）
+        float segX = lineX * smoothstep(1.0 - len - al, 1.0 - len, a.y);
+        float segY = lineY * smoothstep(1.0 - len - al, 1.0 - len, a.x);
+        // 四角括号实、整框只有一成的亮度：既是「准星」，又不会盖住鸟本身。
+        float m = max(max(segX, segY), max(lineX, lineY) * 0.16);
+        float a2 = m * uAlpha;
+        if (a2 < 0.004) discard;
+        gl_FragColor = vec4(0.80, 0.95, 1.0, a2);
+        #include <colorspace_fragment>
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide
+  });
+  const fr = new THREE.Mesh(lockGeo, mat);
+  fr.visible = false;
+  fr.frustumCulled = false;
+  fr.renderOrder = 8;                 // 画在鸟与尾迹之上
+  lockFrames.push(fr);
+  scene.add(fr);
+}
+// 淡入淡出用的包络与「最后位置」：目标被抓走的瞬间框不会跳到捕食者身上，
+// 而是停在原地淡掉。
+const lockAlpha = new Float32Array(MAX_SLOT);
+const lockPosX = new Float32Array(MAX_SLOT);
+const lockPosY = new Float32Array(MAX_SLOT);
+const lockHalf = new Float32Array(MAX_SLOT);
+const lockIdx = new Int32Array(MAX_SLOT);   // 本帧被锁定的鸟索引，鸟着色循环里用
+let lockIdxN = 0;
+
 // ---------------------------------------------------------------- 鼠标即是捕食者
 // 双击画布开启：光标变成一只完全由人驾驶的捕食者，位置沿光标轨迹走、
 // 箭头朝向即光标移动方向；右键恢复成普通箭头。
@@ -2371,41 +2480,43 @@ function frameBegin(dt, time) {
   const tGrid1 = performance.now();
   perfParts.grid = tGrid1 - tGrid0;
 
-  // ---- 捕食者：Reynolds 预测拦截 + 相互分离 + 边界约束 ----
-  // 只跑 AI 那几只；鼠标捕食者不跑这套，单独在下面由光标驱动。
+  // ---- 捕食者：预测拦截选点 + 猛禽飞行动力学（朝向 / 速率分开积分）----
+  // 旧实现是「力 → 速度」直接积分：上限被硬钳、下限被硬抬，所以既加不起速也减不下来，
+  // 看上去像贴图在平移。现在拆成两件事——朝向受角加速度限制地积分（有起转惯性），
+  // 速率按档位目标加减速积分（加速有限、减速有限 → 有滑行段）。
   if (baseP > 0) {
     for (let p = 0; p < baseP; p++) {
       const q = p * 3;
-      const ppx = predPos[q], ppy = predPos[q + 1], ppz = predPos[q + 2];
+      const ppx = predPos[q], ppy = predPos[q + 1];
       predPrev[q] = ppx; predPrev[q + 1] = ppy; predPrev[q + 2] = 0;
-      const pvx = predVel[q], pvy = predVel[q + 1], pvz = predVel[q + 2];
-      // 进食冷却：吃饱后不再追击，只以四成左右的速度随机巡游保存体力。
-      // 速度上限直接生效（不做加速度积分）；再乘个体速度系数，避免几只捕食者同步前进。
+      const pvx = predVel[q], pvy = predVel[q + 1];
+      const speed0 = Math.sqrt(pvx * pvx + pvy * pvy);
+      // 进食冷却：吃饱后不再追击，以滑翔档省力巡游。
       const cooling = time - predFeedAt[p] < params.feedCooldown * 1000;
-      predCap[p] = (cooling ? predSpeed * 0.42 : predSpeed) * predSpdJit[p];
-      const curSpeed = Math.max(1.5, predCap[p]);
-      // 摆尾：航向做连续随机游走，追击时幅度小（不丢目标）、巡游时幅度大（像在闲逛）。
+      // 放弃冷却：刚扑空，先拉起来绕一圈再重新进近。
+      const givingUp = time < predGiveUpUntil[p];
+      // 摆尾相位：追击时幅度小（不丢目标）、巡游时幅度大（像在闲逛）。
       predWobble[p] += (Math.random() - 0.5) * 9 * dt;
-      const wobbleAmp = cooling ? 3.2 : 2.0;
-      const chase = params.chaseWeight;
 
-      let ax = 0, ay = 0, az = 0;
       let best = -1, bestD2 = Infinity;
+      let hdgWant = predHeading[p];
+      let mode = PRED_MODE_CRUISE;
 
-      if (cooling) {
-        // 巡逻：朝场地内部的一个目标点滑行。到点、超时或有人在追（这里没有）
+      if (cooling || givingUp) {
+        // 滑翔段：朝场地内部的一个目标点飞。到点、超时或有人在追（这里没有）
         // 就换新点；新点限制在内缩 38% 的区域里，且离当前位置足够远，
         // 所以它不会贴着墙来回弹，也不会原地打转。
-        predTarget[p] = -1;
+        mode = PRED_MODE_GLIDE;
+        predTarget[p] = -1; predChaseFrom[p] = 0;
         let wx = predWp[p * 2], wy = predWp[p * 2 + 1];
         let dwx = wx - ppx, dwy = wy - ppy;
-        if (Math.sqrt((dwx) * (dwx) + (dwy) * (dwy)) < 5 || time > predWpUntil[p]) {
+        if (Math.sqrt(dwx * dwx + dwy * dwy) < 5 || time > predWpUntil[p]) {
           let bx = 0, by = 0;
           for (let tries = 0; tries < 10; tries++) {
             bx = (Math.random() * 2 - 1) * hx * 0.62;
             by = (Math.random() * 2 - 1) * hy * 0.62;
             // 饱食时巡逻点也别落在草地上：路径天然从草地边上绕过去，
-            // 配合上面的避让推力，看上去就是「有意识地避开」而不是硬撞后弹开。
+            // 配合下面的避让偏航，看上去就是「有意识地避开」而不是硬撞后弹开。
             let onGrass = false;
             for (let g = 0; g < grass.length; g++) {
               const gp = grass[g];
@@ -2420,97 +2531,110 @@ function frameBegin(dt, time) {
           predWpUntil[p] = time + 6000 + Math.random() * 5000;
           dwx = wx - ppx; dwy = wy - ppy;
         }
-        const dwl = Math.sqrt((dwx) * (dwx) + (dwy) * (dwy)) || 1;
-        let tx = dwx / dwl * curSpeed - pvx;
-        let ty = dwy / dwl * curSpeed - pvy;
-        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty));
-        const capF = PRED_FORCE * 0.55;
-        if (tl > capF) { const k = capF / tl; tx *= k; ty *= k; }
-        ax += tx; ay += ty;
+        hdgWant = Math.atan2(dwy, dwx);
       } else {
-        // 目标锁定：先沿用旧目标，超出视野或锁定过期才重选最近个体。
-        // 每帧改追最近者会让鱼群的「迷惑效应」把捕食者拖死，短期记忆可形成稳定直线追击。
+        // 目标锁定：先沿用旧目标，超出视野 / 目标落草地 / 锁定过期才重新打分。
+        // 每帧换目标会让鸟群的「迷惑效应」把捕食者拖死，短期记忆才能形成稳定直线追击。
         const vision2 = Math.pow(Math.max(fleeR * 3, B * 1.3), 2);
         best = predTarget[p];
-        if (best >= 0 && best < n && !caught[best]) {
+        if (best >= 0 && best < n && !caught[best] && !resting[best]) {
           const m = best * 3;
           const dx = pos[m] - ppx, dy = pos[m + 1] - ppy;
           bestD2 = dx * dx + dy * dy;
+        } else {
+          best = -1;
         }
-        if (best < 0 || best >= n || caught[best] || bestD2 > vision2 || time > predLockUntil[p]) {
-          best = -1; bestD2 = Infinity;
+        if (best < 0 || bestD2 > vision2 || time > predLockUntil[p]) {
+          // P1 目标评分：不再只看「谁最近」。真实猛禽挑的是最好抓的那只——
+          // 落在密集群里难下手（同伴的警戒会让整群提前散开，也容易被绕晕），
+          // 掉队的、体力刚耗尽的才是首选。评分越小越优先。
+          best = -1;
+          let bestScore = Infinity;
           for (let j = 0; j < n; j++) {
-            if (caught[j]) continue;
+            // 停在草地上歇着的不追：追不到，而且留到以后（草地易伤）再说。
+            if (caught[j] || resting[j]) continue;
             const m = j * 3;
             const dx = pos[m] - ppx, dy = pos[m + 1] - ppy;
             const d2 = dx * dx + dy * dy;
-            if (d2 < bestD2) { bestD2 = d2; best = j; }
+            if (d2 > vision2) continue;
+            let sc = d2;
+            sc *= 1 + PRED_SCORE_CROWD * localDen[j];             // 群越密越难下手
+            sc *= 1 - PRED_SCORE_TIRED * (1 - stamina[j]);        // 体力见底的跑不动
+            if (sprintUntil[j] > time) sc *= 1 + PRED_SCORE_ALERT; // 正在拼命的追不上
+            if (sc < bestScore) { bestScore = sc; best = j; bestD2 = d2; }
+          }
+        }
+        if (best < 0) {
+          predTarget[p] = -1; predChaseFrom[p] = 0;
+        } else {
+          if (predTarget[p] !== best) predLockFrom[p] = time;   // 换了目标 → 聚焦框重新收拢一次
+          predTarget[p] = best;
+          predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
+          if (predChaseFrom[p] === 0) predChaseFrom[p] = time;
+          // P1 放弃机制：追了几秒还抓不到就走人（真实猛禽就是这样省体力的）。
+          // 每只分到一点随机差，两捕食者才不会同进同退。
+          const holdMs = PRED_GIVEUP_MS * 1000
+            + (predSpdJit[p] - 0.9) / 0.2 * PRED_GIVEUP_JIT_MS;
+          if (time - predChaseFrom[p] > holdMs) {
+            const m = best * 3;
+            // 朝「背离猎物」的方向拉出去，像扑空后拉起来绕一圈再进近。
+            const ex = ppx - pos[m], ey = ppy - pos[m + 1];
+            const el = Math.sqrt(ex * ex + ey * ey) || 1;
+            const pull = 26;
+            predWp[p * 2] = clampNum(ppx + ex / el * pull, -hx * 0.9, hx * 0.9);
+            predWp[p * 2 + 1] = clampNum(ppy + ey / el * pull, -hy * 0.9, hy * 0.9);
+            predWpUntil[p] = time + 5000;
+            predGiveUpUntil[p] = time + PRED_REST_MS + Math.random() * 900;
+            predTarget[p] = -1; predChaseFrom[p] = 0; best = -1;
+            mode = PRED_MODE_GLIDE;
+            hdgWant = predHeading[p] + (Math.random() - 0.5) * 0.3;
           }
         }
         if (best >= 0) {
-          predTarget[p] = best;
-          predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
-        } else {
-          predTarget[p] = -1;
+          // 预测拦截：解 |r + u·τ| = v·τ，比 τ=d/v 更准确地预判侧向移动的猎物。
+          const m = best * 3;
+          const d = Math.sqrt(bestD2);
+          const ux = vel[m], uy = vel[m + 1];
+          const u2 = ux * ux + uy * uy;
+          const ru = (pos[m] - ppx) * ux + (pos[m + 1] - ppy) * uy;
+          const vAim = Math.max(1, predSpeed * predSpdJit[p] * PRED_TIER_V[PRED_MODE_PURSUE]);
+          const a = vAim * vAim - u2;
+          let tau;
+          if (a > 1e-6) tau = (ru + Math.sqrt(Math.max(0, ru * ru + a * bestD2))) / a;
+          else tau = d / Math.max(vAim, 1e-6);   // 捕食者不够快时退化为直追
+          if (!isFinite(tau) || tau < 0) tau = d / Math.max(vAim, 1e-6);
+          tau = Math.min(1.2, tau);              // 限制远距离过度预判
+          hdgWant = Math.atan2(pos[m + 1] + uy * tau - ppy, pos[m] + ux * tau - ppx);
+          // 俯冲：已经咬得很近、而且基本对准了才切档，否则会白扔一次「高度」。
+          const off = Math.atan2(Math.sin(hdgWant - predHeading[p]), Math.cos(hdgWant - predHeading[p]));
+          mode = (d < PRED_DIVE_RANGE && Math.abs(off) < PRED_DIVE_CONE)
+            ? PRED_MODE_DIVE : PRED_MODE_PURSUE;
         }
       }
 
-      if (!cooling && best >= 0) {
-        const m = best * 3;
-        const d = Math.sqrt(bestD2);
-        const ux = vel[m], uy = vel[m + 1], uz = vel[m + 2];
-        const u2 = ux * ux + uy * uy + uz * uz;
-        const ru = (pos[m] - ppx) * ux + (pos[m + 1] - ppy) * uy + (pos[m + 2] - ppz) * uz;
-        // 解 |r + u·t| = v·t：比 τ=d/v 更准确地预判侧向移动目标。
-        const a = curSpeed * curSpeed - u2;
-        let tau;
-        if (a > 1e-6) {
-          tau = (ru + Math.sqrt(Math.max(0, ru * ru + a * bestD2))) / a;
-        } else {
-          tau = d / Math.max(curSpeed, 1e-6);   // 捕食者不够快时退化为直追
-        }
-        if (!isFinite(tau) || tau < 0) tau = d / Math.max(curSpeed, 1e-6);
-        tau = Math.min(1.2, tau);                 // 限制远距离过度预判
-        const aimx = pos[m] + ux * tau;
-        const aimy = pos[m + 1] + uy * tau;
-        const aimz = pos[m + 2] + uz * tau;
-        let tx = aimx - ppx, ty = aimy - ppy, tz = aimz - ppz;
-        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-        if (tl > 1e-6) {
-          tx = tx / tl * curSpeed - pvx;
-          ty = ty / tl * curSpeed - pvy;
-          tz = tz / tl * curSpeed - pvz;
-          const sl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-          if (sl > PRED_FORCE) { const k = PRED_FORCE / sl; tx *= k; ty *= k; tz *= k; }
-          ax += tx * chase; ay += ty * chase; az += tz * chase;
-        }
-      }
+      // ---- 档位：目标速度（predCap 保留给调试 / 音效 / 着色器读数）----
+      const vBase = predSpeed * predSpdJit[p] * PRED_TIER_V[mode];
+      predCap[p] = vBase;
 
-      // 捕食者之间反平方分离，避免叠在一起
+      // ---- 副力：分离 / 避草 / 避墙 ----
+      // 这些不再直接改速度，而是把航向往那边带一点：这样它们永远不会把主推进方向
+      // 「吃掉」，只会让轨迹更自然（绕开同伴、贴着草地边缘滑过）。
+      let sx = 0, sy = 0;
       for (let r = 0; r < P; r++) {
         if (r === p) continue;
         const s = r * 3;
-        const dx = ppx - predPos[s], dy = ppy - predPos[s + 1], dz = ppz - predPos[s + 2];
-        const d2 = dx * dx + dy * dy + dz * dz;
+        const dx = ppx - predPos[s], dy = ppy - predPos[s + 1];
+        const d2 = dx * dx + dy * dy;
         if (d2 > 1e-6 && d2 < PRED_SEP_RANGE2) {
           const inv = PRED_SEP_FORCE / Math.max(d2, 0.5);
-          ax += dx * inv; ay += dy * inv; az += dz * inv;
+          sx += dx * inv; sy += dy * inv;
         }
       }
-
-      // 摆尾力：垂直于当前速度方向施加，让追击轨迹是轻微的蛇形而不是一条直线
-      const vlen = Math.sqrt((pvx) * (pvx) + (pvy) * (pvy)) || 1;
-      const weave = Math.cos(predWobble[p]) * wobbleAmp;
-      ax += (-pvy / vlen) * weave;
-      ay += (pvx / vlen) * weave;
-
-      // 墙不存在：不再有贴边掉头（那等于把墙挪到场内侧）。捕食者与鸟走同一套
-      // 穿墙规则——越界后从关于中心对称的位置继续出现，见下面的 wrapThroughWall。
-      // 饱食（进食冷却中）的捕食者会刻意避让草地：还没碰到草地边缘时就沿
-      // 「离开草地」方向施加一个渐强的推力——不是硬性禁止穿行（真撞上也允许
-      // 过去），而是像有意识地绕开正在休息的鸟群。追逐时（不 cooling）不避让，
-      // 免得把猎物赶到草地上就追不下去了。
-      if (cooling) {
+      // 墙不存在：捕食者与鸟走同一套穿墙规则，见下面的 wrapThroughWall。
+      // 滑翔档（吃饱 / 刚扑空）的捕食者刻意避让草地：还没贴边就沿「离开草地」方向偏航——
+      // 不是硬性禁止穿行，而是像有意识地绕开正在休息的鸟群。
+      // 追逐时不避让，免得把猎物赶到草地上就追不下去。
+      if (mode === PRED_MODE_GLIDE) {
         for (let g = 0; g < grass.length; g++) {
           const gp = grass[g];
           const dx = ppx - gp.x, dy = ppy - gp.y;
@@ -2521,51 +2645,86 @@ function frameBegin(dt, time) {
             const d = Math.sqrt(d2);
             const s = 1 - d / edge;             // 0~1，越贴边越强（已在内部时 s 更大）
             // 幅度按 s² 陡增：离得远几乎不干预（可以大胆靠近草地），
-            // 只在快贴上的最后几米才用力拐开——所以是「有意识地避开」而不是远远躲着走。
+            // 只在快贴上的最后几米才用力偏开——所以是「有意识地避开」而不是远远躲着走。
             const inv = (9 + 44 * s * s) * s / d;
-            ax += dx * inv; ay += dy * inv;
+            sx += dx * inv; sy += dy * inv;
           }
         }
       }
-      az = 0;
-
       // 实体墙时的提前避让（与鸟同一套逻辑，力度小一点：猛禽冲得猛，拐太早追不上猎物）
       if (!params.wrapEdges) {
-        const m = 8;
-        if (ppx > hx - m) { const k = (ppx - (hx - m)) / m; ax -= k * k * 18; }
-        else if (ppx < -hx + m) { const k = ((-hx + m) - ppx) / m; ax += k * k * 18; }
-        if (ppy > hy - m) { const k = (ppy - (hy - m)) / m; ay -= k * k * 18; }
-        else if (ppy < -hy + m) { const k = ((-hy + m) - ppy) / m; ay += k * k * 18; }
+        const mgn = 8;
+        if (ppx > hx - mgn) { const k = (ppx - (hx - mgn)) / mgn; sx -= k * k * 26; }
+        else if (ppx < -hx + mgn) { const k = ((-hx + mgn) - ppx) / mgn; sx += k * k * 26; }
+        if (ppy > hy - mgn) { const k = (ppy - (hy - mgn)) / mgn; sy -= k * k * 26; }
+        else if (ppy < -hy + mgn) { const k = ((-hy + mgn) - ppy) / mgn; sy += k * k * 26; }
       }
-
-      // 记下这一帧施加的加速度模长：拖尾的长度与显隐都由它决定。
-      predAccel[p] = Math.sqrt((ax) * (ax) + (ay) * (ay));
-
-      let nvx = pvx + ax * dt, nvy = pvy + ay * dt;
-      let sp = Math.sqrt((nvx) * (nvx) + (nvy) * (nvy));
-      if (sp > curSpeed) { const k = curSpeed / sp; nvx *= k; nvy *= k; }
-      else if (sp < curSpeed * 0.35 && sp > 1e-6) {
-        const want = curSpeed * 0.35;
-        const k = want / sp; nvx *= k; nvy *= k;
+      const sl2 = Math.sqrt(sx * sx + sy * sy);
+      if (sl2 > 1e-6) {
+        // 权重随副力大小上升但有上限：副力只负责「带一点」，不负责「决定去哪」。
+        const sideH = Math.atan2(sy, sx);
+        const wgt = Math.min(0.55, sl2 / 55);
+        const ccx = Math.cos(hdgWant) + Math.cos(sideH) * wgt;
+        const ccy = Math.sin(hdgWant) + Math.sin(sideH) * wgt;
+        if (ccx * ccx + ccy * ccy > 1e-6) hdgWant = Math.atan2(ccy, ccx);
       }
-      predVel[q] = nvx; predVel[q + 1] = nvy; predVel[q + 2] = 0;
-      predPos[q] = ppx + nvx * dt;
-      predPos[q + 1] = ppy + nvy * dt;
+      // 摆尾：小幅横向抖动，让轨迹是轻微的蛇形而不是一条直线。
+      hdgWant += Math.cos(predWobble[p]) * (mode === PRED_MODE_GLIDE ? 0.16 : 0.085);
+
+      // ---- 转向积分：角速度受角加速度限制，所以起转 / 收住都要时间 ----
+      let dh = hdgWant - predHeading[p];
+      dh = Math.atan2(Math.sin(dh), Math.cos(dh));
+      // 追击力度滑杆映射到「追击时敢用多大的转向能力」：默认 1.55 → 系数 1（不变）。
+      const turnScale = mode >= PRED_MODE_PURSUE ? (0.55 + 0.29 * params.chaseWeight) : 1;
+      const turnMax = PRED_TIER_TURN[mode] * turnScale;
+      const wantTurn = clampNum(dh / Math.max(dt, 1e-4), -turnMax, turnMax);
+      const dTurn = clampNum(wantTurn - predTurnRate[p], -PRED_TURN_ACCEL * dt, PRED_TURN_ACCEL * dt);
+      predTurnRate[p] = clampNum(predTurnRate[p] + dTurn, -turnMax, turnMax);
+      predHeading[p] += predTurnRate[p] * dt;
+
+      // ---- 速率积分：档位目标 + 有限加减速 → 有加速段，也有「冲过头还滑一段」----
+      // 急转掉速：转弯越猛，可用速率越低（急转要付能量代价，真猛禽会主动收速）。
+      const turnPen = 1 / (1 + Math.pow(Math.abs(predTurnRate[p]) / PRED_TURN_SOFT, 2) * PRED_TURN_PEN);
+      const kSpd = predSpeed / 25;              // 让加减速手感不随 predSpeed 滑杆变形
+      const vTarget = vBase * turnPen;
+      let v = speed0;
+      if (v < vTarget) v = Math.min(vTarget, v + PRED_MAX_ACCEL * kSpd * dt);
+      else v = Math.max(vTarget, v - PRED_MAX_DECEL * kSpd * dt);
+      const vFloor = predSpeed * PRED_MIN_FLY;  // 猛禽不会悬停
+      if (v < vFloor) v = vFloor;
+
+      predMode[p] = mode;
+
+      predVel[q] = Math.cos(predHeading[p]) * v;
+      predVel[q + 1] = Math.sin(predHeading[p]) * v;
+      predVel[q + 2] = 0;
+      predPos[q] = ppx + predVel[q] * dt;
+      predPos[q + 1] = ppy + predVel[q + 1] * dt;
       predPos[q + 2] = 0;
-      // 边界：与鸟完全相同的规则。开穿越 → 对侧同高度继续飞（速度方向不变）；
-      // 关穿越 → 撞到实体墙，越界方向的速度分量反转（保留 92%）。
+      // 拖尾 / 音效强度：改用「能量消耗」= 纵向加速度 + 横向（转弯）加速度。
+      // 匀速直线时几乎是 0，加速和急转时才窜起来，和原来「只在扑击、急转时闪现」一致。
+      predAccel[p] = Math.abs(v - speed0) / Math.max(dt, 1e-4)
+        + Math.abs(predTurnRate[p]) * v * 0.35;
+
+      // 边界：与鸟完全相同的规则。开穿越 → 对侧同高度继续飞（方向不变）；
+      // 关穿越 → 撞到实体墙，越界方向的分量反转（保留 92%）。朝向必须同步镜像，
+      // 否则下一帧的转向逻辑会把它又掰回墙里去。
       if (params.wrapEdges) {
         if (wrapThroughWall(predPos[q], predPos[q + 1], hx, hy)) {
           predPos[q] = wrapX; predPos[q + 1] = wrapY;
-          predVel[q] = nvx; predVel[q + 1] = nvy;
           teleportCount++;
           // 尾迹粒子留在旧位置（历史航迹），但发射包络要清零，免得落点凭空接一段
           predTrailP[p] = 0; predTrailNextAt[p] = 0;
         }
       } else if (bounceOffWall(predPos[q], predPos[q + 1], hx, hy)) {
         predPos[q] = wrapX; predPos[q + 1] = wrapY;
-        if (bounceX) { nvx = -nvx * 0.92; predVel[q] = nvx; }
-        if (bounceY) { nvy = -nvy * 0.92; predVel[q + 1] = nvy; }
+        let hb = predHeading[p];
+        if (bounceX) hb = Math.PI - hb;
+        if (bounceY) hb = -hb;
+        predHeading[p] = Math.atan2(Math.sin(hb), Math.cos(hb));
+        predTurnRate[p] = -predTurnRate[p] * 0.6;
+        predVel[q] = Math.cos(predHeading[p]) * v * 0.92;
+        predVel[q + 1] = Math.sin(predHeading[p]) * v * 0.92;
       }
     }
   }
@@ -3496,6 +3655,13 @@ function render(now) {
   arrowMat.uniforms.uJit.value = RENDER_JIT;
   const invMaxSpeed = 1 / Math.max(0.001, params.maxSpeed);
   const sprintSpanMs = Math.max(160, params.sprintDuration * 1000);
+  // 本帧被锁定的鸟：先收成一个小表，循环里就不用每只鸟再扫一遍 predTarget。
+  // 默认只有 1 只捕食者，这里最多几个元素，比给 800 只打标记更省。
+  lockIdxN = 0;
+  for (let p = 0, bp = predBaseCount(); p < bp; p++) {
+    const tg = predTarget[p];
+    if (tg >= 0 && tg < n && !caught[tg]) lockIdx[lockIdxN++] = tg;
+  }
   for (let i = 0; i < n; i++) {
     const k = i * 3;
     // 渲染朝向的低通滤波顺手在这里做：原来另有一趟 3n 的循环，白跑一遍内存。
@@ -3571,6 +3737,17 @@ function render(now) {
       col[k + 1] = col[k + 1] * (1 - w) + sprintPal[so + 1] * w;
       col[k + 2] = col[k + 2] * (1 - w) + sprintPal[so + 2] * w;
       size *= 1.22 + 0.24 * surge;
+    }
+    // 被锁定的鸟：去饱和推向冷白 + 轻微放大并呼吸。放在所有配色之后，
+    // 优先级最高——新生、爆发、争地盘都盖不住它，因为「正在被瞄准」是最该被读到的事。
+    for (let li = 0; li < lockIdxN; li++) {
+      if (lockIdx[li] !== i) continue;
+      const w = 0.70;
+      col[k] = col[k] * (1 - w) + 0.93 * w;
+      col[k + 1] = col[k + 1] * (1 - w) + 0.97 * w;
+      col[k + 2] = col[k + 2] * (1 - w) + 1.00 * w;
+      size *= 1.12 + 0.05 * Math.sin(now * 0.011);
+      break;
     }
     siz[i] = size;
   }
@@ -3725,6 +3902,38 @@ function render(now) {
     }
   } else {
     for (const ring of threatRings) ring.visible = false;
+  }
+
+  // ---- 锁定聚焦框：跟着被锁定的鸟走 ----
+  // 亮起快（0.10s 时间常数）、消失慢（0.20s）：锁定是瞬间事件，放弃要留一点余韵。
+  // 目标被抓走时框停在原地淡掉，不会跳到捕食者身上。
+  {
+    const bp = predBaseCount();
+    for (let p = 0; p < MAX_SLOT; p++) {
+      const fr = lockFrames[p];
+      const tg = p < bp ? predTarget[p] : -1;
+      const on = tg >= 0 && tg < n && !caught[tg] && siz[tg] > 0.001;
+      lockAlpha[p] += ((on ? 0.95 : 0) - lockAlpha[p]) * (1 - Math.exp(-dt / (on ? 0.10 : 0.20)));
+      let ease = 1;
+      if (on) {
+        const m = tg * 3;
+        const age = Math.max(0, now - predLockFrom[p]);
+        // 收拢：刚锁定时框比鸟大一圈，0.19 秒收到贴合，像镜头对焦。
+        ease = 1 - Math.pow(1 - Math.min(1, age / 190), 3);
+        lockHalf[p] = siz[tg] * (1.75 + (1 - ease) * 1.45);
+        lockPosX[p] = pos[m];
+        lockPosY[p] = pos[m + 1];
+      }
+      if (lockAlpha[p] < 0.012) { fr.visible = false; continue; }
+      fr.visible = true;
+      fr.position.set(lockPosX[p], lockPosY[p], 0);
+      // 朝向跟相机走（和警戒圈同一套）：框是「准星」而不是世界里的物体，
+      // 相机摇晃带来的滚转不该让它跟着歪。位置仍用世界坐标，所以不会脱靶。
+      fr.quaternion.copy(camera.quaternion);
+      fr.scale.set(lockHalf[p], lockHalf[p], 1);
+      // 刚咬住的那 0.2 秒额外亮一档（收拢时「咔哒」一下），随后回落到常态。
+      fr.material.uniforms.uAlpha.value = Math.min(1.4, lockAlpha[p] * (1 + 0.45 * (1 - ease)));
+    }
   }
 
   // 捕杀三段动画，节拍与 predate() 的三段音一致
@@ -4366,6 +4575,37 @@ window.FlockLab = {
   },
   get predatorCaps() {
     return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => +predCap[p].toFixed(2));
+  },
+  // 猛禽动力学状态：档位 / 朝向 / 角速度 / 速率 / 能量消耗。
+  // 档位：0 滑翔 1 巡航 2 追击 3 俯冲；turnRate 与 accel 用来验证「有惯性」——
+  // 急转时 turnRate 应逐帧爬升而不是瞬间跳满，捕获后 speed 应逐步滑落而不是阶跃。
+  get predatorDynamics() {
+    return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
+      mode: predMode[p],
+      hdg: +predHeading[p].toFixed(3),
+      turnRate: +predTurnRate[p].toFixed(3),
+      targetSpeed: +predCap[p].toFixed(2),
+      speed: +Math.hypot(predVel[p * 3], predVel[p * 3 + 1]).toFixed(2),
+      accel: +predAccel[p].toFixed(1),
+      chasing: +(predChaseFrom[p] > 0 ? (performance.now() - predChaseFrom[p]) / 1000 : 0).toFixed(2),
+      giveUpIn: +Math.max(0, (predGiveUpUntil[p] - performance.now()) / 1000).toFixed(2),
+    }));
+  },
+  // 锁定聚焦框的状态：哪只鸟被锁、框的透明度与半宽、是否可见。
+  get predatorLocks() {
+    return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
+      target: predTarget[p],
+      alpha: +lockAlpha[p].toFixed(2),
+      half: +lockHalf[p].toFixed(2),
+      visible: !!(lockFrames[p] && lockFrames[p].visible),
+    }));
+  },
+  // 世界坐标 → 画布像素坐标。调试用：定位某个特效在屏幕上到底落在哪儿
+  // （正交相机 + 相机摇晃/缩放都要算进去，直接用 camera.project）。
+  project(x, y) {
+    const v = new THREE.Vector3(x, y, 0).project(camera);
+    const r = renderer.domElement.getBoundingClientRect();
+    return { x: (v.x * 0.5 + 0.5) * r.width, y: (-v.y * 0.5 + 0.5) * r.height };
   },
   get predatorCooling() {
     const now = performance.now();

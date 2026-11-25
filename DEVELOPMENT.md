@@ -443,6 +443,8 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **捕食者**：`predatorCount` / `predatorPositions` / `predatorSpeeds` / `predatorCaps` / `predatorCooling` / `predatorTargets` / `catches` / `deadCount` / `respawnDelays` / `catchRadius` / `predShape` / `reaction` / `ringState` / `mouseHunter` / `mousePredator` / `mouseDrawCount`
 
+**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时）、`predatorLocks`（锁定目标索引 + 聚焦框的 alpha / 半宽 / 是否可见）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 7 rad/s² 限制（撞墙反弹那一帧除外）。
+
 **尾迹**：`trailCount` / `trailStats` → `{live, oldestAge, spanX, spanY, capacity}` / `trailSample`（最近 4 颗的 `pos/dir/age/len/wid`，可验证位置冻结与航向各异）
 
 **边界与穿墙**：`portalChance`（恒为 **1**）/ `teleports`（累计穿墙次数）/ `displayRect`
