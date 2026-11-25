@@ -86,8 +86,8 @@ function mouseFeedMs() {
 // 速度只用于箭头朝向与音效冲击量（位置完全由光标决定，没有速度上限），
 // 夹到 60 是为了不让甩鼠标时音效爆表。
 const MOUSE_VMAX = 60;
-// 注意力：v41 起不再限制邻居数——对齐 / 聚合 / 分离都取视野半径内的**全部**同伴，
-// 即最原始的 Boids 涌现规则（v31~v40 的「只注意最近 7 只」已移除，见 step 里邻域扫描）。
+// 注意力：v1.4.1 起不再限制邻居数——对齐 / 聚合 / 分离都取视野半径内的**全部**同伴，
+// 即最原始的 Boids 涌现规则（v1.3.1~v1.4.0 的「只注意最近 7 只」已移除，见 step 里邻域扫描）。
 // 分段耗时探针（FlockLab.perf 可读）：定位「哪一段吃掉了这一帧」比猜有用。
 const perfParts = { grid: 0, force: 0, loop: 0, stats: 0, color: 0 };
 
@@ -2203,7 +2203,7 @@ function frameBegin(dt, time) {
   const per2 = params.perception * params.perception;
   const sep2 = params.separationRange * params.separationRange;
   // 分离权重恢复 de3717e 的纯 1/d²（不做软化）：贴近时权重按 1/d² 陡增，
-  // 拥挤度 crowd 随之趋近 1 → 满力推开。v33 加的 ε 软化把峰值从上百压到 ~20，
+  // 拥挤度 crowd 随之趋近 1 → 满力推开。v1.3.3 加的 ε 软化把峰值从上百压到 ~20，
   // 反而让「贴身时推不动」成了重叠的根源之一。
   const sepSoft = 0;
   // 分离力软饱和尺度：sl 的量纲是 1/距离，除以安全距离让 crowd 对滑杆不敏感。
@@ -2238,7 +2238,6 @@ function frameBegin(dt, time) {
   // 群体巡航节奏：无威胁时统一收敛到巡航速度的 78%，受惊/爆发才放开到上限。
   const paceSpeed = maxSpeed * 0.78;
   currentPace = paceSpeed;
-  sprintingCount = 0;
   waveStart = 0; waveEnd = 0;   // 本帧「出发 / 离场」计数，用于验证错峰
   restStartThisFrame = 0; restSettleThisFrame = 0;
 
@@ -2749,6 +2748,9 @@ function prepareForces(F, dt, time) {
 function frameFinish(F, res, dt, time) {
   const { n, P, baseP, hx, hy, fleeR, fleeR2, maxSpeed, minSpeed, paceSpeed,
           sprintSpeed, catchR2, predNorm } = F;
+  // 冲刺计数在 frameFinish 里清零 + 累加，必须同帧：多核是「本帧 dispatch、下一帧收尾」，
+  // 若在 frameBegin 清零，累加结果会被下一帧开头的清零立刻抹掉，HUD 永远读到 0。
+  sprintingCount = 0;
   let sumNeighbors = res.sumN;
   let deadCount = 0;
   for (let i = 0; i < n; i++) if (caught[i]) deadCount++;
@@ -2800,6 +2802,11 @@ function frameFinish(F, res, dt, time) {
     let vy = vel[k + 1] + acc[k + 1] * dt;
     let sp = Math.sqrt((vx) * (vx) + (vy) * (vy));
     const sprinting = time < sprintUntil[i];
+    // 体力：爆发期间不恢复，结束后按 sprintRecovery 秒线性回满；没回满不能再爆发。
+    // 这两句在 v1.4.4 拆 step 时丢了——stamina 一旦归零就永远是 0，每只鸟一辈子只能冲刺一次，
+    // sprintingCount 也再没累加过（HUD 的「逃逸涟漪」永远不亮）。补在这里，和冲刺判定同一处。
+    if (sprinting) sprintingCount++;
+    else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
     // 速度上限：爆发 > 受惊 > 巡航节奏，直接取目标值（不做加速度积分），
     // 起爆即可提速、威胁解除即刻降到巡航。
     // 每只鸟的巡航/受惊/爆发速度再乘自己的系数，整群不会以同一速度像刚体一样平移。
@@ -3407,7 +3414,7 @@ function render(now) {
     const hg = (now - hatchAt[i]) / HATCH_MS;
     growBuf[i] = hg >= 1 ? 1 : (hg > 0 ? hg : 0);
     // 色阶用局部密度（3×3 格里的活跃个体数），**不是** neighbors[i]。
-    // neighbors[i] 是「注意力邻居数」，v31 把它固定成最多 7 只，所以它最多只能到
+    // neighbors[i] 是「注意力邻居数」，v1.3.1 把它固定成最多 7 只，所以它最多只能到
     // 7/24 = 0.29 → 色相永远停在青蓝端，用户看到的「再怎么聚也不变紫」就是这条：
     // 密度色阶被注意力上限锁死了。localDen 独立于注意力（见 step），才铺得开。
     const local = localDen[i];
@@ -3795,7 +3802,7 @@ window.FlockLab = {
   params, defaults: DEFAULTS, resetBoids, resetAll: applyDefaults, setCount, setPredCount, spawnBurst,
   saveParams,
   backdrop,   // 背景地貌层（调试时可改 uniforms.uGain 看形状）
-  // 穿墙概率恒为 1：墙不存在，越界一律从关于中心对称的位置出现（v38 起无概率、无反射）
+  // 穿墙概率恒为 1：墙不存在，越界一律从关于中心对称的位置出现（v1.3.8 起无概率、无反射）
   get portalChance() { return 1; },
   get teleports() { return teleportCount; },
   get predShape() {

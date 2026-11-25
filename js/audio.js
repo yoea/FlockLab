@@ -1,6 +1,12 @@
 // ---------------------------------------------------------------- 声音
 // 事件音共五类：加速逃逸 / 被吃掉 / 新生 / 草地降落 / 草地起飞；另有四层生成式音乐。
 // 没有碰撞与琶音；静音时断开输出并挂起 AudioContext。
+// 总线预留余量：音效总线（fxBus）与音乐 bus 都汇进 master 再进 destination。
+// 这个值原来是 params.master，v1.4.7 把音量定死成「面板满刻度」后从 DEFAULTS 删掉了它，
+// 但这里还在读 → undefined → 写 AudioParam 抛 TypeError → 每帧打断 render → 画面定格。
+// 所以改成常量，不再依赖参数表（音频参数以后怎么删都不会再打断主循环）。
+const MASTER_GAIN = 0.38;
+
 export class FlockAudio {
   // flash：与外部共享的「音效指示灯」状态（HUD 上的三个小圆点）
   constructor(params, flash) {
@@ -14,7 +20,7 @@ export class FlockAudio {
     // 静音是「用户意图」，必须跨刷新记住。否则刷新时 enable() 会擅自开声，
     // 看起来就像「明明静音了还有声音」。
     this.mutedPref = false;
-    // v2：v40 之前这个 key 存过实验用的静音状态，会让人「刷新后一直是静音」。
+    // v2：v1.4.0 之前这个 key 存过实验用的静音状态，会让人「刷新后一直是静音」。
     // 换 key 等于一次性重置为「默认开声」，之后用户的静音选择照常记住。
     try { this.mutedPref = localStorage.getItem('flocklab.audio.muted.v2') === '1'; } catch (e) {}
     this.lastSprint = 0; this.sprintWindow = 0; this.sprintCount = 0;
@@ -39,12 +45,19 @@ export class FlockAudio {
   // 所以只要这一个开关断开，任何声音都不可能绕过到达扬声器。
   connectOutput() {
     if (!this.master || !this.ctx) return;
-    const t = this.ctx.currentTime;
-    this.master.gain.cancelScheduledValues(t);
-    this.master.gain.value = this.p.master;
-    this.master.disconnect();
-    this.master.connect(this.ctx.destination);
-    this.outputConnected = true;
+    // 这一段在每帧的仿真路径上被调用（canPlay → connectOutput），
+    // 任何异常都会打断整帧、让画面定格，所以这里必须自己吞掉：
+    // 音频出问题最多是没声音，绝不能让鸟群停下来。
+    try {
+      const t = this.ctx.currentTime;
+      this.master.gain.cancelScheduledValues(t);
+      this.master.gain.value = MASTER_GAIN;
+      this.master.disconnect();
+      this.master.connect(this.ctx.destination);
+      this.outputConnected = true;
+    } catch (_) {
+      this.outputConnected = false;
+    }
   }
   disconnectOutput() {
     if (!this.master || !this.ctx) return;
@@ -88,10 +101,15 @@ export class FlockAudio {
       const ctx = this.ctx = new AC();
 
       this.master = ctx.createGain();
-      this.master.gain.value = this.p.master;
+      this.master.gain.value = MASTER_GAIN;
       this.master.connect(ctx.destination);
       this.outputConnected = true;
+    }
 
+    // 建图拆成两段：上一次若在某个节点上抛错，下次 enable() 还能把缺的补齐，
+    // 不会留下「ctx 有了、fxBus 没有」的半成品状态（那会让每个事件音都抛错）。
+    if (!this.fxBus) {
+      const ctx = this.ctx;
       // 音效总线：所有事件音先进这里，再进 master。
       // 这样「音效音量」只影响提示音，不会把音乐一起推大。
       this.fxBus = ctx.createGain();

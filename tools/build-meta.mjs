@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // 生成 js/version.js（构建元数据：版本 / 作者 / commit / 构建时间）。
 //
-// 用法：node tools/build-meta.mjs [--version v47]
-//   - 版本默认取 README「版本历史」表里最大的 vNN；
+// 用法：node tools/build-meta.mjs [--version v1.4.8]
+//   - 版本默认取 README「版本历史」表里最大的 vMAJOR.MINOR.PATCH（语义化，逐段比较；
+//     带 -rc1 这类预发布后缀的行不参与取值）；
 //   - commit 取当前 HEAD 短哈希（工作区有未提交改动时加 *，一眼看出不是干净构建）；
 //   - 作者取 HEAD 提交的作者名（git config 里没配时回退 user.name）；
 //   - 时间取本机当前时间。
@@ -20,15 +21,21 @@ const git = (cmd, fallback = '') => {
   catch (_) { return fallback; }
 };
 
-// 版本：命令行优先，否则 README 里最大的 vNN
+// 版本：命令行优先，否则 README 版本表里最大的 vMAJOR.MINOR.PATCH
 let version = '';
 const argI = process.argv.indexOf('--version');
 if (argI > 0 && process.argv[argI + 1]) version = process.argv[argI + 1];
 if (!version) {
   const readme = readFileSync(resolve(root, 'README.md'), 'utf8');
-  let max = 0;
-  for (const m of readme.matchAll(/^\|\s*v(\d+)\s*\|/gm)) max = Math.max(max, Number(m[1]));
-  version = max ? 'v' + max : 'dev';
+  let best = null;
+  // 只认三段式正式版本；v1.4.1-rc1 这类预发布行不参与（其后紧跟 - 而非空格）
+  for (const m of readme.matchAll(/^\|\s*v(\d+)\.(\d+)\.(\d+)\s*\|/gm)) {
+    const cur = [Number(m[1]), Number(m[2]), Number(m[3])];
+    if (!best) { best = cur; continue; }
+    const d = cur[0] - best[0] || cur[1] - best[1] || cur[2] - best[2];
+    if (d > 0) best = cur;
+  }
+  version = best ? 'v' + best.join('.') : 'dev';
 }
 
 const commit = git('git rev-parse --short HEAD', 'unknown')
