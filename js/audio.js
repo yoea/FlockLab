@@ -1082,9 +1082,11 @@ export class FlockMusic {
     n.pulseGain.gain.setTargetAtTime(0.010 + 0.018 * c, t, 0.4);
     n.bassPluckGain.gain.setTargetAtTime(0.010 + 0.016 * c, t, 0.6);
     n.shimmerGain.gain.setTargetAtTime(0.0012 + 0.012 * Math.max(0, c - 0.28), t, 0.6);
-    // 常驻低音长音再压一点：有了节奏贝斯之后，这条「二十秒浮一次」的底音
-    // 只需要一点点空气感，压不下来的话两层低频会互相糊住。
-    n.bassGain.gain.setTargetAtTime(0.0007 + 0.0016 * c, t, 0.9);
+    // 常驻低音长音：v1.4.24 再降 10dB（×0.316）。用户确认「每隔几秒浮上来、响几秒」
+    // 的那层嗡嗡声就是它——用 bassGate 的 3~5.5s 渐入 + 5~13s 保持 + 3.5~6.5s 落下
+    // 对得上实测曲线（3 秒爬到顶、6.5 秒保持）。降到这个电平后它只剩极微弱的底衬，
+    // 低频骨架交给节奏贝斯；再想更干净就直接删掉这一层，其余层不依赖它。
+    n.bassGain.gain.setTargetAtTime(0.00022 + 0.00051 * c, t, 0.9);
   }
 
   tick() {
