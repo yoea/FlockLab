@@ -319,12 +319,30 @@ const REST_START_SOFT_CAP = 2, REST_SETTLE_SOFT_CAP = 1;
 const spdJit = new Float32Array(MAX_N);   // 个体速度系数 0.86 ~ 1.14
 const wAng = new Float32Array(MAX_N);     // 个体游走航向（每帧小幅随机漂移）
 const wAmp = new Float32Array(MAX_N);     // 个体游走强度 0.55 ~ 1.65
+// 渲染抖动：**只影响画出来的样子，不参与任何受力**（见 render 里「尺寸」与顶点着色器）。
+// 密集群里个体被分离力推到等间距、又几乎同向，屏幕上就叠出一层规整栅格；当栅格周期
+// 接近像素周期时出现摩尔纹——用户看到的「干涉网格」。三样固定的个体偏差就能打散它：
+// 尺寸（点大小不一）、朝向（箭头不同向）、位置（点不严格落在等距格点上）。
+// 都是每只鸟出生时抽一次的常数，所以个体身份稳定，飞起来也不会跳。
+const rJit = new Float32Array(MAX_N * 4);  // 尺寸系数 / 朝向偏置 / 位置偏移 x,y
+// 开关：0 = 退回旧画法（等大等向、密集处偏大），用于现场 A/B 对比摩尔纹。
+// 只有调试用，不进存档——它不改变仿真，只影响画法。
+let RENDER_JIT = 1;
+let aJitDirty = true;
 let WANDER_BASE = 1.6;                    // 游走基础力度（调试接口可改，用于对比手感）
 function rollTraits(i) {
   spdJit[i] = 0.86 + Math.random() * 0.28;
   wAng[i] = Math.random() * Math.PI * 2;
   wAmp[i] = 0.55 + Math.random() * 1.1;
   reactJit[i] = 0.78 + Math.random() * 0.54;
+  rJit[i * 4] = 0.88 + Math.random() * 0.24;
+  rJit[i * 4 + 1] = (Math.random() - 0.5) * 0.52;
+  // 位置偏移取 ±0.18：密集处实测间距中位数 0.56，偏 30% 足以让行列错开，
+  // 又小到单独看仍觉得「一群在齐飞」。
+  const ja = Math.random() * Math.PI * 2, jr = 0.06 + Math.random() * 0.12;
+  rJit[i * 4 + 2] = Math.cos(ja) * jr;
+  rJit[i * 4 + 3] = Math.sin(ja) * jr;
+  aJitDirty = true;
   // 作息相位是「性格」的一部分：出生时抽一次，之后每次重排休息/离场时间都带上它，
   // 于是同一波落地的鸟天然分散在不同的时刻出发与起飞。
   restPhase[i] = Math.random();
@@ -1187,18 +1205,21 @@ const aCol = new THREE.InstancedBufferAttribute(col, 3).setUsage(THREE.DynamicDr
 const aSiz = new THREE.InstancedBufferAttribute(siz, 1).setUsage(THREE.DynamicDrawUsage);
 // 出生涌出进度 0~1（见上方「出生动画」）：CPU 只写进度，缓动与自转在顶点着色器里算
 const aGrow = new THREE.InstancedBufferAttribute(growBuf, 1).setUsage(THREE.DynamicDrawUsage);
+// 渲染抖动 vec4（尺寸系数 / 朝向偏置 / 位置偏移 xy），每只鸟固定，见 rollTraits
+const aJit = new THREE.InstancedBufferAttribute(rJit, 4).setUsage(THREE.DynamicDrawUsage);
 arrowGeo.setAttribute('aPosition', aPos);
 arrowGeo.setAttribute('aVelocity', aVel);
 arrowGeo.setAttribute('aColor', aCol);
 arrowGeo.setAttribute('aSize', aSiz);
 arrowGeo.setAttribute('aGrow', aGrow);
+arrowGeo.setAttribute('aJit', aJit);
 arrowGeo.instanceCount = activeCount;
 
 const arrowMat = new THREE.ShaderMaterial({
   // uGrow：出生涌出总开关。鸟 = 1，捕食者 = 0。
   // 捕食者的材质是 arrowMat.clone()，共用这段顶点着色器；它没有 aGrow 属性，
   // 而缺失的顶点属性在 GLSL 里恒为 0 —— 不关掉的话整只猛禽会被缩成 8% 大小（一个点）。
-  uniforms: { uMaxSpeed: { value: params.maxSpeed }, uGrow: { value: 1 } },
+  uniforms: { uMaxSpeed: { value: params.maxSpeed }, uGrow: { value: 1 }, uJit: { value: 1 } },
   vertexShader: `
     attribute vec2 aLocal;
     attribute vec3 aPosition;
@@ -1206,8 +1227,10 @@ const arrowMat = new THREE.ShaderMaterial({
     attribute vec3 aColor;
     attribute float aSize;
     attribute float aGrow;
+    attribute vec4 aJit;
     uniform float uMaxSpeed;
     uniform float uGrow;
+    uniform float uJit;
     varying vec2 vLocal;
     varying vec3 vColor;
     varying float vSpeed;
@@ -1231,10 +1254,14 @@ const arrowMat = new THREE.ShaderMaterial({
 
       vec4 mv = modelViewMatrix * vec4(aPosition, 1.0);
       vec3 vv = (modelViewMatrix * vec4(aVelocity, 0.0)).xyz;
-      float ang = atan(vv.y, vv.x) + spin;
+      // 个体的固定偏差：尺寸（点大小不一）、朝向（箭头不同向）、位置（不落在等距格点上）。
+      // 三者任一单独做都不够——密集群的点阵感来自「等距 + 等大 + 同向」三者叠加。
+      // uJit=0 时退回原样（捕食者没有这个属性，缺失属性恒为 0 会把它缩成 0）。
+      vec4 jt = mix(vec4(1.0, 0.0, 0.0, 0.0), aJit, uJit);
+      float ang = atan(vv.y, vv.x) + spin + jt.y;
       float cs = cos(ang), sn = sin(ang);
-      vec2 lp = aLocal * aSize * sK;
-      mv.xy += vec2(lp.x * cs - lp.y * sn, lp.x * sn + lp.y * cs);
+      vec2 lp = aLocal * aSize * sK * jt.x;
+      mv.xy += vec2(lp.x * cs - lp.y * sn, lp.x * sn + lp.y * cs) + jt.zw;
       vFade = 1.0 - smoothstep(45.0, 145.0, -mv.z);
       gl_Position = projectionMatrix * mv;
     }
@@ -1425,6 +1452,8 @@ const predMat = arrowMat.clone();
 predMat.uniforms.uMaxSpeed.value = params.predSpeed;
 // 猛禽没有出生动画：关掉 uGrow，顶点着色器就退回原来的「尺寸 × 1、不旋转、不淡入」。
 predMat.uniforms.uGrow.value = 0;
+// 同样的道理：predGeo 没有 aJit 属性，缺失属性恒为 0 会把猛禽缩成 0 大小，必须关掉。
+predMat.uniforms.uJit.value = 0;
 // 锐角等腰三角形：腰长 1、底 0.5（即「腰 1.4 : 底 0.7」的比例），方向即运动方向。
 // 顶点 (2h/3, 0)、(-h/3, ±0.25)，h = √(1 - 0.25²) → 重心落在原点。
 // 实际尺寸由 predSiz = 腰长 控制，所以只改一处就能整体缩放。
@@ -3217,6 +3246,7 @@ function render(now) {
   const n = activeCount;
   const SMOOTH = 0.18;   // 30 FPS 下时间常数约 0.15s，抖动明显降低且方向仍跟手
   const arrowBase = params.arrowSize;
+  arrowMat.uniforms.uJit.value = RENDER_JIT;
   const invMaxSpeed = 1 / Math.max(0.001, params.maxSpeed);
   const sprintSpanMs = Math.max(160, params.sprintDuration * 1000);
   for (let i = 0; i < n; i++) {
@@ -3255,7 +3285,11 @@ function render(now) {
       cg = cg * (1 - w) + 0.18 * w;
       cb = cb * (1 - w) + 0.14 * w;
     }
-    let size = arrowBase + local * 0.10;
+    // 尺寸不再随密度变化。原来是 `arrowBase + local * 0.10`——密集处反而放大，
+    // 而实例四边形全宽是 2×size，10000 只时实测间距中位数只有 0.56，一放大就
+    // 超过间距，相邻图元互相叠住、连成整片规则栅格（摩尔纹的放大器）。
+    // 个体之间的大小差异改由顶点着色器按 aJit.x 做（±12%），既有疏密感又不会锁相。
+    let size = RENDER_JIT ? arrowBase : arrowBase + local * 0.10;
     // 新生个体：亮绿色 + 轻微脉冲，1.8s 后开始渐变为普通色，3.2s 后完全一致。
     const age = now - birthAt[i];
     if (age >= 0 && age < BIRTH_TOTAL_MS) {
@@ -3299,6 +3333,8 @@ function render(now) {
   aCol.needsUpdate = true;
   aSiz.needsUpdate = true;
   aGrow.needsUpdate = true;
+  // 抖动只在抽签（出生/重生）后变过，不必每帧重传 160KB
+  if (aJitDirty) { aJit.needsUpdate = true; aJitDirty = false; }
 
   // ---- 加速尾迹：沿实际航迹撒独立粒子（见文件上方「加速尾迹」的说明）----
   // 鸟与捕食者共用 emitTrail，只有「怎么判定在加速」不同：
@@ -3619,6 +3655,9 @@ window.FlockLab = {
     return { x: [+mnx.toFixed(1), +mxx.toFixed(1)], y: [+mny.toFixed(1), +mxy.toFixed(1)] };
   },
   get view() { return { x: view2D.x, y: view2D.y, zoom: view2D.zoom }; },
+  // 渲染抖动开关（只影响画法，不影响仿真）：0 = 旧的等大等向画法，用于对比密集处的栅格感。
+  get renderJitter() { return RENDER_JIT; },
+  set renderJitter(v) { RENDER_JIT = v ? 1 : 0; return RENDER_JIT; },
   get displayRect() {
     const { hx, hy } = bounds2D();
     return { hx: +hx.toFixed(2), hy: +hy.toFixed(2) };
