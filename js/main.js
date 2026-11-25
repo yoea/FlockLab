@@ -128,7 +128,10 @@ const DEFAULTS = {
   wrapEdges: false,
   // 多核加速：把鸟群邻域受力分给几个 Worker 并行算。
   // 关掉就是原来的单线程路径（也是 worker 建不起来时的自动回退目标）。
-  multiCore: true
+  multiCore: true,
+  // 视野摇晃：模拟「人扛着摄影机」，相机做缓慢的漂移 / 倾斜 / 拉近拉远。
+  // 0 = 完全静止（截图对比、演示时用）。只影响相机与鼠标拾取，不参与任何力学。
+  viewShake: 1
 };
 // 运行时参数：先从 localStorage 恢复上次的调整结果，没有存档才用默认值。
 const params = { ...DEFAULTS, enabled: false, paused: false };
@@ -142,7 +145,7 @@ const PERSIST_KEYS = [
   'predatorOn', 'predatorCount', 'fleeWeight', 'fleeRange', 'predict',
   'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
   'sprintFactor', 'sprintDuration', 'sprintRecovery',
-  'grassOn', 'wrapEdges', 'multiCore'
+  'grassOn', 'wrapEdges', 'multiCore', 'viewShake'
 ];
 // v7：只多了一个「多核加速」开关，默认值一个都没改，所以升级时把 v6 的存档整份搬过来，
 // 不让用户调过的参数回到出厂值。
@@ -155,7 +158,8 @@ const PARAM_RANGE = {
   predatorCount: [1, MAX_P], fleeWeight: [0, 6], fleeRange: [3, 24],
   predict: [0, 1.5], chaseWeight: [0, 4], predSpeed: [2, 36],
   lockTime: [0, 5], feedCooldown: [0.3, 60],
-  sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12]
+  sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12],
+  viewShake: [0, 2.5]
 };
 const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function loadParams() {
@@ -676,6 +680,31 @@ const camera = orthoCam;
 const view2D = { x: 0, y: 0, zoom: 1, tZoom: 1 };
 // 相机视野固定：世界半高＝活动范围，短边正好铺满屏幕；留 2% 边距让边界线可见。
 function view2DFitHalfH() { return BOUND * VIEW2D_MARGIN; }
+
+// ---------------------------------------------------------------- 视野摇晃
+// 模拟「有人扛着摄影机」：四条低频通道叠在相机上——横向漂移、纵向漂移、
+// 绕视线轴倾斜、视锥轻微缩放。每条通道 = 主频 + 次频（振幅约 6:4），频率取
+// 无理比、相位互错，所以叠加后不会在十几秒后回到原点，看不出周期。
+//
+// 两条约束决定了写法：
+//  · 幅度按「视口高度的比例」算，不是固定世界单位——放大到 4× 或缩到 0.5× 时，
+//    屏幕上的晃动幅度必须一样（halfH 传的就是当前 zoom 下的视口半高）。
+//  · 倾斜必须用 rotateZ 叠在 lookAt **之后**。改 camera.up 会被 lookAt 重算掉。
+const SHAKE = { t: 0, x: 0, y: 0, roll: 0, zoom: 1 };
+const TAU = Math.PI * 2;
+function updateViewShake(dt, halfH) {
+  const s = params.viewShake;
+  if (!(s > 0)) { SHAKE.x = 0; SHAKE.y = 0; SHAKE.roll = 0; SHAKE.zoom = 1; return; }
+  SHAKE.t += dt;                        // 暂停时传 0：相位冻结 → 画面定格
+  const t = SHAKE.t;
+  // 强度 1.0 时：横向 ±1.6% 视口高（约 13px @810 高）、纵向 ±1.0%（约 8px）、
+  // 倾斜 ±0.55°、缩放 ±0.9%。周期 5~23 秒，能感到在动又不影响看鸟。
+  // 注意 halfH 是视口**半**高，所以「视口高的 1.6%」要写成 0.032 × halfH。
+  SHAKE.x = (Math.sin(TAU * 0.055 * t + 1.3) * 0.62 + Math.sin(TAU * 0.130 * t + 4.1) * 0.38) * halfH * 0.032 * s;
+  SHAKE.y = (Math.sin(TAU * 0.071 * t + 3.7) * 0.62 + Math.sin(TAU * 0.190 * t + 0.4) * 0.38) * halfH * 0.020 * s;
+  SHAKE.roll = (Math.sin(TAU * 0.043 * t + 5.2) * 0.62 + Math.sin(TAU * 0.110 * t + 2.6) * 0.38) * 0.0096 * s;
+  SHAKE.zoom = 1 + (Math.sin(TAU * 0.062 * t + 2.2) * 0.62 + Math.sin(TAU * 0.150 * t + 3.3) * 0.38) * 0.009 * s;
+}
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
 renderer.setSize(innerWidth, innerHeight);
@@ -685,16 +714,20 @@ document.getElementById('scene').appendChild(renderer.domElement);
 // 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
 let bgMesh = null;   // 背景渐变稍后才创建，先声明避免「用到未定义变量」
 let backdrop = null; // 地貌层同理
-function updateOrthoFrustum() {
+// zoomOverride：摇晃时的瞬时缩放。不写回 view2D.zoom，否则滚轮状态会被抖动污染；
+// 不传就等于基准 zoom，所以 resize / 重置视图这些调用点的行为完全不变。
+function updateOrthoFrustum(zoomOverride) {
   const aspect = innerWidth / innerHeight;
-  const halfH = view2DFitHalfH() / view2D.zoom;
+  const z = zoomOverride === undefined ? view2D.zoom : zoomOverride;
+  const halfH = view2DFitHalfH() / Math.max(0.05, z);
   const halfW = halfH * aspect;
   orthoCam.left = -halfW; orthoCam.right = halfW;
   orthoCam.top = halfH; orthoCam.bottom = -halfH;
   orthoCam.updateProjectionMatrix();
   // 背景渐变挂在与地貌在相机上，尺寸跟着视锥走，永远铺满视口
   if (bgMesh) {
-    bgMesh.scale.set(halfW * 2.06, halfH * 2.06, 1);
+    // 2.10 而不是 2.06：相机倾斜时画面四角会往内收，21:9 上 0.9° 要约 3.4% 余量。
+    bgMesh.scale.set(halfW * 2.10, halfH * 2.10, 1);
   }
   if (backdrop) backdrop.setProjection(halfW, halfH);
 }
@@ -1558,12 +1591,19 @@ for (let p = 0; p < MAX_SLOT; p++) {
 // 箭头朝向即光标移动方向；右键恢复成普通箭头。
 // 期间左键拖拽平移、点按钮、滚轮缩放全部照旧——只把画布上的系统光标藏起来，
 // UI 面板上仍是正常指针，所以「变成捕食者期间仍然可以操作」。
+// 相机现在会随风摇（SHAKE），反投影必须把「瞬时缩放 / 平移 / 倾斜」一起算进去，
+// 否则双击开启的鼠标捕食者会比光标偏十几像素，而且光标不动时看起来在漂。
 function screenToWorld(cx, cy) {
   const rect = cv.getBoundingClientRect();
-  const scale = (2 * view2DFitHalfH() / view2D.zoom) / Math.max(1, rect.height);
+  const halfH = view2DFitHalfH() / Math.max(0.05, view2D.zoom * SHAKE.zoom);
+  const scale = (2 * halfH) / Math.max(1, rect.height);
+  const dx = (cx - (rect.left + rect.width * 0.5)) * scale;
+  const dy = -(cy - (rect.top + rect.height * 0.5)) * scale;
+  // 相机绕视线轴转过了 roll，屏幕向量要转回世界方向（乘 R(+roll)）
+  const cr = Math.cos(SHAKE.roll), sr = Math.sin(SHAKE.roll);
   return {
-    x: view2D.x + (cx - (rect.left + rect.width * 0.5)) * scale,
-    y: view2D.y - (cy - (rect.top + rect.height * 0.5)) * scale,
+    x: view2D.x + SHAKE.x + dx * cr - dy * sr,
+    y: view2D.y + SHAKE.y + dx * sr + dy * cr,
   };
 }
 
@@ -1946,6 +1986,8 @@ bindNum(fMotion, 'arrowSize', 0.18, 0.9, 0.01, '元素大小',
   '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍，再整体 ×2），所以它只影响外观，不影响运动规则。');
 bindBool(fMotion, 'wrapEdges', '屏幕边缘穿越',
   '屏幕边缘穿越｜开启：墙不存在，鸟和猛禽飞出画面后从对侧同一高度飞回来（等价环面，群体能完整地穿过去再聚回来）。关闭：墙变成实体，撞到边缘就弹开（速度损失 8%），捕食者也会被弹回来。');
+bindNum(fMotion, 'viewShake', 0, 2.5, 0.05, '视野摇晃',
+  '视野摇晃｜模拟人扛着摄影机：缓慢左右上下漂移 + 轻微倾斜 + 轻微拉近拉远，只影响画面、不动物理。0 = 完全静止（做前后截图对比时用它）｜调大：更像手持机，但看久了可能有点晕。');
 fMotion.open();
 
 const fPred = gui.addFolder('捕食与逃逸');
@@ -3236,10 +3278,14 @@ function render(now) {
   }
 
   view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
-  updateOrthoFrustum();
-  camera.position.set(view2D.x, view2D.y, 40);
+  // 手持摇晃：暂停时 dt 传 0 —— 相位冻结、画面定格，但把强度调到 0 仍会立刻回正。
+  updateViewShake(params.paused ? 0 : dt, view2DFitHalfH() / Math.max(0.05, view2D.zoom));
+  updateOrthoFrustum(view2D.zoom * SHAKE.zoom);
+  const camX = view2D.x + SHAKE.x, camY = view2D.y + SHAKE.y;
+  camera.position.set(camX, camY, 40);
   camera.up.set(0, 1, 0);
-  camera.lookAt(view2D.x, view2D.y, 0);
+  camera.lookAt(camX, camY, 0);
+  if (SHAKE.roll) camera.rotateZ(SHAKE.roll);   // 必须在 lookAt 之后，否则朝向被重算掉
 
   // CPU 只写颜色/尺寸；箭头的朝向与形状全部交给 GPU 着色器。
   const tCol0 = performance.now();
@@ -3403,7 +3449,8 @@ function render(now) {
   const bgT = now * 0.001;
   bgMat.uniforms.uTime.value = bgT;
   dustMat.uniforms.uTime.value = bgT;
-  backdrop.update(bgT, view2D.x, view2D.y);
+  // 视差层要跟相机的**实际**位置（含摇晃偏移），否则摇晃时背景像贴在屏幕上不动。
+  backdrop.update(bgT, view2D.x + SHAKE.x, view2D.y + SHAKE.y);
   trailGeo.instanceCount = MAX_TRAILS;      // 恒定：过期粒子在顶点着色器里被裁掉
   if (trailDirty) {
     aTrPos.needsUpdate = true; aTrDir.needsUpdate = true; aTrCol.needsUpdate = true;
@@ -3655,6 +3702,17 @@ window.FlockLab = {
     return { x: [+mnx.toFixed(1), +mxx.toFixed(1)], y: [+mny.toFixed(1), +mxy.toFixed(1)] };
   },
   get view() { return { x: view2D.x, y: view2D.y, zoom: view2D.zoom }; },
+  // 当前摇晃的瞬时量（世界单位 / 弧度 / 缩放系数），验证幅度用。
+  get viewShakeNow() { return { x: SHAKE.x, y: SHAKE.y, roll: SHAKE.roll, zoom: SHAKE.zoom, t: SHAKE.t }; },
+  // 屏幕（clientX/Y）→ 世界坐标。已经含摇晃的平移/倾斜/缩放，验证鼠标对准用。
+  screenToWorld: (cx, cy) => screenToWorld(cx, cy),
+  // 世界 → 屏幕。走引擎自己的投影矩阵，不依赖上面那套手写公式，
+  // 所以可以拿来交叉校验 screenToWorld 的符号与量级（摇晃一改就要重验）。
+  projectToScreen: (x, y) => {
+    const v = new THREE.Vector3(x, y, 0).project(camera);
+    const rect = cv.getBoundingClientRect();
+    return { x: rect.left + (v.x * 0.5 + 0.5) * rect.width, y: rect.top + (-v.y * 0.5 + 0.5) * rect.height };
+  },
   // 渲染抖动开关（只影响画法，不影响仿真）：0 = 旧的等大等向画法，用于对比密集处的栅格感。
   get renderJitter() { return RENDER_JIT; },
   set renderJitter(v) { RENDER_JIT = v ? 1 : 0; return RENDER_JIT; },

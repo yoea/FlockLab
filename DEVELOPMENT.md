@@ -267,6 +267,45 @@ requestAnimationFrame(render)
 - **避让草地必须用世界坐标**：纹理会随窗口重画、还会带 22% 视差，按屏幕坐标擦纹理的话一平移就对不上。现在是在片元着色器里把像素反算成世界点（`wp = (vUv-0.5)*2*uHalf + uView`），再和 `setGrass()` 传进来的 `(x,y,R,a1,p1,a2,p2)` 比，轮廓用和草地完全相同的极坐标谐波 → 河 / 村庄 / 草地斑都会绕开草地，平移缩放零成本。
 - **不要在背景里叠「山坡」横带**：那几条脊线在静态画面里读起来像划痕（v42 已删）。
 
+### 3.9b 视野摇晃：四通道低频叠加（v46）
+
+模拟「人扛着摄影机」。**不要把每条通道写成一条正弦**——单频会像机器在摆。每条通道
+= 主频 + 次频（振幅约 6:4），频率取无理比、相位互错，叠加后十几秒内不会回到原点，
+所以看不出周期。
+
+| 通道 | 频率（Hz / 周期） | 强度 1.0 时幅度 |
+| --- | --- | --- |
+| 横向漂移 `x` | 0.055（18s）+ 0.130（7.7s） | 视口高 × 1.6% ≈ ±13px @810 |
+| 纵向漂移 `y` | 0.071（14s）+ 0.190（5.3s） | 视口高 × 1.0% ≈ ±8px |
+| 倾斜 `roll` | 0.043（23s）+ 0.110（9s） | ±0.55° |
+| 缩放 `zoom` | 0.062（16s）+ 0.150（6.7s） | ±0.9% |
+
+四条硬约束，漏一条就出 bug：
+
+- **幅度必须按视口比例，不能是固定世界单位**。`halfH` 传的是当前 zoom 下的视口半高，
+  所以放大到 4× 时世界单位幅度自动变小、屏幕幅度不变。⚠️ `halfH` 是**半高**：
+  「视口高的 1.6%」要写成 `0.032 × halfH`，写成 `0.016 × halfH` 只有目标的一半
+  （第一版就是这么错的，实测量出来刚好是 ±6px）。
+- **倾斜必须在 `lookAt` 之后 `camera.rotateZ(roll)`**。改 `camera.up` 会被 `lookAt` 重算掉；
+  顺序反了倾斜会静默消失。
+- **`screenToWorld` 必须同步**（含偏移 + `R(+roll)` 逆变换 + `zoom × SHAKE.zoom`）。
+  不同步的话，双击开启的鼠标捕食者会比光标偏十几像素，光标不动时看起来在漂。
+  校验方法：`projectToScreen`（走引擎自己的投影矩阵）→ `screenToWorld` 往返，误差应 ≈ 0。
+  这同时能证明 roll 真的进了相机矩阵——如果 roll 没生效，两者会差 `2·roll·距离` 约 16px。
+- **穿墙边界 `bounds2D()` 绝不跟着晃**。它同时是穿墙判定轴，晃了等于物理边界在动。
+  摇晃只作用于「画出来的相机」：`frustum / position / z 旋转`。
+
+配套细节：
+
+- 缩放通道用 `updateOrthoFrustum(zoomOverride)` 的临时乘数，**不写回 `view2D.zoom`**，
+  否则滚轮状态会被抖动污染。
+- 背景渐变 quad 的余量从 `2.06` 提到 `2.10`：倾斜时四角会内收，21:9 上 0.9° 要 3.4%。
+  地貌层 `OVER = 1.30` 本来就有 15%，不用动。
+- 视差层（`backdrop.update`）要传**含摇晃的相机位置**，否则背景像贴在屏幕上不动。
+- **暂停时相位冻结**（`updateViewShake` 传 `dt = 0`）：画面定格，方便观察和截图；
+  但强度调到 0 仍会立刻回正，因为 `s <= 0` 分支直接清零。
+- 截图逐像素对比前先把 `viewShake` 设 0，否则前后两张永远对不上。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
@@ -328,6 +367,8 @@ requestAnimationFrame(render)
 **尾迹**：`trailCount` / `trailStats` → `{live, oldestAge, spanX, spanY, capacity}` / `trailSample`（最近 4 颗的 `pos/dir/age/len/wid`，可验证位置冻结与航向各异）
 
 **边界与穿墙**：`portalChance`（恒为 **1**）/ `teleports`（累计穿墙次数）/ `displayRect`
+
+**视野**：`viewShakeNow` → `{x, y, roll, zoom, t}`（当前摇晃的瞬时量，验证幅度用）；`screenToWorld(cx, cy)` / `projectToScreen(x, y)` 互为逆变换，用来验证鼠标与画面是否对准
 
 **性能**：`perf` → `{step, prep, draw, total, fps, count, grid, loop, stats, color, force}`（毫秒，指数平滑；`force` 单核模式是 `computeForces` 的耗时、多核模式是**各 worker 计算时间之和**，可直接和单核对比）
 
@@ -517,6 +558,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v42 | **PWA**：`manifest.json` + `sw.js`（壳 SWR / CDN 缓存优先 / 导航网络优先）+ 五张图标（**不自建安装按钮、不拦 `beforeinstallprompt`**，交给浏览器地址栏提示）；**出生涌出动画**：`aGrow` 实例属性（`mix(1, aGrow, uGrow)`，微光→展开过冲→自转→淡入）+ `hatchAt` 错峰 + 重生绿丝 `birthWisp`；**背景地貌层** `js/backdrop.js`（canvas 纹理 + `GAIN` 换算 + 加法混合 + 22% 视差 + 世界坐标避让草地 + 可平铺云层）；删「山坡」横带；新增 `FlockLab.backdrop` / `hatchPending` / `respawn(n)` 调试口；修「捕食者变成一个点」（`predMat` 克隆 arrowMat 却没有 `aGrow`） |
 | v44 | **多核**：邻域受力抽成 `js/forces.js`（单核直调 / 多核 Worker 共用同一份实现），最多 6 个模块 Worker + `Transferable` 双程零拷贝，按上一帧 `neighbors` 加权切连续区间；`step()` 巨函数拆成 `frameBegin/updateResting/prepareForces/frameFinish`（单核 5~7 倍）；`multiCore` 默认开，存档 v7 |
 | v45 | 密集区「干涉网格」：`aJit`（尺寸 ±12% / 朝向 ±15° / 位置 ±0.18，出生抽一次）+ 取消密集处放大箭头；只碰渲染，见 §3.8b |
+| v46 | **视野摇晃**：模拟人扛摄影机，四通道低频叠加（横/纵漂移、倾斜、轻微缩放），每条 = 主频 + 次频、频率无理比，所以看不出周期；幅度按视口比例算，缩放后屏幕幅度不变；`viewShake` 0~2.5（默认 1，0 = 静止），暂停时相位冻结。同步改了 `screenToWorld`（否则鼠标捕食者偏十几像素）、背景余量 2.06→2.10（倾斜不露边）、视差层跟随相机实际位置。实测横向 ±12px、纵向 ±7px、倾斜 ±0.55°、缩放 ±0.86%，引擎投影往返误差 0px，见 §3.9b |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
