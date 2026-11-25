@@ -22,7 +22,7 @@ const SHELL = [
   './assets/icon-192.png',
   './assets/icon-512.png',
   './assets/icon-maskable-512.png',
-  './manifest.webmanifest'
+  './manifest.json'
 ];
 
 // CDN 依赖：离线时同样要能加载，否则 module 直接 import 失败、整页白屏

@@ -48,7 +48,7 @@ node --input-type=module --check < js/grass.js
 flocklab/
 ├── index.html          页面骨架、图标按钮、「关于」弹窗、CDN 引入、SW 注册
 ├── sw.js               Service Worker：离线壳缓存 + CDN 依赖缓存
-├── manifest.webmanifest PWA 清单（standalone / 图标 / 主题色）
+├── manifest.json PWA 清单（standalone / 图标 / 主题色）
 ├── css/style.css       全部界面样式（含隐藏动画、右下角按钮 / 控制台定位）
 ├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 3900 行，核心）
 ├── js/audio.js         Web Audio 事件音效 + 六层生成式音乐（约 730 行）
@@ -223,7 +223,7 @@ requestAnimationFrame(render)
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
 - 策略：同源静态资源 **stale-while-revalidate**（最多落后一个版本，第二次打开就是新的）；CDN（URL 带版本号、内容不可变）**缓存优先**；导航 **网络优先**，断了退回缓存里的 `index.html`。CDN 两条 module URL 也必须缓存，否则离线时 `import` 直接失败、整页白屏。
 - 调试：`?nosw=1` 跳过注册（但已在控制的页面仍受旧 SW 影响，必要时 `navigator.serviceWorker.getRegistrations()` 清掉）。
-- **部署必须带 `sw.js` / `manifest.webmanifest` / `assets/icon-*.png`**，少一个就装不成应用。
+- **部署必须带 `sw.js` / `manifest.json` / `assets/icon-*.png`**，少一个就装不成应用。
 
 ### 3.11 其他约定
 
@@ -437,7 +437,7 @@ v42 给 `arrowMat` 的顶点着色器加了出生涌出后，捕食者**自动�
 | v41a | 修「草地上的红鸟左右闪」：① 休息间隔改为按「鸟数 / 草地总容量」自适应（原来固定 20–53 秒，800 只时需求是容量的 4 倍，队列从第一秒就清不空）；② 排队 20 秒进不去就认输褪红、隔一大段再来（不再永久红鸟）；③ 到点速度随距离收敛到 0.35（原来下限 1.1，会冲过落点再掉头，渲染朝向跟着 180° 翻）；④ 绕草地的切向力改连续值，停住时不再每帧翻向 |
 | v41 | 去掉注意力上限（恢复视野内全邻域）+ `sepCap` 安全阀 + 网格 `视野/1.4`；边缘穿越默认关闭 + 实体墙提前避让；捕食者加速音重做；HUD 传送/爆发/休憩改近 1 秒速率；背景改斜向光带（去闪烁星点）；声音默认开 |
 | v40 | 捕食者加速音效 `predDash`（边沿触发 + 400ms/只限流）、草地落地/起飞改轻快双音；动态背景（fbm 星云 + 星点 + 浮尘，`bgMat.uTime` / `dustMat.uTime` 原来没更新）；`wrapEdges` 开关（关=实体墙反弹）；修「不变紫」：色阶改用 `localDen`（原读 `neighbors/24`，被 7 只注意力上限钉死在 0.29）+ 重定 `LOCAL_DEN_K`；修「散成一坨坨」：穿墙不再镜像、质心/半径改最小映像、加弱长程群体归拢；音量滑块移除、固定满刻度 |
-| v42 | **PWA**：`manifest.webmanifest` + `sw.js`（壳 SWR / CDN 缓存优先 / 导航网络优先）+ 五张图标（**不自建安装按钮、不拦 `beforeinstallprompt`**，交给浏览器地址栏提示）；**出生涌出动画**：`aGrow` 实例属性（`mix(1, aGrow, uGrow)`，微光→展开过冲→自转→淡入）+ `hatchAt` 错峰 + 重生绿丝 `birthWisp`；**背景地貌层** `js/backdrop.js`（canvas 纹理 + `GAIN` 换算 + 加法混合 + 22% 视差 + 世界坐标避让草地 + 可平铺云层）；删「山坡」横带；新增 `FlockLab.backdrop` / `hatchPending` / `respawn(n)` 调试口；修「捕食者变成一个点」（`predMat` 克隆 arrowMat 却没有 `aGrow`） |
+| v42 | **PWA**：`manifest.json` + `sw.js`（壳 SWR / CDN 缓存优先 / 导航网络优先）+ 五张图标（**不自建安装按钮、不拦 `beforeinstallprompt`**，交给浏览器地址栏提示）；**出生涌出动画**：`aGrow` 实例属性（`mix(1, aGrow, uGrow)`，微光→展开过冲→自转→淡入）+ `hatchAt` 错峰 + 重生绿丝 `birthWisp`；**背景地貌层** `js/backdrop.js`（canvas 纹理 + `GAIN` 换算 + 加法混合 + 22% 视差 + 世界坐标避让草地 + 可平铺云层）；删「山坡」横带；新增 `FlockLab.backdrop` / `hatchPending` / `respawn(n)` 调试口；修「捕食者变成一个点」（`predMat` 克隆 arrowMat 却没有 `aGrow`） |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
