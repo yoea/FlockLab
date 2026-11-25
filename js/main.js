@@ -1354,7 +1354,7 @@ function syncGrassVisibility() {
   backdrop.setGrass(params.grassOn ? grass : []);   // 草地关掉时地貌就该露出来
 }
 function endRest(i, time, scared) {
-  if (resting[i]) audio.takeoff();   // 离地
+  if (resting[i]) audio.takeoff(pos[i * 3], pos[i * 3 + 1]);   // 离地
   const wasSettled = settled[i] === 1;
   resting[i] = 0; settled[i] = 0;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
@@ -2609,7 +2609,10 @@ function frameBegin(dt, time) {
         near = true; break;
       }
     }
-    if (near && !groupWasThreat) groupThreatAt = time;
+    if (near && !groupWasThreat) {
+      groupThreatAt = time;
+      audio.alarm();      // 整群被惊动：一片涌动的沙沙声（5 次/分，以前完全没声音）
+    }
     groupWasThreat = near;
     groupAlert = near;          // 状态卡「群体警戒」徽标
   } else { groupWasThreat = false; groupAlert = false; }
@@ -2795,7 +2798,12 @@ function frameBegin(dt, time) {
             hdgWant = Math.atan2(rsY - ppy, rsX - ppx);
           }
         } else {
-          if (predTarget[p] !== best) predLockFrom[p] = time;   // 换了目标 → 高亮/调试计时重新起算
+          // 锁定音：从「没目标」到「有目标」、或者换了一只，响一次。
+          // 这是玩家最能感知的那一瞬间（鹰突然盯上谁），以前完全没有声音。
+          if (predTarget[p] !== best) {
+            predLockFrom[p] = time;   // 换了目标 → 高亮/调试计时重新起算
+            audio.lockOn(pos[best * 3], pos[best * 3 + 1]);
+          }
           predTarget[p] = best;
           predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
           if (predChaseFrom[p] === 0) predChaseFrom[p] = time;
@@ -2921,6 +2929,9 @@ function frameBegin(dt, time) {
       const vFloor = predSpeed * PRED_MIN_FLY;  // 猛禽不会悬停
       if (v < vFloor) v = vFloor;
 
+      // 俯冲起手：其它档位切进 DIVE 的那一帧响一次。这是「扑下来」的起势，
+      // 和 predDash（加速度包络冲高）不是同一个事件——那个是起步/急转，这个是从上往下砸。
+      if (mode === PRED_MODE_DIVE && predMode[p] !== PRED_MODE_DIVE) audio.dive(ppx, ppy);
       predMode[p] = mode;
 
       predVel[q] = Math.cos(predHeading[p]) * v;
@@ -3102,7 +3113,7 @@ function updateResting(dt, time) {
           ? Math.atan2(rVel[k + 1], rVel[k]) : wAng[i];
         // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位
         vel[k] = 0; vel[k + 1] = 0;
-        audio.land();          // 落地的那一下
+        audio.land(px, py);    // 落地的那一下（带位置 → 声像）
         restSince[i] = time;
         restSessions++;
         // 离场时间带个体相位：28~60 秒，同批落地的鸟不会一起走
@@ -3173,7 +3184,7 @@ function prepareForces(F, dt, time) {
           stamina[i] = Math.max(0, stamina[i] - 1);
           sprintCount++;
           if (!full) secondWindCount++;
-          audio.sprint(Math.min(1, d / fleeR));
+          audio.sprint(Math.min(1, d / fleeR), pos[i * 3], pos[i * 3 + 1]);
           // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
         }
       } else {
@@ -3378,7 +3389,7 @@ function frameFinish(F, res, dt, time) {
         const rvx = vx - predVel[q], rvy = vy - predVel[q + 1];
         const vrel = Math.max(0.5, Math.sqrt((rvx) * (rvx) + (rvy) * (rvy)));
         const J = Math.pow(vrel, 1.2) / predNorm;
-        audio.predate(J);
+        audio.predate(J, pos[k], pos[k + 1]);
         // 撞轴 = 捕食者速度方向。捕食者几乎悬停时（速度≈0）退化成「从捕食者指向猎物」，
         // 总比固定朝右强——碎片的飞散方向必须对得上「刚才那一下是从哪撞过来的」。
         let ix = predVel[q], iy = predVel[q + 1];
@@ -3415,7 +3426,7 @@ function frameFinish(F, res, dt, time) {
     if (caught[i] && time >= respawnAt[i]) {
       spawnFar(i, time);
       caught[i] = 0; respawnAt[i] = 0;
-      audio.birth();
+      audio.birth(pos[i * 3], pos[i * 3 + 1]);
     }
   }
   if (P > 0) prevFlee.set(fleeDir);   // 信息级联使用上一帧逃逸方向
@@ -3899,6 +3910,12 @@ function render(now) {
     }
   }
 
+  // 密度纹理层（P3）：整群振翅的「底噪」，代替逐鸟逐次振翅发事件——
+  // 800 只按每秒约 7 次振翅就是 5000+ 次/秒，那是三个数量级的超标。
+  // 三个输入：飞得多快、群体多密、多少比例在拼命 → 决定电平与中心频率。
+  audio.setDensity(avgSpeed / Math.max(1, params.maxSpeed), density,
+    sprintingCount / Math.max(1, activeCount), params.paused);
+
   view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
   // 手持摇晃：暂停时 dt 传 0 —— 相位冻结、画面定格，但把强度调到 0 仍会立刻回正。
   updateViewShake(params.paused ? 0 : dt, view2DFitHalfH() / Math.max(0.05, view2D.zoom));
@@ -3908,6 +3925,9 @@ function render(now) {
   camera.up.set(0, 1, 0);
   camera.lookAt(camX, camY, 0);
   if (SHAKE.roll) camera.rotateZ(SHAKE.roll);   // 必须在 lookAt 之后，否则朝向被重算掉
+  // 视口快照给音频：声像与距离都从它算。放在相机更新之后，差一帧以内。
+  // 正交俯视 + 只带极小 roll，所以世界 X 直接就是屏幕左右，不需要矩阵。
+  audio.setView(camX, camY, orthoCam.right);
 
   // CPU 只写颜色/尺寸；箭头的朝向与形状全部交给 GPU 着色器。
   const tCol0 = performance.now();
@@ -4077,7 +4097,7 @@ function render(now) {
       // 每只捕食者 400ms 内最多一次，避免扑击时连成一片。
       if (predTrailP[p] > 0.30 && prevEnv <= 0.30 && now >= predSoundAt[p]) {
         predSoundAt[p] = now + 400;
-        audio.predDash(predTrailP[p]);
+        audio.predDash(predTrailP[p], predPos[p * 3], predPos[p * 3 + 1]);
       }
       if (predTrailP[p] <= 0.18) continue;      // 匀速直线与普通续航转向不出尾迹
       if (now < predTrailNextAt[p]) continue;
@@ -4794,6 +4814,25 @@ window.FlockLab = {
   get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
   get audioOutputConnected() { return audio.outputConnected; },
   get soundEvents() { return { ...audio.total }; },
+  // 空间音频的自检读数：声像映射是否跟着相机、各事件的最后一个 pan、
+  // 混响与密度层的实际电平。听感验证不了，但这些量都能量。
+  get audioSpatial() {
+    return {
+      view: { x: +audio.view.x.toFixed(2), y: +audio.view.y.toFixed(2), halfW: +audio.view.halfW.toFixed(2) },
+      lastPan: +audio.lastPan.toFixed(3),
+      reverb: audio.revSend ? 'on' : 'off',
+      texture: audio.tex ? {
+        gain: +audio.tex.gain.gain.value.toFixed(5),
+        freq: Math.round(audio.tex.bp.frequency.value),
+        applied: +(audio.texApplied || 0).toFixed(5)
+      } : null
+    };
+  },
+  // 世界坐标 → 声像，用来核对「左边的鸟在不在左边」。
+  panAt(x) { return +audio.panAt(x).toFixed(3); },
+  // 限流诊断：try=调用次数、gap=被最小间隔拒、cap=被每秒上限拒、pass=放行、b0..b3=各桶命中。
+  // 「声音太少」时先看这里，能立刻分出「没事件」还是「全被闸门丢了」。
+  get audioLimits() { return audio.limits; },
   // 休息 / 争斗状态的逐只快照：排查「草地上的红鸟左右乱闪」这类问题用。
   // resting=在去草地的路上或已停稳；settled=真的停稳了；c=争斗红；dd=到落点距离
   restDebug() {

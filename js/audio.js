@@ -7,6 +7,21 @@
 // 所以改成常量，不再依赖参数表（音频参数以后怎么删都不会再打断主循环）。
 const MASTER_GAIN = 0.38;
 
+// ---------------------------------------------------------------- 空间（v1.4.21）
+// 相机是正交俯视、lookAt 正下方，唯一的旋转是 ±0.55° 的 SHAKE.roll（可忽略）。
+// 所以「世界坐标 → 声像」是一条直线：pan = (x − camX) / 视野半宽。
+// 不需要 PannerNode，也不需要把相机矩阵搬进音频线程。
+const PAN_SPREAD = 0.92;     // 最大声像偏移：留一点余量，不把声音推到单边贴耳
+const PAN_FAR = 1.6;         // 距离归一化的上限（视野半宽的倍数）
+const BUCKETS = 4;           // 限流分桶数：左 / 中左 / 中右 / 右
+// 共享混响：两条串联的短延迟 + 阻尼反馈 ≈ 0.6s 的房间。事件音原来是纯干声，
+// 只有音乐层带空间感，两者听着像不在同一个场地里。不引入卷积（不必载 IR）。
+const REV_WET = 0.20;
+const REV_D1 = 0.037, REV_D2 = 0.053, REV_FB = 0.40, REV_LP = 2600;
+// 密度纹理层（P3）：一条常驻的循环噪声，代替「每只鸟每次振翅都发一个音」。
+const TEX_LOOP_SEC = 3.7;    // 循环长度取质数秒，配合接缝交叉淡化，听不出周期
+const TEX_LFO_HZ = 0.63;     // 极慢的振幅摆动：像整群在「呼吸」，而不是一段嘶声
+
 export class FlockAudio {
   // flash：与外部共享的「音效指示灯」状态（HUD 上的三个小圆点）
   constructor(params, flash) {
@@ -23,14 +38,16 @@ export class FlockAudio {
     // v2：v1.4.0 之前这个 key 存过实验用的静音状态，会让人「刷新后一直是静音」。
     // 换 key 等于一次性重置为「默认开声」，之后用户的静音选择照常记住。
     try { this.mutedPref = localStorage.getItem('flocklab.audio.muted.v2') === '1'; } catch (e) {}
-    this.lastSprint = 0; this.sprintWindow = 0; this.sprintCount = 0;
-    this.lastPred = 0;   this.predWindow = 0;   this.predCount = 0;
-    this.lastBirth = 0;  this.birthWindow = 0;  this.birthCount = 0;
-    this.lastLand = 0;   this.landWindow = 0;   this.landCount = 0;
-    this.lastTake = 0;   this.takeWindow = 0;   this.takeCount = 0;
-    this.lastDash = 0;   this.dashWindow = 0;   this.dashCount = 0;   // 捕食者加速音效
     this.lastSprintDur = 0;
-    this.total = { sprint: 0, predate: 0, birth: 0, land: 0, takeoff: 0, dash: 0 };
+    // 视口快照（由 main.js 每帧喂三个标量）：声像与距离都从它算，音频模块不碰相机。
+    this.view = { x: 0, y: 0, halfW: 60 };
+    // 统一限流表：key → {last, win, n}。按声像分桶，见 _allow()。
+    this.lim = Object.create(null);
+    this.ctr = {};           // 限流诊断计数（try / gap / cap / pass / b0..b3）
+    this.lastPan = 0;
+    this.total = { sprint: 0, predate: 0, birth: 0, land: 0, takeoff: 0, dash: 0, lock: 0, dive: 0, alarm: 0 };
+    this.tex = null;         // 密度纹理层（P3），在 enable() 里建
+    this.texApplied = -1;
     this.music = null;   // 由构造函数末尾创建（音乐与音效共用同一套音频上下文）
     // 切到后台 / 页面被隐藏：主动断开并挂起。浏览器标签页静音由浏览器负责，
     // 但 AudioContext 自己仍在 running、音乐调度器仍每 25ms 排音符——一旦静音
@@ -77,6 +94,94 @@ export class FlockAudio {
     return true;
   }
 
+  // ---- 空间：世界坐标 → 声像 / 距离 ----------------------------------
+  // main.js 在相机更新之后每帧调一次。用「屏幕」而不是「场地」当标尺：
+  // 缩放时视野半宽变小，远处的鸟声自然会更偏向画面两侧，和看到的一致。
+  setView(x, y, halfW) {
+    const v = this.view;
+    v.x = x; v.y = y;
+    v.halfW = (halfW > 1) ? halfW : 60;
+  }
+
+  // 声像：正交俯视 + 极小 roll ⇒ 只跟世界 X 有关，一条直线映射。
+  panAt(x) {
+    if (x === undefined) return 0;
+    const v = this.view;
+    const p = (x - v.x) / v.halfW;
+    return Math.max(-1, Math.min(1, p)) * PAN_SPREAD;
+  }
+
+  // 距离（归一化到视野半宽）：只用来做很轻的衰减与闷化。
+  distAt(x, y) {
+    if (x === undefined) return 0;
+    const v = this.view;
+    const dx = x - v.x, dy = y - v.y;
+    return Math.min(PAN_FAR, Math.sqrt(dx * dx + dy * dy) / v.halfW);
+  }
+
+  // 每个事件音共用的出口链：低通（按距离闷化）→ 增益（按距离衰减）
+  // → StereoPanner（按位置）→ fxBus（+ 混响送出）。
+  // 返回链路的「入口」，事件音的各个成分全部接到它上面。
+  _chain(pan, dist) {
+    const ctx = this.ctx;
+    const d = Math.max(0, Math.min(PAN_FAR, dist || 0));
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    // 18k → 6.1k → 3.3k：远处的声音更闷，这是人耳判断距离的主要线索之一。
+    lp.frequency.value = 18000 * Math.pow(0.34, d);
+    lp.Q.value = 0.5;
+    const g = ctx.createGain();
+    // 衰减刻意温和（最多 −45%）：整片场地的鸟声本来就该是一层雾，
+    // 衰减太狠会变成一颗颗孤立的点，反而更假。
+    g.gain.value = 1 - 0.45 * Math.min(1, d);
+    lp.connect(g);
+    let out = g;
+    if (ctx.createStereoPanner) {
+      const p = ctx.createStereoPanner();
+      p.pan.value = Math.max(-1, Math.min(1, pan || 0));
+      g.connect(p); out = p;
+    }
+    out.connect(this.fxBus);
+    if (this.revSend) out.connect(this.revSend);   // 共享空间感（纯干声听着像贴脸）
+    return lp;
+  }
+
+  // 统一限流：gapMs 是最小间隔，perSec 是每秒上限。
+  // 返回 true 表示「放行」，调用方负责计数。
+  // `try` / `gap` / `cap` / `pass` 只做诊断：调音时要能分出「本来就没事件」和「全被闸门丢了」。
+  _allow(key, gapMs, perSec) {
+    const now = performance.now();
+    let st = this.lim[key];
+    if (!st) st = this.lim[key] = { last: 0, win: 0, n: 0 };
+    this.ctr.try = (this.ctr.try || 0) + 1;
+    // 窗口必须**先**滚动，再判间隔。
+    // 反过来写是个真 bug：事件持续密集（间隔永远小于 gapMs）时，
+    // 每次调用都停在 gap 那一行 return，永远走不到重置；计数器打满一次就永久锁死，
+    // 实测把冲刺发声从 8/s 压到 4.4/s，且表面看「闸门明明还有余量」。
+    if (now > st.win) { st.win = now + 1000; st.n = 0; }
+    if (now - st.last < gapMs) { this.ctr.gap = (this.ctr.gap || 0) + 1; return false; }
+    if (st.n >= perSec) { this.ctr.cap = (this.ctr.cap || 0) + 1; return false; }
+    st.last = now; st.n++;
+    this.ctr.pass = (this.ctr.pass || 0) + 1;
+    return true;
+  }
+
+  // 限流**只有一道全局闸门**（每个事件类型各一道），与 v1.4.20 语义一致。
+  // 曾经试过「按声像分 4 桶各自限流」，实测没有收益：800 只鸟是集中一团，
+  // 声源几乎全落在 1~2 个桶里（b2 命中 758、b0 只有 2），分桶既不改善空间分布，
+  // 还让总量变得不可预测（sprint 从 547 掉到 213 次/分）。分桶在这里没有意义——
+  // 声像该跟着位置走，总量该由一道闸门管。
+  _allowPanned(kind, pan, gapMs, perSec) {
+    const b = Math.max(0, Math.min(BUCKETS - 1,
+      Math.floor((Math.max(-1, Math.min(1, pan)) + 1) * (BUCKETS / 2))));
+    this.ctr['b' + b] = (this.ctr['b' + b] || 0) + 1;   // 只做诊断：看声源摊在几个桶
+    return this._allow(kind, gapMs, perSec);
+  }
+
+  // 诊断快照：try / gap / cap / pass 累计 + b0..b3 各声像桶的命中数。
+  // 「声音太少」时先看这里，能立刻分出是「没事件」还是「全被闸门丢了」。
+  get limits() { return { ...this.ctr }; }
+
   handleVisibility() {
     if (!this.ctx) return;
     if (document.hidden) {
@@ -122,6 +227,10 @@ export class FlockAudio {
       this.noise = ctx.createBuffer(1, len, ctx.sampleRate);
       const data = this.noise.getChannelData(0);
       for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+
+      // 空间感与密度层都挂在 fxBus 之后，一起受「音效音量」与总开关控制
+      this.buildReverb();
+      this.buildTexture();
     }
     // 先把「允许发声 / 静音」的状态定下来，再尝试 resume。
     // 关键：resume() 在没有用户手势时会被浏览器拒绝（抛出 NotAllowedError）。
@@ -141,6 +250,82 @@ export class FlockAudio {
       if (this.music) this.music.start();        // 音乐跟着声音一起开
       this.refreshButton();
     }
+  }
+
+  // 共享混响：两条串联短延迟 + 阻尼反馈（≈0.6s 的房间）。
+  // 事件音原来全是干声，只有音乐层带空间感，两者听着不像在同一个场地。
+  // 不用卷积混响——那需要载一份 IR，而这里要的只是「有墙」的感觉。
+  buildReverb() {
+    const ctx = this.ctx;
+    const send = ctx.createGain(); send.gain.value = 1;
+    const pre = ctx.createDelay(0.2); pre.delayTime.value = 0.012;
+    const d1 = ctx.createDelay(0.5); d1.delayTime.value = REV_D1;
+    const d2 = ctx.createDelay(0.5); d2.delayTime.value = REV_D2;
+    const damp = ctx.createBiquadFilter();
+    damp.type = 'lowpass'; damp.frequency.value = REV_LP; damp.Q.value = 0.6;
+    const fb = ctx.createGain(); fb.gain.value = REV_FB;
+    const wet = ctx.createGain(); wet.gain.value = REV_WET;
+    send.connect(pre); pre.connect(d1); d1.connect(d2);
+    d2.connect(damp); damp.connect(fb); fb.connect(d1);
+    damp.connect(wet); wet.connect(this.fxBus);
+    this.revSend = send;
+  }
+
+  // 密度纹理层（P3）：一条常驻循环噪声，代替「每只鸟每次振翅各发一个音」。
+  // 800 只鸟按 0.15s 振翅一次是 5000+ 次/秒，逐鸟发事件根本不可能；
+  // 而「整群在动」这个感觉，用一条随速度/密度变化的噪声层就够了。
+  buildTexture() {
+    const ctx = this.ctx;
+    const len = Math.floor(ctx.sampleRate * TEX_LOOP_SEC);
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    // 接缝交叉淡化：噪声直接循环会在接缝处「嗒」一下。
+    const fade = Math.floor(ctx.sampleRate * 0.06);
+    for (let i = 0; i < fade; i++) {
+      const k = i / fade;
+      d[i] = d[i] * k + d[len - fade + i] * (1 - k);
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.loop = true;
+
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.7;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 5200; lp.Q.value = 0.4;
+    // 极慢的振幅摆动（0.63Hz，深度 25%）：一片振翅的「涌」，不是一段稳定嘶声。
+    const trem = ctx.createGain(); trem.gain.value = 0.75;
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine'; lfo.frequency.value = TEX_LFO_HZ;
+    const lfoG = ctx.createGain(); lfoG.gain.value = 0.25;
+    lfo.connect(lfoG); lfoG.connect(trem.gain);
+    const gain = ctx.createGain(); gain.gain.value = 0;
+    src.connect(bp); bp.connect(lp); lp.connect(trem); trem.connect(gain);
+    gain.connect(this.fxBus);
+    src.start(); lfo.start();
+    this.tex = { src, bp, lp, trem, gain };
+    this.texAt = 0;
+  }
+
+  // 每帧喂三个 0~1 的标量（速度、密度、冲刺比例）+ 是否暂停。
+  // 参数写入节流到 ~11Hz：逐帧写 AudioParam 得到的是抖动，不是呼吸。
+  setDensity(speedNorm, densNorm, sprintNorm, paused) {
+    if (!this.tex) return;
+    const now = performance.now();
+    if (now - this.texAt < 90) return;
+    this.texAt = now;
+    const t = this.ctx.currentTime;
+    const s = Math.max(0, Math.min(1, speedNorm || 0));
+    const dn = Math.max(0, Math.min(1, densNorm || 0));
+    const sp = Math.max(0, Math.min(1, sprintNorm || 0));
+    // 电平压得极低：它是底噪式的「整群在动」，绝不能盖住任何一个事件音
+    const lvl = (paused || this.muted || this.suspendedByVisibility || document.hidden)
+      ? 0
+      : 0.0026 + 0.0130 * (0.45 * s + 0.55 * dn) * (1 + 0.75 * sp);
+    this.tex.gain.gain.setTargetAtTime(lvl, t, 0.35);
+    // 中心频率跟着速度和冲刺走：飞得越快、越多人拼命，那层「唰」越亮越高。
+    this.tex.bp.frequency.setTargetAtTime(620 + 1250 * s + 950 * sp, t, 0.45);
+    this.texApplied = lvl;
   }
 
   refreshButton() {
@@ -183,13 +368,14 @@ export class FlockAudio {
   //      · 一记 sine 哨音从 ~1.5kHz 快速上滑到 ~3kHz（55ms），给提速一个方向
   //      · 整组串 700Hz 高通，把所有低频浑浊切掉；声像每次随机
   //      · 严格限流：间隔 55ms、每秒最多 12 组，密集爆发时是成串的清脆振翅
-  sprint(intensity = 0) {
+  sprint(intensity = 0, x, y) {
     if (!this.canPlay() || !this.p.predatorOn) return;
-    const now = performance.now();
-    if (now - this.lastSprint < 55) return;
-    if (now > this.sprintWindow) { this.sprintWindow = now + 1000; this.sprintCount = 0; }
-    if (this.sprintCount >= 12) return;
-    this.lastSprint = now; this.sprintCount++; this.total.sprint++;
+    // 声像不再每次随机：起爆的鸟在哪儿，声音就从哪儿。原来随机 ±0.6 只是
+    // 「听着宽」，方向是假的；整群同时冲刺时还会左右乱跳。
+    const pan = this.panAt(x);
+    if (!this._allowPanned('spr', pan, 55, 12)) return;
+    this.total.sprint++;
+    this.lastPan = pan;
     this.flash.sprint = 1;
 
     const ctx = this.ctx, t = ctx.currentTime;
@@ -200,13 +386,7 @@ export class FlockAudio {
     // 公共出口：高通把 700Hz 以下全部切掉，避免任何低频「发闷」的成分漏出去
     const hp = ctx.createBiquadFilter();
     hp.type = 'highpass'; hp.frequency.value = 700; hp.Q.value = 0.7;
-    let out = hp;
-    if (ctx.createStereoPanner) {
-      const pan = ctx.createStereoPanner();
-      pan.pan.value = (Math.random() * 2 - 1) * 0.6;
-      hp.connect(pan); out = pan;
-    }
-    out.connect(this.fxBus);
+    hp.connect(this._chain(pan, this.distAt(x, y)));
 
     // ① 扑翅：3 记短促高频噪声脉冲，中心频率逐记略升，形成连拍的颗粒感
     for (let b = 0; b < 3; b++) {
@@ -245,18 +425,19 @@ export class FlockAudio {
 
   // 2) 被吃掉：三段音与捕杀动画同步——
   //    0ms 亮核闪光=低频撞击；90ms 内环扩张=撕裂噪声；240ms 外环与火花=低沉余波。
-  predate(J) {
+  predate(J, x, y) {
     if (!this.canPlay() || !this.p.predatorOn) return;
-    const now = performance.now();
-    if (now - this.lastPred < 120) return;
-    if (now > this.predWindow) { this.predWindow = now + 1000; this.predCount = 0; }
-    if (this.predCount >= 5) return;
-    this.lastPred = now; this.predCount++; this.total.predate++;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('eat', pan, 120, 5)) return;
+    this.total.predate++;
+    this.lastPan = pan;
     this.flash.predate = 1;
 
     const ctx = this.ctx, t = ctx.currentTime;
     const amp = Math.max(0, Math.min(1, J));
     const f = 95 + 150 * Math.sqrt(amp);
+    // 三段共用一条出口链：一次捕食是「一个身体被撞碎」，三段分别定位会散开
+    const out = this._chain(pan, dist);
 
     // 第一段：撞击（对应亮核爆闪）
     const o1 = ctx.createOscillator();
@@ -267,7 +448,7 @@ export class FlockAudio {
     g1.gain.setValueAtTime(0.0001, t);
     g1.gain.exponentialRampToValueAtTime(0.065 + 0.055 * amp, t + 0.006);
     g1.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
-    o1.connect(g1); g1.connect(this.fxBus);
+    o1.connect(g1); g1.connect(out);
     o1.start(t); o1.stop(t + 0.13);
 
     // 第二段：撕裂（对应内环扩张与火花飞散）
@@ -282,7 +463,7 @@ export class FlockAudio {
     g2.gain.setValueAtTime(0.0001, t2);
     g2.gain.exponentialRampToValueAtTime(0.055 + 0.045 * amp, t2 + 0.02);
     g2.gain.exponentialRampToValueAtTime(0.0001, t2 + 0.19);
-    src.connect(bp); bp.connect(g2); g2.connect(this.fxBus);
+    src.connect(bp); bp.connect(g2); g2.connect(out);
     src.start(t2); src.stop(t2 + 0.2);
 
     // 第三段：余波（对应外环扩散到最大）
@@ -295,22 +476,22 @@ export class FlockAudio {
     g3.gain.setValueAtTime(0.0001, t3);
     g3.gain.exponentialRampToValueAtTime(0.04 + 0.035 * amp, t3 + 0.03);
     g3.gain.exponentialRampToValueAtTime(0.0001, t3 + 0.38);
-    o3.connect(g3); g3.connect(this.fxBus);
+    o3.connect(g3); g3.connect(out);
     o3.start(t3); o3.stop(t3 + 0.4);
   }
 
   // 4) 降落：一声很轻的低频「嗒」+ 一下收翅的气流声 + 一点点亮的小尾音。
   //    用窄带噪声做收翅气流，保证每只鸟的声音是独立颗粒，多了也不会糊。
   //    尾音（triangle 1.3kHz 下滑 40ms）就是「轻快」的来源：像鸟爪在草叶上点了一下。
-  land() {
+  land(x, y) {
     if (!this.canPlay()) return;
-    const now = performance.now();
-    if (now - this.lastLand < 95) return;
-    if (now > this.landWindow) { this.landWindow = now + 1000; this.landCount = 0; }
-    if (this.landCount >= 5) return;
-    this.lastLand = now; this.landCount++; this.total.land++;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('land', pan, 95, 5)) return;
+    this.total.land++;
+    this.lastPan = pan;
 
     const ctx = this.ctx, t = ctx.currentTime;
+    const out = this._chain(pan, dist);
     const f = 150 + Math.random() * 60;
     const o = ctx.createOscillator();
     o.type = 'sine';
@@ -320,7 +501,7 @@ export class FlockAudio {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.026, t + 0.006);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.10);
-    o.connect(g); g.connect(this.fxBus);
+    o.connect(g); g.connect(out);
     o.start(t); o.stop(t + 0.12);
 
     const src = ctx.createBufferSource();
@@ -333,7 +514,7 @@ export class FlockAudio {
     g2.gain.setValueAtTime(0.0001, t);
     g2.gain.exponentialRampToValueAtTime(0.010, t + 0.012);
     g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.13);
-    src.connect(bp); bp.connect(g2); g2.connect(this.fxBus);
+    src.connect(bp); bp.connect(g2); g2.connect(out);
     src.start(t, Math.random() * 0.1, 0.15);
 
     // 尾音：一个短促下滑的小亮音，落在五声音阶上（A/C/D/E/G），
@@ -348,20 +529,20 @@ export class FlockAudio {
     g3.gain.setValueAtTime(0.0001, t + 0.01);
     g3.gain.exponentialRampToValueAtTime(0.011, t + 0.018);
     g3.gain.exponentialRampToValueAtTime(0.0001, t + 0.085);
-    o3.connect(g3); g3.connect(this.fxBus);
+    o3.connect(g3); g3.connect(out);
     o3.start(t + 0.01); o3.stop(t + 0.1);
   }
 
   // 5) 起飞：一下轻快的扑翅 + 两声上行小音（五声音阶），比降落更亮、更有「起势」。
-  takeoff() {
+  takeoff(x, y) {
     if (!this.canPlay()) return;
-    const now = performance.now();
-    if (now - this.lastTake < 95) return;
-    if (now > this.takeWindow) { this.takeWindow = now + 1000; this.takeCount = 0; }
-    if (this.takeCount >= 5) return;
-    this.lastTake = now; this.takeCount++; this.total.takeoff++;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('take', pan, 95, 5)) return;
+    this.total.takeoff++;
+    this.lastPan = pan;
 
     const ctx = this.ctx, t = ctx.currentTime;
+    const out = this._chain(pan, dist);
     const src = ctx.createBufferSource();
     src.buffer = this.noise;
     const bp = ctx.createBiquadFilter();
@@ -373,7 +554,7 @@ export class FlockAudio {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.017, t + 0.02);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.19);
-    src.connect(bp); bp.connect(g); g.connect(this.fxBus);
+    src.connect(bp); bp.connect(g); g.connect(out);
     src.start(t, Math.random() * 0.08, 0.21);
 
     // 两声上行小音：550~780Hz 起，第二声升一个音级（大二度~纯四度），
@@ -391,7 +572,7 @@ export class FlockAudio {
       g2.gain.setValueAtTime(0.0001, tt);
       g2.gain.exponentialRampToValueAtTime(0.015 - k * 0.003, tt + 0.008);
       g2.gain.exponentialRampToValueAtTime(0.0001, tt + 0.075);
-      o.connect(g2); g2.connect(this.fxBus);
+      o.connect(g2); g2.connect(out);
       o.start(tt); o.stop(tt + 0.09);
     }
   }
@@ -403,17 +584,16 @@ export class FlockAudio {
   //      ② 气流：噪声带通 900→240Hz → 收翅切开空气的「唰」
   //      ③ 落地感：95→52Hz 正弦短促下坠 → 冲刺的「推背感」
   //    只在加速度包络由低冲高时触发一次（main.js 做边沿检测 + 每只 400ms 限流）。
-  predDash(amp) {
+  predDash(amp, x, y) {
     if (!this.canPlay()) return;
-    const now = performance.now();
-    if (now - this.lastDash < 220) return;
-    if (now > this.dashWindow) { this.dashWindow = now + 1000; this.dashCount = 0; }
-    if (this.dashCount >= 3) return;
-    this.lastDash = now; this.dashCount++;
-    this.total.dash = (this.total.dash || 0) + 1;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('dash', pan, 220, 3)) return;
+    this.total.dash++;
+    this.lastPan = pan;
 
     const ctx = this.ctx, t = ctx.currentTime;
     const a = Math.max(0.25, Math.min(1, amp));
+    const out = this._chain(pan, dist);
 
     // ① 锐鸣（主体：音高与时长都随机，避免每次一模一样）
     const bp = ctx.createBiquadFilter();
@@ -426,7 +606,7 @@ export class FlockAudio {
     g1.gain.setValueAtTime(0.0001, t);
     g1.gain.exponentialRampToValueAtTime(0.050 + 0.030 * a, t + 0.014);
     g1.gain.exponentialRampToValueAtTime(0.0001, t + 0.20);
-    bp.connect(g1); g1.connect(this.fxBus);
+    bp.connect(g1); g1.connect(out);
     for (const det of [-9, 9]) {
       const o = ctx.createOscillator();
       o.type = 'sawtooth';
@@ -450,7 +630,7 @@ export class FlockAudio {
     g2.gain.setValueAtTime(0.0001, t);
     g2.gain.exponentialRampToValueAtTime(0.034 + 0.020 * a, t + 0.03);
     g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
-    src.connect(nb); nb.connect(hp); hp.connect(g2); g2.connect(this.fxBus);
+    src.connect(nb); nb.connect(hp); hp.connect(g2); g2.connect(out);
     src.start(t, Math.random() * 0.06, 0.3);
 
     // ③ 低频落地感
@@ -462,21 +642,21 @@ export class FlockAudio {
     g3.gain.setValueAtTime(0.0001, t);
     g3.gain.exponentialRampToValueAtTime(0.040 + 0.022 * a, t + 0.012);
     g3.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
-    lo.connect(g3); g3.connect(this.fxBus);
+    lo.connect(g3); g3.connect(out);
     lo.start(t); lo.stop(t + 0.2);
   }
 
   // 3) 新生：两声短促上行的清亮提示音，捕获后被吃的声音之后响起。
-  birth() {
+  birth(x, y) {
     if (!this.canPlay()) return;
-    const now = performance.now();
-    if (now - this.lastBirth < 90) return;
-    if (now > this.birthWindow) { this.birthWindow = now + 1000; this.birthCount = 0; }
-    if (this.birthCount >= 5) return;
-    this.lastBirth = now; this.birthCount++; this.total.birth++;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('birth', pan, 90, 5)) return;
+    this.total.birth++;
+    this.lastPan = pan;
     this.flash.birth = 1;
 
     const ctx = this.ctx, t = ctx.currentTime;
+    const out = this._chain(pan, dist);
     for (const [delay, f1, f2] of [[0, 740, 1100], [0.085, 990, 1480]]) {
       const o = ctx.createOscillator();
       o.type = 'sine';
@@ -486,9 +666,123 @@ export class FlockAudio {
       g.gain.setValueAtTime(0.0001, t + delay);
       g.gain.exponentialRampToValueAtTime(0.075, t + delay + 0.008);
       g.gain.exponentialRampToValueAtTime(0.0001, t + delay + 0.09);
-      o.connect(g); g.connect(this.fxBus);
+      o.connect(g); g.connect(out);
       o.start(t + delay); o.stop(t + delay + 0.1);
     }
+  }
+
+  // ---- P1：三个以前完全没有声音的罕见事件 ------------------------------
+  // 它们每分钟只有 5~7 次（锁定 / 俯冲 / 群体警戒），低频、可辨识，
+  // 而且正对着玩家的注意力 —— 这才是「加音效」该加的地方，
+  // 而不是去给每秒几千次的振翅各发一个音。
+
+  // 7) 锁定目标：一记高频「叮」+ 一下极短的擦声。
+  //    刻意做成干净的单音：sprint 是成串的高频扑棱，predDash 是下滑锐鸣，
+  //    这里必须是第三种质地，否则三个一起响就分不出来了。
+  lockOn(x, y) {
+    if (!this.canPlay() || !this.p.predatorOn) return;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('lock', pan, 400, 3)) return;
+    this.total.lock++;
+    this.lastPan = pan;
+
+    const ctx = this.ctx, t = ctx.currentTime;
+    const out = this._chain(pan, dist);
+    // 一声短「叮」：音高在 1.6~2.4kHz 之间抖，避免每次都是同一个音
+    const f = 1650 + Math.random() * 700;
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(f, t);
+    o.frequency.exponentialRampToValueAtTime(f * 1.18, t + 0.045);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.020, t + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.075);
+    o.connect(g); g.connect(out);
+    o.start(t); o.stop(t + 0.09);
+    // 擦声：10ms 的高频噪声，给「注意力一下收束」一个颗粒
+    const src = ctx.createBufferSource();
+    src.buffer = this.noise;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.Q.value = 3.2; bp.frequency.value = 3600;
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(0.014, t + 0.004);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.022);
+    src.connect(bp); bp.connect(g2); g2.connect(out);
+    src.start(t, Math.random() * 0.1, 0.03);
+  }
+
+  // 8) 俯冲开始：一路下坠的「唰」+ 一记低频落感。
+  //    和 predDash 的区别是方向——那条是「由低冲高」（起步）的下滑锐鸣，
+  //    这条整体是往下掉的，听感就是「从高处砸下来」。
+  dive(x, y) {
+    if (!this.canPlay() || !this.p.predatorOn) return;
+    const pan = this.panAt(x), dist = this.distAt(x, y);
+    if (!this._allowPanned('dive', pan, 300, 3)) return;
+    this.total.dive++;
+    this.lastPan = pan;
+
+    const ctx = this.ctx, t = ctx.currentTime;
+    const out = this._chain(pan, dist);
+    const src = ctx.createBufferSource();
+    src.buffer = this.noise;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.Q.value = 1.5;
+    bp.frequency.setValueAtTime(2400 + Math.random() * 500, t);
+    bp.frequency.exponentialRampToValueAtTime(280, t + 0.30);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.030, t + 0.05);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.34);
+    src.connect(bp); bp.connect(g); g.connect(out);
+    src.start(t, Math.random() * 0.08, 0.36);
+    // 落感：70→38Hz 的短下坠，比 predDash 那记更低更长一点
+    const lo = ctx.createOscillator();
+    lo.type = 'sine';
+    lo.frequency.setValueAtTime(74, t + 0.05);
+    lo.frequency.exponentialRampToValueAtTime(38, t + 0.30);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.0001, t + 0.05);
+    g2.gain.exponentialRampToValueAtTime(0.034, t + 0.10);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
+    lo.connect(g2); g2.connect(out);
+    lo.start(t + 0.05); lo.stop(t + 0.34);
+  }
+
+  // 9) 群体警戒：整群被惊动。不做「点」，做成一片涌动的沙沙声 + 低频隆起，
+  //    声像居中（它是全场事件，不该从某个方向来）。
+  alarm() {
+    if (!this.canPlay() || !this.p.predatorOn) return;
+    if (!this._allow('alarm', 900, 2)) return;
+    this.total.alarm++;
+    this.lastPan = 0;
+
+    const ctx = this.ctx, t = ctx.currentTime;
+    const out = this._chain(0, 0.45);
+    const src = ctx.createBufferSource();
+    src.buffer = this.noise;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.Q.value = 0.9;
+    bp.frequency.setValueAtTime(300, t);
+    bp.frequency.exponentialRampToValueAtTime(1050, t + 0.26);
+    bp.frequency.exponentialRampToValueAtTime(520, t + 0.62);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.028, t + 0.13);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.70);
+    src.connect(bp); bp.connect(g); g.connect(out);
+    src.start(t, 0, 0.72);
+    const lo = ctx.createOscillator();
+    lo.type = 'sine';
+    lo.frequency.setValueAtTime(58, t);
+    lo.frequency.exponentialRampToValueAtTime(44, t + 0.5);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.0001, t);
+    g2.gain.exponentialRampToValueAtTime(0.026, t + 0.10);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+    lo.connect(g2); g2.connect(out);
+    lo.start(t); lo.stop(t + 0.58);
   }
 
   // 构造完再建音乐：FlockMusic 定义在本文件后面，运行到这里时已经就绪

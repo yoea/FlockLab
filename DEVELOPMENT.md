@@ -53,7 +53,7 @@ flocklab/
 ├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 4050 行，核心）
 ├── js/forces.js        邻域受力（约 380 行，全项目最热的一段；单核与 Worker 共用同一份实现）
 ├── js/sim-worker.js    多核 Worker 壳（约 120 行，只调 forces.js，不含任何规则逻辑）
-├── js/audio.js         Web Audio 事件音效 + 六层生成式音乐（约 730 行）
+├── js/audio.js         Web Audio 九类事件音效 + 空间化（声像/混响）+ 密度层 + 六层生成式音乐（约 1160 行）
 ├── js/grass.js         草地几何、谐波轮廓、面积校准、着色（约 180 行）
 ├── js/backdrop.js      背景地貌（草地斑 / 河流 / 村庄剪影）+ 漂移云层（约 250 行）
 ├── js/version.js       **生成的**构建元数据（版本 / commit / 构建时间 / 作者），勿手改
@@ -396,6 +396,32 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 - `resumeFromSim()` 必须重设 `nextTime = currentTime + 0.06`。`tick()` 里虽然也有「落后就跳到 now」的兜底，但那是按 `now + 0.03` 补，暂停几十秒后仍可能连排一串；显式重设才是稳的。
 - 恢复时要看 `muted / suspendedByVisibility / document.hidden`：这三者任一为真就只修状态、不拉音量，等 `mute(false)` 或切回前台时自然会响。
 
+### 3.9f 空间音频：声像、混响、密度层（v1.4.21）
+
+这三件事的前提是同一个观察：**这个场景的声源全在同一平面上，相机又是正交俯视**。它决定了什么该做、什么不该做。
+
+- **声像是一条直线**，不需要 `PannerNode`：`camera` 只有 `lookAt(camX, camY, 0)` 加 ±0.55° 的 `SHAKE.roll`，没有偏航俯仰。
+  所以 `pan = (x − camX) / 视野半宽`，视野半宽直接取 `orthoCam.right`（`updateOrthoFrustum` 每帧更新，缩放自动跟着变）。
+  `main.js` 在相机更新之后调 `audio.setView(camX, camY, orthoCam.right)`——**必须在 `lookAt` / `rotateZ` 之后**，否则拿到的是上一帧的相机。
+- **不要用 HRTF**：头部相关传输函数解决的是仰角与前后混淆，而俯视图里没有任何视觉上的「前」「后」可以对照，多出来的线索只会和画面对不上；卷积成本还是 `StereoPanner` 的一个数量级以上，移动端最先掉帧。
+- **每事件一条出口链**（`_chain(pan, dist)`）：按距离的低通（`18000 × 0.34^d`）→ 距离增益（最多 −45%）→ `StereoPanner` → `fxBus`，同时并联一条 `revSend`。
+  衰减刻意**温和**：整片场地的鸟声本来就该是一层雾，压太狠会变成一颗颗孤立的点，反而更假。
+- **限流保持单一全局闸门**（`_allowPanned` → `_allow`，每类事件各一道，语义与 v1.4.20 相同）。
+  曾经按声像分 4 桶各自限流，**实测没有收益**：800 只鸟是一团，声源几乎全落在 1~2 个桶
+  （一次采样 b3 命中 849、b0 只有 2），分桶既不改善空间分布，又让总量不可预测（sprint 发声 547 → 213 次/分）。
+  `_allowPanned` 现在只做两件事：算桶（`ctr.b0..b3` 仅作诊断）+ 转调全局闸门。
+- **限流器的窗口必须先滚动再判间隔**。反过来写是个真 bug：事件持续密集（间隔永远小于 `gapMs`）时，
+  每次调用都停在间隔那一行 `return`，永远执行不到 `st.win` 重置；计数器打满一次就永久锁死，
+  表面上看「闸门明明还有余量，却没有声音」。
+- **知道冲刺为什么是「每簇一声」**：起爆是按「离猛禽距离」给 45–260ms 反应延迟再由 `alertMs` 累积触发的，
+  几十只会落在几乎同一毫秒里成簇爆发，簇与簇之间有几十毫秒空档。所以 55ms 的间隔闸门实际过滤掉的是整个簇，
+  实测 `gap` 拒绝 42/s、放行 6.7/s。**这是事件密度决定的，不是闸门调值能救的**——想更密只能缩短反应延迟的离散度。
+- **混响用双延迟反馈，不用卷积**：两条串联短延迟 37 / 53ms、阻尼反馈 0.40、低通 2600Hz，往返一圈 0.09s ⇒ RT60 ≈ 0.68s。
+  事件音原来是纯干声、只有音乐带空间感，两者听着不在同一个场地。
+- **振翅不能做成事件**：800 只 × 每 0.15 秒一次 = 5000+ 次/秒，Web Audio 每个音要建 4~8 个节点，三个数量级超标。
+  正确做法是**一条密度层**（`buildTexture` / `setDensity`）：3.7 秒循环噪声 + 接缝交叉淡化（不做就会有一下「嗒」），带通中心频率与增益跟「平均速度 / 密度 / 冲刺比例」走，外加 0.63Hz 的极慢振幅摆动让它「呼吸」而不是「嘶」。一条总线、几个节点，和鸟的数量完全无关。
+- **参数写入一律节流**：`setDensity` 90ms、`FlockMusic.update` 靠 `applied` 变化量判断。逐帧直写 `AudioParam` 得到的是抖动，不是呼吸。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
@@ -485,6 +511,7 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 **群体归拢**：`flockKeep`（`{r, f}`）/ `setFlockKeep(r, f)`——长程归拢的半径与力度，调参用、不持久化
 
 **音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0–1.5)` / `music.running` / `paused` / `pauseSim(on)`（等价于点暂停按钮，暂停时音乐一起停）
+**空间音频（v1.4.21）**：`audioSpatial` → `{view:{x,y,halfW}, lastPan, reverb, texture:{gain,freq,applied}}`；`panAt(x)` 把世界 X 换算成声像（左右各夹在 ±0.92），用来核对「左边的鸟在不在左边」。`view` 每帧由 `audio.setView(camX, camY, orthoCam.right)` 喂入，所以它本身就是「相机是否与音频对齐」的证据。
 
 **出生动画 / 背景**：`hatchPending`（还在涌出中的个体数，加载后应逐渐归 0）/ `respawn(n)`（立刻让 n 只原地重生，验证涌出动画）/ `backdrop`（背景层本体：`uniforms.uGain` 拉高可看清地貌形状，`uniforms.uGN=0` 可 A/B 对比草地避让）
 
@@ -570,6 +597,12 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 
 `Page.reload({ignoreCache:true})` 仍可能加载旧模块。用 `Page.navigate` + `?t=Date.now()`。
 另：浏览器会缓存 CDN 的 three.js，排查「改了没生效」先排除缓存。
+
+**v1.4.21 实测到的「新一半、旧一半」**：清掉 `Storage.clearDataForOrigin{service_workers,cache_storage}` 之后再导航，
+Service Worker 会重新 `install` 并预缓存——**而它预缓存时用的是 HTTP 磁盘缓存**。于是出现「`main.js` 是新的、
+`audio.js` 还是旧的」：页面不报错，只是新接口全是 `undefined`（表现为 `audioSpatial` 抛异常、`soundEvents` 少字段）。
+判据：`FlockLab.soundEvents` 里有没有本版本新增的键。
+修法：CDP 里除清 CacheStorage 之外，**还要 `Network.enable` + `Network.setCacheDisabled{true}`**，再导航。
 
 ### 6.6 Windows / Git Bash 环境
 
