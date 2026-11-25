@@ -2775,6 +2775,18 @@ function frameFinish(F, res, dt, time) {
   // 冲刺计数在 frameFinish 里清零 + 累加，必须同帧：多核是「本帧 dispatch、下一帧收尾」，
   // 若在 frameBegin 清零，累加结果会被下一帧开头的清零立刻抹掉，HUD 永远读到 0。
   sprintingCount = 0;
+  // 多核专用补丁：worker 对「休息中 / 等待重生」的个体直接 continue（forces.js 第 74 行），
+  // 回传的 acc / fleeDir / neighbors / fleeing 里这几只的位置保持**上一轮的旧值**，
+  // 而 onWorkerDone 是整段覆盖回主线程的 —— 于是 updateResting 刚清零的合力又被写回非零。
+  // 停稳的鸟每帧拿到同一坨固定方向的旧合力，被推着朝一个方向匀速漂，能一路飘出草地。
+  // 单核没有这个问题（computeForces 直接写主线程数组，跳过即保持 0）。
+  for (let i = 0; i < n; i++) {
+    if (!resting[i] && !caught[i]) continue;
+    const k = i * 3;
+    acc[k] = 0; acc[k + 1] = 0; acc[k + 2] = 0;
+    fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
+    neighbors[i] = 0; fleeing[i] = 0;
+  }
   let sumNeighbors = res.sumN;
   let deadCount = 0;
   for (let i = 0; i < n; i++) if (caught[i]) deadCount++;
@@ -2811,11 +2823,9 @@ function frameFinish(F, res, dt, time) {
         vel[k + 1] += (wy - vel[k + 1]) * kk;
         vel[k + 2] = 0;
       } else {
-        // 停稳：强阻尼把速度收到 0 附近（不适用最低速度与边界反弹）
-        const damp = Math.exp(-dt / 0.4);
-        vel[k] = (vel[k] + acc[k] * dt) * damp;
-        vel[k + 1] = (vel[k + 1] + acc[k + 1] * dt) * damp;
-        vel[k + 2] = 0;
+        // 停稳：语义就是「一动不动」。直接归零，不再走 acc 积分——
+        // 残留的合力（多核回传的旧值）会把静止的鸟推着朝一个方向匀速漂出草地。
+        vel[k] = 0; vel[k + 1] = 0; vel[k + 2] = 0;
       }
       pos[k] += vel[k] * dt; pos[k + 1] += vel[k + 1] * dt;
       const rsp = Math.sqrt((vel[k]) * (vel[k]) + (vel[k + 1]) * (vel[k + 1]));
