@@ -1885,9 +1885,19 @@ function syncPauseBtn() {
   pauseBtn.title = label;
   pauseBtn.setAttribute('aria-label', label);
 }
-pauseBtn.addEventListener('click', () => {
-  params.paused = !params.paused;
+// 暂停 = 真的停住：仿真不再推进，音乐也跟着停。
+// 否则画面冻在一帧、音乐还在推进，观感割裂，也容易让人以为「暂停没生效」。
+// 只在状态边沿切一次，不每帧调用（每帧写 AudioParam 会打断主循环，v1.4.8 的教训）。
+function setPaused(on) {
+  on = !!on;
+  if (params.paused === on) { syncPauseBtn(); return; }
+  params.paused = on;
   syncPauseBtn();
+  if (on) music.pauseForSim();
+  else music.resumeFromSim();
+}
+pauseBtn.addEventListener('click', () => {
+  setPaused(!params.paused);
   wake();
 });
 // 全屏：只做浏览器全屏切换，不碰模拟状态。原来的「重新初始化」已下线，
@@ -2128,8 +2138,7 @@ fView.close();
 // FlockLab.resetAll() 用；平时刷新都沿用存档。
 function applyDefaults() {
   for (const key of PERSIST_KEYS) params[key] = DEFAULTS[key];
-  params.paused = false;
-  syncPauseBtn();
+  setPaused(false);          // 恢复出厂 = 继续跑：暂停与音乐一起复位
   setCount(params.count);
   setPredCount(params.predatorCount);
   syncPredDraw();
@@ -3892,6 +3901,8 @@ window.FlockLab = {
   setMultiCore(on) { return setMultiCore(on); },
   get version() { return { version: VERSION, commit: COMMIT, buildTime: BUILD_TIME, author: AUTHOR }; },
   get paused() { return !!params.paused; },
+  // 调试用：等价于点一下暂停按钮（暂停时音乐一起停）
+  pauseSim(on) { setPaused(!!on); return !!params.paused; },
   get sepCap() { return sepCapFor(activeCount); },
   set sepCap(v) { dbgSepCap = Math.max(0, Math.round(v)); return sepCapFor(activeCount); },
   // 局部密度（颜色色阶）的分位数：验证色相是否铺满青蓝→紫，而不是卡在一处。

@@ -530,6 +530,9 @@ export class FlockMusic {
     this.nextTime = 0;
     this.step = 0;
     this.timer = 0;
+    // 模拟（画面）是否被暂停：暂停时音乐要停，但「静音」是用户意图、两件事不能混。
+    // 这个标志同时管住 start / mute / resumeScheduler，避免暂停期间被它们偷偷复活。
+    this.simPaused = false;
     this.counts = { chord: 0, pulse: 0, shimmer: 0, bass: 0 };
     // 捕食者状态（由 main.js 每帧喂标量，音频参数的平滑与写入只在 25ms 调度器里做）
     this.pred = { active: false, x: 0, heat: 0, dist: 100 };
@@ -651,7 +654,8 @@ export class FlockMusic {
     this.smooth = 0; this.applied = -1;
     this.nextTime = ctx.currentTime + 0.12;
     this.nodes.bus.gain.cancelScheduledValues(ctx.currentTime);
-    this.nodes.bus.gain.setTargetAtTime(this.level, ctx.currentTime, 0.9);
+    // 画面处于暂停时不要出声，否则「暂停着却自己响起来」
+    this.nodes.bus.gain.setTargetAtTime(this.simPaused ? 0 : this.level, ctx.currentTime, 0.9);
     this.resumeScheduler();
   }
 
@@ -661,18 +665,50 @@ export class FlockMusic {
     if (this.nodes) this.nodes.bus.gain.setTargetAtTime(0, this.a.ctx.currentTime, 0.12);
   }
 
+  // 模拟暂停：音乐一起停。这和「静音」不是一回事——静音是用户意图、要跨刷新记住，
+  // 暂停只是画面冻结，恢复后应该接着往下走。
+  // 做法：总线渐隐到 0 + 停掉 25ms 调度器（不排新音符），振荡器留在原地不动。
+  pauseForSim() {
+    this.simPaused = true;
+    this.pauseScheduler();
+    if (!this.nodes || !this.a.ctx) return;
+    const ctx = this.a.ctx;
+    this.nodes.bus.gain.cancelScheduledValues(ctx.currentTime);
+    this.nodes.bus.gain.setTargetAtTime(0, ctx.currentTime, 0.1);
+  }
+
+  // 继续：从当前时刻接着走。nextTime 必须重设，否则会把暂停那几十秒里「欠下」的
+  // 音符一次性补排出来（听感上是突然一大串和弦砸下来）。
+  resumeFromSim() {
+    this.simPaused = false;
+    if (!this.running || !this.nodes || !this.a.ctx) return;
+    const ctx = this.a.ctx;
+    this.nextTime = ctx.currentTime + 0.06;
+    // 用户静音 / 页面在后台时保持无声，只把状态修好；等 mute(false) 或切回来时自然会响
+    if (this.a.muted || this.a.suspendedByVisibility || document.hidden) return;
+    this.nodes.bus.gain.setTargetAtTime(this.level, ctx.currentTime, 0.3);
+    this.resumeScheduler();
+  }
+
   // 静音 / 切后台时连 25ms 的调度器一起停，避免后台空转继续排音符
   pauseScheduler() { if (this.timer) { clearInterval(this.timer); this.timer = 0; } }
-  resumeScheduler() { if (this.running && !this.timer) this.timer = setInterval(() => this.tick(), 25); }
+  resumeScheduler() {
+    if (this.simPaused || !this.running || this.timer) return;
+    this.timer = setInterval(() => this.tick(), 25);
+  }
 
   // 与声音总开关联动：静音时整个音乐总线归零，恢复时把调度指针拉回当前时刻，
-  // 否则会把暂停期间「欠下」的音符一次性补排出来。
+  // 否则会把静音期间「欠下」的音符一次性补排出来。
+  // 画面暂停期间解除静音只记状态，不出声（等继续播放时由 resumeFromSim 接回来）。
   mute(m) {
     if (!this.nodes || !this.a.ctx) return;
     const ctx = this.a.ctx;
-    this.nodes.bus.gain.setTargetAtTime(m ? 0 : this.level, ctx.currentTime, 0.12);
+    this.nodes.bus.gain.setTargetAtTime((m || this.simPaused) ? 0 : this.level, ctx.currentTime, 0.12);
     if (m) this.pauseScheduler();
-    else { this.nextTime = ctx.currentTime + 0.08; this.step = 0; this.resumeScheduler(); }
+    else {
+      this.nextTime = ctx.currentTime + 0.08; this.step = 0;
+      this.resumeScheduler();
+    }
   }
 
   // main.js 每帧只传 4 个标量，不碰任何 AudioParam；真正的平滑写在 25ms 调度器里。

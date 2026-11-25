@@ -353,6 +353,16 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 
 **「重新初始化」已下线**：那条按钮改成了全屏，恢复出厂参数的入口只剩调试接口 `FlockLab.resetAll()`（内部就是 `applyDefaults()`），函数本身保留。
 
+### 3.9e 暂停 = 画面 + 音乐（v1.4.10）
+
+「暂停」必须真的停住：只冻画面、音乐还在推进，观感是割裂的，用户会以为暂停没生效。
+
+- **只在边沿切一次**：`setPaused(on)` 里 `params.paused` 变了才调 `music.pauseForSim()` / `resumeFromSim()`，不放进每帧循环——每帧写 `AudioParam` 正是 v1.4.8 那个「定格」事故的成因。
+- **暂停 ≠ 静音**，两套状态必须分开：静音是用户意图（`localStorage` 记住、跨刷新），暂停是画面冻结（会话内）。所以 `FlockMusic` 里多一个 `simPaused` 标志，`start()` / `mute()` / `resumeScheduler()` 三处都要看它——否则「暂停中点一下声音开关」「暂停中切后台回来」都会把音乐偷偷放出来。
+- 停的做法是**总线渐隐到 0 + 停 25ms 调度器**（不再排新音符），振荡器留在原地不销毁：恢复时不用重建音色，也不会从第一个和弦重新开始。
+- `resumeFromSim()` 必须重设 `nextTime = currentTime + 0.06`。`tick()` 里虽然也有「落后就跳到 now」的兜底，但那是按 `now + 0.03` 补，暂停几十秒后仍可能连排一串；显式重设才是稳的。
+- 恢复时要看 `muted / suspendedByVisibility / document.hidden`：这三者任一为真就只修状态、不拉音量，等 `mute(false)` 或切回前台时自然会响。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
@@ -428,7 +438,7 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 
 **群体归拢**：`flockKeep`（`{r, f}`）/ `setFlockKeep(r, f)`——长程归拢的半径与力度，调参用、不持久化
 
-**音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0–1.5)` / `music.running`
+**音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0–1.5)` / `music.running` / `paused` / `pauseSim(on)`（等价于点暂停按钮，暂停时音乐一起停）
 
 **出生动画 / 背景**：`hatchPending`（还在涌出中的个体数，加载后应逐渐归 0）/ `respawn(n)`（立刻让 n 只原地重生，验证涌出动画）/ `backdrop`（背景层本体：`uniforms.uGain` 拉高可看清地貌形状，`uniforms.uGN=0` 可 A/B 对比草地避让）
 
@@ -612,6 +622,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v1.4.7 | **信息面整理**：状态卡新增运行模式（单核 / 多核 ×N，按「这一帧真的在并行吗」判定，而不是只看开关）与 CPU / GPU 压力条（都以 60fps 的 16.7ms 为 100%；GPU 用 `EXT_disjoint_timer_query_webgl2` 实测，浏览器不给扩展时退回提交耗时并标 `~`）；卡底新增版本行（**版本 · commit · 构建时间 · 作者**，由 `tools/build-meta.mjs` 生成 `js/version.js`）；关于弹窗从 16 条压到 3 条要点；控制台由「鸟群规则 / 飞行与视野 / 捕食与逃逸 / 高级参数 / 草地」重排为「鸟群 / 飞行 / 捕食者 / 逃逸 / 草地 / 画面与性能」，参数按用途归位、默认只展开前两组。顺带修了四处：存档 120ms 防抖窗口内关页面会丢最后一次改动（`pagehide` 立即落盘）；「恢复默认参数」后多核开关显示为开但实际仍跑单核（漏了重建线程池）；v6→v7 迁移会把 `musicLevel` / `boundary` 这些已废弃的键也搬进新存档；多核首帧冷启动被 800ms 超时误杀（首帧给 4 倍宽限）。见 §3.9c |
 | v1.4.8 | **修「开声后画面定格」**：`params.master` 在 v1.4.7 被删但 `audio.js` 仍在读，`AudioParam.value = undefined` 抛 TypeError；异常发生在 `render` 的仿真段（`prepareForces → audio.sprint()`），每帧中断 → 画面定格，静音后 `canPlay()` 早退即恢复。改为常量 `MASTER_GAIN`，`connectOutput()` 内 try/catch 兜底（音频故障只能没声音，不能停鸟群），音频建图拆两段可续建。同批补回 v1.4.4 丢失的 `stamina` 恢复与 `sprintingCount` 累加——后者必须与累加同在 `frameFinish`：多核是「本帧 dispatch、下帧收尾」，在 `frameBegin` 清零会被下一帧立刻抹掉 |
 | v1.4.9 | **界面交互重做**：右下角「重新初始化」→ **全屏**（`requestFullscreen` / `exitFullscreen` 带 webkit 回退，只切全屏不动参数，`fullscreenchange` + `webkitfullscreenchange` 双事件同步图标与高亮）；**闲置 5 秒自动隐藏**控制台 / 状态卡 / 右下角按钮，光标同时隐藏，任意输入调 `wake()` 恢复并重置计时；`#hud.pinned` 靠 CSS `:not(.pinned)` 排除在隐藏之外，卡内按钮跟着常驻；「关于」弹窗打开期间不计时；删除小眼睛按钮、`autoHideUi` 的载入 1 秒收起与 `eyeTimer` 那套淡出；`applyDefaults()` 保留给调试接口 `resetAll()`。见 §3.9d |
+| v1.4.10 | **暂停 = 画面 + 音乐**：`setPaused(on)` 只在状态边沿调 `music.pauseForSim()` / `resumeFromSim()`（不进每帧循环——每帧写 AudioParam 正是 v1.4.8 定格事故的成因）；停法是音乐总线渐隐 0 + 停 25ms 调度器，恢复时 `nextTime = now + 0.06` 不补排欠下的音符，振荡器不重建。新增 `simPaused` 标志，被 `start` / `mute` / `resumeScheduler` 三处引用，防止暂停期间被静音开关或后台恢复偷偷放声；`applyDefaults()` 改走 `setPaused(false)`。见 §3.9e |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
