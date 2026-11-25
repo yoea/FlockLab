@@ -2,6 +2,7 @@
 import { FlockAudio, FlockMusic } from './audio.js';
 import { createGrass } from './grass.js';
 import { createBackdrop } from './backdrop.js';
+import { computeForces, MAX_FORCE } from './forces.js';
 
 const fail = (msg) => {
   const el = document.getElementById('error');
@@ -54,6 +55,20 @@ const BOUND = 40;
 // 相机视口比活动范围大 2%（留少量边距，缩放/平移时不至于一下就贴边）。
 // 注意 bounds2D() 会引用它，所以必须声明在 bounds2D 之前（否则 TDZ）。
 const VIEW2D_MARGIN = 1.02;
+// 多核调度状态。定义在文件顶部：setCount / resetBoids 在模块初始化阶段就会 bump
+// epoch（TDZ 安全），而这些函数远在调度器代码之前。
+const MC = {
+  enabled: false,   // 当前是否在用 Worker
+  tried: false,     // 是否尝试过创建（只试一次）
+  reason: 'idle',   // idle / on / off / no-worker / spawn / worker-error / timeout
+  workers: [],
+  job: null,        // 在飞的那一帧
+  epoch: 0,         // 数组被重置过就 +1，旧结果直接丢弃
+  serial: 0,
+  lastWall: 0,      // 上一帧 dispatch→收齐的墙钟时间（ms）
+  minN: 320,        // 小群体并行反而更慢（消息开销 > 计算）
+  timeoutMs: 800
+};
 const MAX_N = 10000;
 const MAX_P = 10;              // AI 捕食者上限（GUI 可调范围）
 // 鼠标捕食者单独占一个数组槽位（索引 = 当前 AI 捕食者数量），所以要多留一格。
@@ -71,7 +86,7 @@ const MOUSE_VMAX = 60;
 // 注意力：v41 起不再限制邻居数——对齐 / 聚合 / 分离都取视野半径内的**全部**同伴，
 // 即最原始的 Boids 涌现规则（v31~v40 的「只注意最近 7 只」已移除，见 step 里邻域扫描）。
 // 分段耗时探针（FlockLab.perf 可读）：定位「哪一段吃掉了这一帧」比猜有用。
-const perfParts = { grid: 0, loop: 0, stats: 0, color: 0 };
+const perfParts = { grid: 0, force: 0, loop: 0, stats: 0, color: 0 };
 
 // 出厂默认值：只有点击「重新初始化」才会回到这里。
 const DEFAULTS = {
@@ -110,7 +125,10 @@ const DEFAULTS = {
   // 草地：场里长出 2~3 片草地，鸟会定期降落歇一会儿
   grassOn: true,
   // 屏幕边缘穿越：开=墙不存在（环面平移，飞出对侧回来）；关=墙变实体（反弹）
-  wrapEdges: false
+  wrapEdges: false,
+  // 多核加速：把鸟群邻域受力分给几个 Worker 并行算。
+  // 关掉就是原来的单线程路径（也是 worker 建不起来时的自动回退目标）。
+  multiCore: true
 };
 // 运行时参数：先从 localStorage 恢复上次的调整结果，没有存档才用默认值。
 const params = { ...DEFAULTS, enabled: false, paused: false };
@@ -124,11 +142,12 @@ const PERSIST_KEYS = [
   'predatorOn', 'predatorCount', 'fleeWeight', 'fleeRange', 'predict',
   'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
   'sprintFactor', 'sprintDuration', 'sprintRecovery',
-  'grassOn', 'wrapEdges'
+  'grassOn', 'wrapEdges', 'multiCore'
 ];
-// v6：出厂默认值改为 对齐 1.8 / 视野 7 / 元素 800，音乐音量改回 0~1.5 增益刻度（默认 0.4）；
-// 音量刻度与默认值都变了，旧存档不能沿用，否则刷新后仍是旧数值。
-const STORE_KEY = 'flocklab.params.v6';
+// v7：只多了一个「多核加速」开关，默认值一个都没改，所以升级时把 v6 的存档整份搬过来，
+// 不让用户调过的参数回到出厂值。
+const STORE_KEY = 'flocklab.params.v7';
+const STORE_KEY_PREV = 'flocklab.params.v6';
 const PARAM_RANGE = {
   count: [10, MAX_N], separation: [0, 4], alignment: [0, 4], cohesion: [0, 4],
   perception: [1, 14], separationRange: [0.2, 6], flow: [0, 4],
@@ -142,6 +161,16 @@ const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 function loadParams() {
   let saved = null;
   try { saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (_) { saved = null; }
+  if (!saved || typeof saved !== 'object') {
+    // v6 → v7 迁移：新增的 multiCore 走默认值，其余原样继承。
+    try {
+      const old = JSON.parse(localStorage.getItem(STORE_KEY_PREV) || 'null');
+      if (old && typeof old === 'object') {
+        saved = old;
+        localStorage.setItem(STORE_KEY, JSON.stringify(old));
+      }
+    } catch (_) { /* 读不到就算了 */ }
+  }
   if (!saved || typeof saved !== 'object') return;
   for (const key of PERSIST_KEYS) {
     const v = saved[key];
@@ -192,6 +221,7 @@ const localDen = new Float32Array(MAX_N);
 const fleeDir = new Float32Array(MAX_N * 3);   // 当前帧逃逸力方向
 const prevFlee = new Float32Array(MAX_N * 3);  // 上一帧逃逸力，用于信息级联（传播带一帧延迟）
 const fleeing = new Uint8Array(MAX_N);
+const grassTouch = new Int8Array(MAX_N).fill(-1);   // 本帧压在哪片草地（-1 = 不在）；并行段写、主线程读
 const caught = new Uint8Array(MAX_N);           // 1=已被捕食，等待重新出生
 const respawnAt = new Float64Array(MAX_N);      // 重新出生的时间戳（ms），0 表示无需等待
 const birthAt = new Float64Array(MAX_N);       // 新生时间戳：-Infinity 表示普通个体
@@ -357,7 +387,6 @@ function predBaseCount() { return params.predatorOn ? activeP : 0; }
 // 所以所有 `for (p = 0; p < P; p++)` 的循环天然把它一起算进逃逸、捕食与渲染。
 function predCountNow() { return predBaseCount() + (mouseHunter ? 1 : 0); }
 
-const MAX_FORCE = 22;
 // 长程归拢（见 step 里「群体归拢」一段）：超出这个半径才开始拉。
 // 9 会让群体长期停在 3~5 坨；14 实测稳定在 1~2 大团（偶发 3~4），分离指标不变。
 // 通过 FlockLab.flockKeep 可在线改（调参用，不持久化、不上面板）。
@@ -419,8 +448,6 @@ let teleportCount = 0;   // 累计穿墙次数（状态卡「穿越」计数）
 const PRED_FORCE = 24;
 const PRED_SEP_RANGE2 = 6 * 6;
 const PRED_SEP_FORCE = 34;
-const COLLIDE_DIST = 0.55;
-const COLLIDE_DIST2 = COLLIDE_DIST * COLLIDE_DIST;
 const BIRTH_TOTAL_MS = 3200;                    // 新生标记总时长：前 1.8s 亮绿，后 1.4s 渐变
 const BIRTH_SOLID_MS = 1800;
 const BURST_MS = 820;                           // 捕杀动画时长，三段音效与其对齐
@@ -612,6 +639,7 @@ function setPredCount(v) {
   document.getElementById('hPred').textContent = params.predatorOn ? next : '0';
 }
 function setCount(v) {
+  MC.epoch++;
   const next = Math.max(10, Math.min(MAX_N, Math.round(v)));
   if (next > activeCount) initBoids(activeCount, next);
   activeCount = next;
@@ -1926,6 +1954,9 @@ bindBool(fPred, 'infoCascade', '警报传递',
 fPred.open();
 
 const fAdv = gui.addFolder('高级参数（很少用）');
+bindBool(fAdv, 'multiCore', '多核加速',
+  '多核加速｜把最耗时的邻域受力计算按个体区间切给几个后台线程并行（本机最多 6 个，长年不变的那部分仍在主线程）。关掉立刻回到单核，可以和打开时对比右下角的 FPS——鸟越多差距越大。检测不到 Worker 或某次计算超时会自动退回单核，不会卡住。',
+  (v) => { setMultiCore(v); saveParams(); });
 bindNum(fAdv, 'minSpeed', 0.5, 8, 0.1, '最低速度',
   '最低速度｜鸟再慢也不会低于这个值，避免悬停不动。一般不用调。');
 bindNum(fAdv, 'predict', 0, 1.5, 0.05, '预判系数',
@@ -1973,10 +2004,6 @@ let cellStart = new Int32Array(0);
 let cellEnd = new Int32Array(0);
 let cellFill = new Int32Array(0);
 const cellItems = new Int32Array(MAX_N);
-// 邻域扫描的 9 个格：自己格 → 四邻 → 四角。
-const NBR_OFF = [0, 0, 1, 0, -1, 0, 0, 1, 0, -1, 1, 1, 1, -1, -1, 1, -1, -1];
-// 局部密度（颜色）用同一套 9 格，但只读每格的计数、不遍历成员。
-const DEN_OFF = NBR_OFF;
 // 本帧最近一对个体的间距²（只统计 sepRange 内的）：用来验证「鸟不再叠在一起」。
 // 期望值 > 0.02（间距 0.14 以上）；若趋近 0 就是分离力在近距离失效了。
 let minPairD2 = Infinity;
@@ -1996,8 +2023,37 @@ function sepCapFor(n) {
 // p95 落在 0.9，青蓝→紫整条色阶铺得开（用 70/110 时中位以上全部顶格 1.0）。
 const LOCAL_DEN_K = 160;
 
+// ---------------------------------------------------------------- 受力上下文
+// 主线程单核模式直接引用真实数组；Worker 模式由 worker 用消息里的副本重建同名字段，
+// 两边喂给同一个 computeForces，所以行为只有一份实现。
+const forceCtx = {
+  pos, vel, acc, localDen, neighbors, nearD2A, fleeDir, fleeing, prevFlee,
+  caught, resting, wAng, wAmp, sprintUntil, predPos, predVel,
+  cellStart, cellEnd, cellItems, grass, grassTouch,
+  n: 0, P: 0, dt: 0, time: 0,
+  groupX: 0, groupY: 0, groupThreatAt: 0, hx: 0, hy: 0,
+  cell: 5, per2: 49, sep2: 3.61, sepSoft: 0, sepSat: 2.1, denK: 224,
+  maxSpeed: 15, maxForce: MAX_FORCE, keepR: 18, keepR2: 324, keepF: 14,
+  paceSpeed: 11.7, sprintSpeed: 25.5, fleeR: 9.5, fleeR2: 90.25, sepCap: 130,
+  flowT: 0, alignment: 1.8, cohesion: 1.16, separation: 2.3, fleeWeight: 2.45,
+  predict: 0.6, infoCascade: true, flow: 2.05, grassOn: true, wrapEdges: false,
+  wanderBase: 1.6, gridX0: 0, gridY0: 0, gridW: 1, gridH: 1
+};
+let lastForceResult = null;   // 单核模式复用；多核模式由 worker 结果覆盖
+// 每帧的标量参数：单核模式 Object.assign 到 forceCtx，多核模式原样 postMessage 给 worker。
+// 只有一份填表逻辑，Worker 侧不重复计算任何参数。
+const forceMeta = {
+  n: 0, P: 0, dt: 0, time: 0, groupX: 0, groupY: 0, hx: 0, hy: 0, groupThreatAt: 0,
+  cell: 5, per2: 49, sep2: 3.61, sepSoft: 0, sepSat: 2.1, denK: 224,
+  maxSpeed: 15, maxForce: 22, keepR: 18, keepR2: 324, keepF: 14,
+  paceSpeed: 11.7, sprintSpeed: 25.5, fleeR: 9.5, fleeR2: 90.25, sepCap: 130,
+  flowT: 0, alignment: 1.8, cohesion: 1.16, separation: 2.3, fleeWeight: 2.45,
+  predict: 0.6, infoCascade: true, flow: 2.05, grassOn: true, wrapEdges: false,
+  wanderBase: 1.6, gridX0: 0, gridY0: 0, gridW: 1, gridH: 1, grass: []
+};
+
 // ---------------------------------------------------------------- 模拟
-function step(dt, time) {
+function frameBegin(dt, time) {
   const n = activeCount;
   minPairD2 = Infinity;                         // 本帧「最近一对」的间距²（验证不重合）
   // 网格边长取感知半径的 1/1.4：3×3 格覆盖 2.14 倍感知半径，仍然「一定覆盖全部邻居」
@@ -2357,501 +2413,212 @@ function step(dt, time) {
     mouseSlot = -1;
   }
 
-  let sumNeighbors = 0;
+  // 前半段的成果交给后半段（积分 + 统计）与多核调度器。
+  return { n, P, baseP, hx, hy, fleeR, fleeR2, maxSpeed, minSpeed: params.minSpeed,
+           paceSpeed, sprintSpeed, catchR2, predSpeed, predNorm, tGrid1, accCells };
+}
+
+// ---------------------------------------------------------------- 休息（串行）
+// 休息中的鸟不参与邻域，只朝落点漂过去、站稳、被惊飞、到点起身。
+// 这一段会改草地成员集合与「每帧出发配额」，所以只能在主线程串行跑。
+function updateResting(dt, time) {
+  const n = activeCount;
+  const baseP = params.predatorOn ? activeP : 0;
+  const P = baseP + (mouseHunter ? 1 : 0);
+  const fleeR = params.fleeRange;
+  const paceSpeed = params.maxSpeed * 0.78;
+  for (let i = 0; i < n; i++) {
+    if (caught[i] || !resting[i]) continue;
+    const k = i * 3;
+    const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
+    const vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
+    acc[k] = 0; acc[k + 1] = 0; acc[k + 2] = 0;
+    fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
+    fleeing[i] = 0; neighbors[i] = 0;
+    // 争斗色自动褪去：抢到位子坐下 REST_CONTENTION_FADE 后恢复正常体色，
+    // 让「刚争夺成功」这件事在画面上留一下，但不整场都是红鸟。
+    if (contending[i] && settled[i] && restSince[i] > 0 && time - restSince[i] > REST_CONTENTION_FADE) contending[i] = 0;
+
+    // 老住客换位：到点才起身，落点只在身边半步内，位移交给速度积分（绝不瞬移）。
+    if (settled[i] && time >= restSwapAt[i]) {
+      restSwapAt[i] = Infinity;
+      const gp = grass[restPatch[i]];
+      if (gp) {
+        const [nx, ny] = nearbyRestPoint(gp, i, px, py);
+        restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
+        settled[i] = 0; restTries[i] = 0;
+        restApproachUntil[i] = Math.max(restApproachUntil[i], time + 4500);
+      }
+    }
+    // 目标点要在换位之后读取，否则换位那一帧会立刻又站回原地
+    const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
+    const dd = Math.sqrt((tx - px) * (tx - px) + (ty - py) * (ty - py));
+
+    // 受惊不再让整片草地同一帧起飞：按「离猛禽多远」给 40~560ms 反应延迟，
+    // 近的先跑、远的稍后，和飞行个体的反应延迟是同一套逻辑。
+    let scared = false, predD2 = Infinity;
+    const safe2 = fleeR * 1.5 * (fleeR * 1.5);
+    for (let p = 0; p < P; p++) {
+      const q = p * 3;
+      const ex = px - predPos[q], ey = py - predPos[q + 1];
+      const d2 = ex * ex + ey * ey;
+      if (d2 < predD2) predD2 = d2;
+      if (d2 < safe2) scared = true;
+    }
+    if (scared) {
+      if (restFleeAt[i] === Infinity) {
+        const near = Math.min(1, Math.sqrt(predD2) / (fleeR * 1.5));
+        restFleeAt[i] = time + 40 + near * 520;
+      }
+    } else restFleeAt[i] = Infinity;
+    const fleeNow = scared && time >= restFleeAt[i];
+
+    // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算。
+    // 每帧只放行 1 只站定：否则同帧落地的两只鸟互相都还没 settled，
+    // 各自的间距检查都会跳过对方，于是贴在一起站定（minSep 掉到 0.6 的元凶）。
+    if (!settled[i] && dd < 0.7 && Math.sqrt((vx) * (vx) + (vy) * (vy)) < 2.2
+        && restSettleThisFrame < REST_SETTLE_SOFT_CAP) {
+      const gp = grass[restPatch[i]];
+      let tooClose = false;
+      if (gp) {
+        const lim = REST_SPACING * 0.95;
+        for (const j of gp.members) {
+          if (j === i || !settled[j]) continue;
+          const ex = px - pos[j * 3], ey = py - pos[j * 3 + 1];
+          if (ex * ex + ey * ey < lim * lim) { tooClose = true; break; }
+        }
+      }
+      if (tooClose && gp && restTries[i] < 5) {
+        // 只改目标点，让下一帧靠速度积分「走」过去。旧版在这里直接写 pos，
+        // 采样点可能落在草地另一头，于是肉眼看到的就是一次瞬移。
+        const [nx, ny] = nearbyRestPoint(gp, i, px, py);
+        restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
+        restTries[i]++;
+        restApproachUntil[i] = Math.max(restApproachUntil[i], time + 2600);
+      } else {
+        settled[i] = 1;
+        restSettleThisFrame++;
+        // 站定朝向 = 落地瞬间的渲染朝向：箭头不会突然转过去，也不再随机重设朝向。
+        restAng[i] = Math.sqrt((rVel[k]) * (rVel[k]) + (rVel[k + 1]) * (rVel[k + 1])) > 1e-4
+          ? Math.atan2(rVel[k + 1], rVel[k]) : wAng[i];
+        // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位
+        vel[k] = 0; vel[k + 1] = 0;
+        audio.land();          // 落地的那一下
+        restSince[i] = time;
+        restSessions++;
+        // 离场时间带个体相位：28~60 秒，同批落地的鸟不会一起走
+        restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN
+                       + restPhase[i] * REST_PHASE_SPAN;
+      }
+    }
+    // 飞太久还没停稳（草地太挤/一直被挤）就放弃，别一直算作「在路上」
+    if (!settled[i] && time > restApproachUntil[i]) {
+      endRest(i, time, false);
+      continue;
+    }
+    if (fleeNow || time >= restUntil[i] || !params.grassOn) {
+      endRest(i, time, scared);
+      // 起飞：朝场内偏中心，再给一个大扇形随机，避免整片鸟朝同一方向齐刷刷飞出
+      const ang = Math.atan2(py - groupY, px - groupX) + (Math.random() - 0.5) * 2.4;
+      const vs = paceSpeed * (0.8 + Math.random() * 0.3);
+      vel[k] = Math.cos(ang) * vs; vel[k + 1] = Math.sin(ang) * vs; vel[k + 2] = 0;
+    }
+    continue;
+  }
+}
+
+// ---------------------------------------------------------------- 受力（可并行）
+// 爆发触发要写 stamina / alertMs / sprintUntil 并播声音，私人航向也是一次 O(n) 推进，
+// 所以放在受力之前由主线程统一做；真正重的那一段（邻域扫描 + 三条规则）在 forces.js。
+function prepareForces(F, dt, time) {
+  const n = activeCount;
+  const P = F.P;
+  const fleeR = F.fleeR;
+  const fleeR2 = F.fleeR2;
+
+  for (let i = 0; i < n; i++) {
+    if (caught[i] || resting[i]) continue;
+    // 个体游走：每只鸟带一条缓慢漂移的私人航向（原在算力循环里，现在统一提前推进）。
+    wAng[i] += (Math.random() - 0.5) * 6 * dt;
+    if (P === 0) { alertMs[i] = 0; continue; }
+
+    let nearest2 = Infinity;
+    for (let p = 0; p < P; p++) {
+      const q = p * 3;
+      const dx = pos[i * 3] - predPos[q], dy = pos[i * 3 + 1] - predPos[q + 1];
+      const d2 = dx * dx + dy * dy;
+      if (d2 < nearest2) nearest2 = d2;
+    }
+    // 反应延迟：进入感知圈只是「看到」，还要累积够所需时间才会起爆。
+    // 所需时间随距离（平方）从贴身 45ms 增长到圈边缘 260ms，再乘个体系数，
+    // 于是爆发会从捕食者身边向外扩散，而不是整群同时亮。
+    if (nearest2 < fleeR2) {
+      if (stamina[i] >= 1 && time >= sprintUntil[i]) {
+        const dNorm = Math.min(1, Math.sqrt(nearest2) / fleeR);
+        const need = (REACT_NEAR_MS + (REACT_FAR_MS - REACT_NEAR_MS) * dNorm * dNorm) * reactJit[i];
+        alertMs[i] += dt * 1000;
+        if (alertMs[i] >= need) {
+          alertMs[i] = 0;
+          sprintUntil[i] = time + params.sprintDuration * 1000;
+          stamina[i] = 0;
+          sprintCount++;
+          audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
+          // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
+        }
+      } else {
+        alertMs[i] = 0;
+      }
+    } else {
+      alertMs[i] = 0;   // 脱离感知圈就清空，重新进入要重新累积
+    }
+  }
+
+  const M = forceMeta;
+  const per = params.perception;
+  const nrm = Math.max(1, n / 800);
+  M.n = n; M.P = P; M.dt = dt; M.time = time;
+  M.groupX = groupX; M.groupY = groupY; M.hx = F.hx; M.hy = F.hy;
+  M.groupThreatAt = groupThreatAt;
+  M.cell = per / 1.4;
+  M.per2 = per * per;
+  M.sep2 = params.separationRange * params.separationRange;
+  M.sepSoft = 0;
+  M.sepSat = 4.0 / params.separationRange;
+  M.denK = LOCAL_DEN_K * 1.4 * Math.sqrt(nrm);
+  M.maxSpeed = F.maxSpeed;
+  M.maxForce = MAX_FORCE;
+  M.keepR = Math.min(60, Math.max(12, FLOCK_KEEP_R * Math.sqrt(nrm)));
+  M.keepR2 = M.keepR * M.keepR;
+  M.keepF = FLOCK_KEEP_F;
+  M.paceSpeed = F.paceSpeed;
+  M.sprintSpeed = F.sprintSpeed;
+  M.fleeR = fleeR; M.fleeR2 = fleeR2;
+  M.sepCap = sepCapFor(n);
+  M.flowT = time * 0.00022;
+  M.alignment = params.alignment; M.cohesion = params.cohesion;
+  M.separation = params.separation; M.fleeWeight = params.fleeWeight;
+  M.predict = params.predict; M.infoCascade = params.infoCascade;
+  M.flow = params.flow; M.grassOn = params.grassOn; M.wrapEdges = params.wrapEdges;
+  M.wanderBase = WANDER_BASE;
+  M.gridX0 = gridX0; M.gridY0 = gridY0; M.gridW = gridW; M.gridH = gridH;
+  M.grass = grass;
+  return M;
+}
+
+// ---------------------------------------------------------------- 积分 + 统计（串行）
+function frameFinish(F, res, dt, time) {
+  const { n, P, baseP, hx, hy, fleeR, fleeR2, maxSpeed, minSpeed, paceSpeed,
+          sprintSpeed, catchR2, predNorm } = F;
+  let sumNeighbors = res.sumN;
   let deadCount = 0;
   for (let i = 0; i < n; i++) if (caught[i]) deadCount++;
   const aliveN = Math.max(1, n - deadCount);
-  let cx = 0, cy = 0, cz = 0;
-  let impact = 0;
+  let cx = res.cx, cy = res.cy, cz = 0;
+  const B = BOUND;
+  let impact = res.impact;
   let boundaryImpact = 0;
+  minPairD2 = res.minPair2;
 
-  for (let i = 0; i < n; i++) {
-    if (caught[i]) continue;   // 死亡等待期不参与运动与统计
-    const k = i * 3;
-    const px = pos[k], py = pos[k + 1], pz = pos[k + 2];
-    let vx = vel[k], vy = vel[k + 1], vz = vel[k + 2];
-
-    // 在草地上休息：不跑三条规则，只是朝落点漂过去、站稳、偶尔挪半步。
-    // 附近有捕食者按距离错峰起飞，到点也会自己走——草地是「歇脚点」而不是避难所。
-    if (resting[i]) {
-      acc[k] = 0; acc[k + 1] = 0; acc[k + 2] = 0;
-      fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
-      fleeing[i] = 0; neighbors[i] = 0;
-      // 争斗色自动褪去：抢到位子坐下 REST_CONTENTION_FADE 后恢复正常体色，
-      // 让「刚争夺成功」这件事在画面上留一下，但不整场都是红鸟。
-      if (contending[i] && settled[i] && restSince[i] > 0 && time - restSince[i] > REST_CONTENTION_FADE) contending[i] = 0;
-
-      // 老住客换位：到点才起身，落点只在身边半步内，位移交给速度积分（绝不瞬移）。
-      if (settled[i] && time >= restSwapAt[i]) {
-        restSwapAt[i] = Infinity;
-        const gp = grass[restPatch[i]];
-        if (gp) {
-          const [nx, ny] = nearbyRestPoint(gp, i, px, py);
-          restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
-          settled[i] = 0; restTries[i] = 0;
-          restApproachUntil[i] = Math.max(restApproachUntil[i], time + 4500);
-        }
-      }
-      // 目标点要在换位之后读取，否则换位那一帧会立刻又站回原地
-      const tx = restTgt[i * 2], ty = restTgt[i * 2 + 1];
-      const dd = Math.sqrt((tx - px) * (tx - px) + (ty - py) * (ty - py));
-
-      // 受惊不再让整片草地同一帧起飞：按「离猛禽多远」给 40~560ms 反应延迟，
-      // 近的先跑、远的稍后，和飞行个体的反应延迟是同一套逻辑。
-      let scared = false, predD2 = Infinity;
-      const safe2 = fleeR * 1.5 * (fleeR * 1.5);
-      for (let p = 0; p < P; p++) {
-        const q = p * 3;
-        const ex = px - predPos[q], ey = py - predPos[q + 1];
-        const d2 = ex * ex + ey * ey;
-        if (d2 < predD2) predD2 = d2;
-        if (d2 < safe2) scared = true;
-      }
-      if (scared) {
-        if (restFleeAt[i] === Infinity) {
-          const near = Math.min(1, Math.sqrt(predD2) / (fleeR * 1.5));
-          restFleeAt[i] = time + 40 + near * 520;
-        }
-      } else restFleeAt[i] = Infinity;
-      const fleeNow = scared && time >= restFleeAt[i];
-
-      // 到点 + 几乎不动 才算真的在休息；只是从队里飞过来还在路上就不算。
-      // 每帧只放行 1 只站定：否则同帧落地的两只鸟互相都还没 settled，
-      // 各自的间距检查都会跳过对方，于是贴在一起站定（minSep 掉到 0.6 的元凶）。
-      if (!settled[i] && dd < 0.7 && Math.sqrt((vx) * (vx) + (vy) * (vy)) < 2.2
-          && restSettleThisFrame < REST_SETTLE_SOFT_CAP) {
-        const gp = grass[restPatch[i]];
-        let tooClose = false;
-        if (gp) {
-          const lim = REST_SPACING * 0.95;
-          for (const j of gp.members) {
-            if (j === i || !settled[j]) continue;
-            const ex = px - pos[j * 3], ey = py - pos[j * 3 + 1];
-            if (ex * ex + ey * ey < lim * lim) { tooClose = true; break; }
-          }
-        }
-        if (tooClose && gp && restTries[i] < 5) {
-          // 只改目标点，让下一帧靠速度积分「走」过去。旧版在这里直接写 pos，
-          // 采样点可能落在草地另一头，于是肉眼看到的就是一次瞬移。
-          const [nx, ny] = nearbyRestPoint(gp, i, px, py);
-          restTgt[i * 2] = nx; restTgt[i * 2 + 1] = ny;
-          restTries[i]++;
-          restApproachUntil[i] = Math.max(restApproachUntil[i], time + 2600);
-        } else {
-          settled[i] = 1;
-          restSettleThisFrame++;
-          // 站定朝向 = 落地瞬间的渲染朝向：箭头不会突然转过去，也不再随机重设朝向。
-          restAng[i] = Math.sqrt((rVel[k]) * (rVel[k]) + (rVel[k + 1]) * (rVel[k + 1])) > 1e-4
-            ? Math.atan2(rVel[k + 1], rVel[k]) : wAng[i];
-          // 停稳瞬间把残余速度清零：否则还会借着惯性滑出 0.5~0.6 个单位
-          vel[k] = 0; vel[k + 1] = 0;
-          audio.land();          // 落地的那一下
-          restSince[i] = time;
-          restSessions++;
-          // 离场时间带个体相位：28~60 秒，同批落地的鸟不会一起走
-          restUntil[i] = time + REST_MAX_MIN + Math.random() * REST_MAX_SPAN
-                         + restPhase[i] * REST_PHASE_SPAN;
-        }
-      }
-      // 飞太久还没停稳（草地太挤/一直被挤）就放弃，别一直算作「在路上」
-      if (!settled[i] && time > restApproachUntil[i]) {
-        endRest(i, time, false);
-        continue;
-      }
-      if (fleeNow || time >= restUntil[i] || !params.grassOn) {
-        endRest(i, time, scared);
-        // 起飞：朝场内偏中心，再给一个大扇形随机，避免整片鸟朝同一方向齐刷刷飞出
-        const ang = Math.atan2(py - groupY, px - groupX) + (Math.random() - 0.5) * 2.4;
-        const vs = paceSpeed * (0.8 + Math.random() * 0.3);
-        vel[k] = Math.cos(ang) * vs; vel[k + 1] = Math.sin(ang) * vs; vel[k + 2] = 0;
-      }
-      continue;
-    }
-
-    // 安全时按群体节奏控速；受惊时恢复满速；爆发时直接用爆发速度作为
-    // 转向目标速度——否则「追赶」只会把速度上限抬高，方向却仍按巡航速度算，容易冲过头。
-    const isDashing = time < sprintUntil[i];
-    const calm = !fleeing[i] && !isDashing;
-    const desiredSpeed = isDashing ? sprintSpeed : (calm ? paceSpeed : maxSpeed);
-    let count = 0;
-    let sx = 0, sy = 0, sz = 0;
-    let ax = 0, ay = 0, az = 0;
-    let dxs = 0, dys = 0, dzs = 0;
-    let maxW = 0;                                       // 最近那只的排斥权重（拥挤度用）
-    let nearDx = 0, nearDy = 0, nearD2 = Infinity;      // 最近那只的方向与间距²（贴身硬核用）
-    let nearVx = 0, nearVy = 0;                         // 最近那只的速度（抵消接近分量用）
-    let cfx = 0, cfy = 0, cfz = 0, cascadeCount = 0;   // 信息级联：邻居上一帧的逃逸方向
-    let asp2 = 0;                                       // 注意力邻里速度平方和（一致性加权用，免 sqrt）
-
-    const ix = Math.floor(px / cell) - gridX0, iy = Math.floor(py / cell) - gridY0;
-    // 局部密度：3×3 格的总活跃鸟数（只读计数，不遍历成员，开销可以忽略）。
-    // 颜色色阶必须独立于「注意力只取 7 只」——否则 neighbors[i] 恒为 7，整群永远同一色。
-    let nearby = 0;
-    for (let oi = 0; oi < 18; oi += 2) {
-      const cx = ix + DEN_OFF[oi], cy = iy + DEN_OFF[oi + 1];
-      if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) continue;
-      const c = cy * gridW + cx;
-      nearby += cellEnd[c] - cellStart[c];
-    }
-    localDen[i] = nearby > denK ? 1 : nearby / denK;
-
-    // ---- 邻域扫描（原始 Reynolds 式：视野内全部同伴）----
-    // v31 曾把「注意力」限成最近的 7 只（Ballerini 2008 的拓扑邻域），代价是：
-    // 密集时这 7 只常常全在自己那一格里，聚合质心被钉在格心、群体被拽成一个个方块，
-    // 挤到极近时纯 1/d² 又把方块炸开，于是「聚成一坨 → 炸开 → 再聚」反复横跳。
-    // v41 去掉这条上限：对齐 / 聚合 / 分离全部用**视野半径内的所有个体**，
-    // 即最原始的 Boids 涌现规则。配对量随密度平方级上升，所以保留一个
-    // 「每帧最多扫多少个候选」的安全阀（sepCap，按数量分档），它只是防炸帧，
-    // 在默认 800 只时远大于真实邻居数，等于没有上限。
-    let cand = 0;
-    scanCells:
-    for (let pass = 0; pass < 9; pass++) {
-      const cx = ix + NBR_OFF[pass * 2], cy = iy + NBR_OFF[pass * 2 + 1];
-      if (cx < 0 || cy < 0 || cx >= gridW || cy >= gridH) continue;
-      const c = cy * gridW + cx;
-      const b1 = cellEnd[c];
-      for (let b = cellStart[c]; b < b1; b++) {
-        if (cand >= sepCap) break scanCells;
-        cand++;
-        const j = cellItems[b];
-        if (j === i || caught[j]) continue;
-        const m = j * 3;
-        const dx = px - pos[m], dy = py - pos[m + 1], dz = pz - pos[m + 2];
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 > per2 || d2 < 1e-8) continue;
-
-        // 对齐与聚合：视野内每一只都算
-        count++;
-        sx += pos[m]; sy += pos[m + 1]; sz += pos[m + 2];
-        ax += vel[m]; ay += vel[m + 1]; az += vel[m + 2];
-        asp2 += vel[m] * vel[m] + vel[m + 1] * vel[m + 1] + vel[m + 2] * vel[m + 2];
-        if (P > 0 && params.infoCascade && fleeing[j]) {
-          cfx += prevFlee[m]; cfy += prevFlee[m + 1]; cfz += prevFlee[m + 2];
-          cascadeCount++;
-        }
-        if (d2 < sep2) {
-          // 近邻主导但峰值有界：纯 1/d² 在 d≈0.15 时权重到 44，一次擦身就能把整块炸开；
-          // 加一个小的 ε 把峰值压到 ~20，近邻仍比远邻大一个量级以上。
-          const w = 1 / (d2 + sepSoft);
-          if (w > maxW) maxW = w;
-          dxs += dx * w; dys += dy * w; dzs += dz * w;
-          if (d2 < nearD2) { nearD2 = d2; nearDx = dx; nearDy = dy; nearVx = vel[m]; nearVy = vel[m + 1]; }
-          if (d2 < minPairD2) minPairD2 = d2;
-        }
-        if (d2 < COLLIDE_DIST2) {
-          const dist = Math.sqrt(d2);
-          const nx = dx / dist, ny = dy / dist, nz = dz / dist;
-          const rvx = vx - vel[m], rvy = vy - vel[m + 1], rvz = vz - vel[m + 2];
-          const closing = -(rvx * nx + rvy * ny + rvz * nz); // 相向接近才计冲量
-          if (closing > 0) impact = Math.max(impact, Math.pow(closing, 1.2));
-        }
-      }
-    }
-    neighbors[i] = count;
-    sumNeighbors += count;
-    // 质心累计用「相对上一帧质心的最小映像位移」：鸟穿墙的那一瞬间位置会跳到对侧，
-    // 直接累加坐标会让质心跟着跳、把「群体归拢」的方向整个翻过来（鸟群因此被拉回中场
-    // 而不是顺着速度穿过去）。按最小映像算，跨边界的个体对质心的贡献是连续的。
-    let cdx = px - groupX, cdy = py - groupY;
-    if (cdx > hx) cdx -= 2 * hx; else if (cdx < -hx) cdx += 2 * hx;
-    if (cdy > hy) cdy -= 2 * hy; else if (cdy < -hy) cdy += 2 * hy;
-    cx += cdx; cy += cdy; cz += pz;
-
-    let fx = 0, fy = 0, fz = 0;
-    if (count > 0) {
-      let len = Math.sqrt((ax) * (ax) + (ay) * (ay) + (az) * (az));
-      if (len > 1e-6) {
-        // 一致性 = |Σv| / sqrt(n·Σv²)（0=各飞各的，1=完全齐飞；与 |Σv|/Σ|v| 等价但省掉逐只开方）。
-        // 只看 7 只时样本很少，散乱状态下「把合方向归一化到 desiredSpeed」会把方向噪声
-        // 放大成满力，群体被随机推力搅成一块块；按一致性加权后，散乱时力只有约四成，
-        // 齐飞时才接近满力——这正是 v30 用 100 多只邻居平均时天然具备的平滑性。
-        const agree = asp2 > 1e-6 ? len / Math.sqrt(count * asp2) : 0;
-        const s = desiredSpeed * (0.72 + 0.28 * agree) / len;
-        let tx = ax * s - vx, ty = ay * s - vy, tz = az * s - vz;
-        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-        if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
-        fx += tx * params.alignment; fy += ty * params.alignment; fz += tz * params.alignment;
-      }
-      let tx = sx / count - px, ty = sy / count - py, tz = sz / count - pz;
-      len = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-      if (len > 1e-6) {
-        const s = desiredSpeed / len;
-        tx = tx * s - vx; ty = ty * s - vy; tz = tz * s - vz;
-        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-        if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
-        fx += tx * params.cohesion; fy += ty * params.cohesion; fz += tz * params.cohesion;
-      }
-    }
-    // ---- 群体归拢（长程）----
-    // 局部规则只看 7 只邻居（视野 7），一旦两坨鸟的间距超过视野，它们就永久互不相见：
-    // 强分离把群体压成许多个「结晶小团」，彼此既不吸引也不排斥，于是整屏散着一小坨一小坨
-    // （实测 800 只稳定在 5~9 团，群体 RMS 半径 42 ≈ 铺满全屏）。
-    // 真实的椋鸟群是整群一起转向的：归拢这件事本来就不只发生在最近的 7 只之间。
-    // 这里补一条只对「离群体质心太远」的个体生效的弱长程吸引，把结晶小团慢慢拉回到一起；
-    // 质心附近的个体不受力，所以不会把队伍压成一块实心板。
-    // 力度随超出量线性增长但整体很小（远小于 maxForce）：它只负责「方向上的缓慢修正」，
-    // 真正决定队形的仍是前面三条规则。
-    let rgx = groupX - px, rgy = groupY - py;
-    if (rgx > hx) rgx -= 2 * hx; else if (rgx < -hx) rgx += 2 * hx;
-    if (rgy > hy) rgy -= 2 * hy; else if (rgy < -hy) rgy += 2 * hy;
-    const rg2 = rgx * rgx + rgy * rgy;
-    // 归拢半径随数量放大（面积 ∝ 数量 → 密度不随数量暴涨），否则 3000 只会被压成
-    // 和 800 只同样大小的实心球（实测 rms 都是 22，密度色阶全体顶格）。
-    if (rg2 > keepR2) {
-      const rg = Math.sqrt(rg2);
-      const w = Math.min(1.6, (rg - keepR) / keepR);
-      fx += rgx / rg * FLOCK_KEEP_F * w;
-      fy += rgy / rg * FLOCK_KEEP_F * w;
-    }
-    // ---- 分离 ----
-    // 拥挤度必须由「最近那只挤得多近」（maxW = max 1/(d²+ε)）决定，不能用加权和
-    // 的模长 sl：sl = |Σ d·w| 在 d→0 时同样趋于 0（d 比 1/d² 衰减得快），
-    // 于是「最该排斥的时刻力反而最小」，鸟会直接叠在一起。
-    let sl = Math.sqrt((dxs) * (dxs) + (dys) * (dys) + (dzs) * (dzs));
-    if (maxW > 1e-6) {
-      // crowd 随贴近程度单调上升：刚进安全圈 0.1、贴身 0.9（比例控制，不是开关）
-      const crowd = maxW / (maxW + SEP_SAT);
-      if (sl < 1e-6) {
-        // 完全重合时 dxs 也退化成 0，方向只能随机——但力必须还在，否则叠住分不开
-        const a = Math.random() * 6.2831853;
-        dxs = Math.cos(a); dys = Math.sin(a); dzs = 0; sl = 1;
-      }
-      // 0.55 的底数（v37 是 0.42）：远距离就有力推开，接近 de3717e 的恒定满推，
-      // 鸟在贴近之前就被挡开——防重叠靠「提前推开」而不是贴身再补救。
-      // crowd 再随贴近程度加码到满力，同时保留连续性（避免 v34 那种开关式极限环）。
-      const s = desiredSpeed * (0.55 + 0.45 * crowd) / sl;
-      let tx = dxs * s - vx * crowd, ty = dys * s - vy * crowd, tz = dzs * s - vz * crowd;
-      const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-      if (tl > maxForce) { const q = maxForce / tl; tx *= q; ty *= q; tz *= q; }
-      fx += tx * params.separation; fy += ty * params.separation; fz += tz * params.separation;
-    }
-    // 贴身硬核：已经挤进「一个身位」(COLLIDE_DIST) 时，光靠转向根本来不及——
-    // 速度 15、帧间隔 20~30ms 时一帧就位移 0.3~0.45，转弯半径再小也会穿过去。
-    // 所以同时做两件事：① 沿「远离最近那只」的方向强推；② 把「朝对方去」的
-    // 速度分量直接掐掉。两者都按 k²/k 加权，只在极近处发力，不影响正常编队。
-    if (nearD2 < COLLIDE_DIST2) {
-      const d = Math.sqrt(nearD2);
-      const k = (COLLIDE_DIST - d) / COLLIDE_DIST;      // 0~1，越贴身越陡
-      const nx = nearDx / d, ny = nearDy / d;           // 由邻居指向自己
-      let hfx = nx * maxForce * 1.2 * k * k;
-      let hfy = ny * maxForce * 1.2 * k * k;
-      const closing = (vx - nearVx) * nx + (vy - nearVy) * ny;   // <0 = 正在靠近
-      if (closing < 0) {
-        // 碰撞响应，不是普通转向：一帧内抵消 85% 的接近速度，且**不受 maxForce
-        // 限制**——速度 15、相对速度 30 时，靠 22 的转向力要 20 多帧才停得住，
-        // 期间早就穿过去了。上限 900 只防极端 dt 抖动。
-        const kill = Math.min(-closing / Math.max(dt, 0.008) * 0.85, 900) * k;
-        hfx += nx * kill; hfy += ny * kill;
-      }
-      const hl = Math.sqrt(hfx * hfx + hfy * hfy);
-      const hcap = 900;
-      if (hl > hcap) { const q = hcap / hl; hfx *= q; hfy *= q; }
-      fx += hfx; fy += hfy;
-    }
-    nearD2A[i] = nearD2 === Infinity ? 0 : nearD2;   // sepStats 统计用
-
-    // ---- 猎物逃逸：预测威胁点 + 距离平方衰减 + 信息级联 ----
-    // 白肌式短时爆发：体力满 + 进入危险范围才触发，持续固定时长后体力清零；
-    // 必须等 sprintRecovery 秒完全恢复才能再次爆发，所以不能连续冲刺。
-    let sprinting = time < sprintUntil[i];
-    if (P > 0) {
-      let nearest2 = Infinity, nearestP = -1;
-      for (let p = 0; p < P; p++) {
-        const q = p * 3;
-        const dx = px - predPos[q], dy = py - predPos[q + 1], dz = pz - predPos[q + 2];
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 < nearest2) { nearest2 = d2; nearestP = p; }
-      }
-      // 反应延迟：进入感知圈只是「看到」，还要累积够所需时间才会起爆。
-      // 所需时间随距离（平方）从贴身 45ms 增长到圈边缘 260ms，再乘个体系数，
-      // 于是爆发会从捕食者身边向外扩散，而不是整群同时亮。
-      if (nearest2 < fleeR2) {
-        if (stamina[i] >= 1 && time >= sprintUntil[i]) {
-          const dNorm = Math.min(1, Math.sqrt(nearest2) / fleeR);
-          const need = (REACT_NEAR_MS + (REACT_FAR_MS - REACT_NEAR_MS) * dNorm * dNorm) * reactJit[i];
-          alertMs[i] += dt * 1000;
-          if (alertMs[i] >= need) {
-            alertMs[i] = 0;
-            sprintUntil[i] = time + params.sprintDuration * 1000;
-            stamina[i] = 0;
-            sprintCount++;
-            audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
-            // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
-          }
-        } else {
-          alertMs[i] = 0;
-        }
-      } else {
-        alertMs[i] = 0;   // 脱离感知圈就清空，重新进入要重新累积
-      }
-      sprinting = time < sprintUntil[i];
-
-      let efx = 0, efy = 0, efz = 0;
-      for (let p = 0; p < P; p++) {
-        const q = p * 3;
-        const dx = px - predPos[q], dy = py - predPos[q + 1], dz = pz - predPos[q + 2];
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 >= fleeR2 || d2 < 1e-8) continue;
-        const d = Math.sqrt(d2);
-        const tau = (d / maxSpeed) * params.predict;
-        // 威胁点取捕食者未来位置；方向为从威胁点指向自己
-        let ex = px - (predPos[q] + predVel[q] * tau);
-        let ey = py - (predPos[q + 1] + predVel[q + 1] * tau);
-        let ez = pz - (predPos[q + 2] + predVel[q + 2] * tau);
-        const el = Math.sqrt((ex) * (ex) + (ey) * (ey) + (ez) * (ez));
-        if (el < 1e-6) continue;
-        const escapeSpeed = sprinting ? sprintSpeed : maxSpeed;
-        let tx = ex / el * escapeSpeed - vx;
-        let ty = ey / el * escapeSpeed - vy;
-        let tz = ez / el * escapeSpeed - vz;
-        const tl = Math.sqrt((tx) * (tx) + (ty) * (ty) + (tz) * (tz));
-        const fCap = sprinting ? maxForce * 2 : maxForce;
-        if (tl > fCap) { const s = fCap / tl; tx *= s; ty *= s; tz *= s; }
-        const w = 1 - d / fleeR;                 // 到半径边缘恰好为 0，避免力突变
-        const mag = params.fleeWeight * w * w * (sprinting ? 1.25 : 1);
-        efx += tx * mag; efy += ty * mag; efz += tz * mag;
-      }
-      // 群体级躲避：捕食者进入范围时整群沿远离它的方向一起偏航一次（约 1.2 秒波纹），
-      // 随后停止群体推力，让鱼群重新聚合——像真实鱼群遇鲨后散开再合拢，而不是永远四散。
-      const ripple = Math.max(0, 1 - (time - groupThreatAt) / 1200);
-      if (ripple > 0) {
-        for (let p = 0; p < P; p++) {
-          const q = p * 3;
-          const gdx = groupX - predPos[q], gdy = groupY - predPos[q + 1];
-          const gl = Math.sqrt((gdx) * (gdx) + (gdy) * (gdy));
-          if (gl < 1e-6) continue;
-          const dx = px - predPos[q], dy = py - predPos[q + 1];
-          const d = Math.sqrt((dx) * (dx) + (dy) * (dy));
-          if (d > fleeR * 2.5) continue;
-          const w = Math.max(0, 1 - d / (fleeR * 2.5));
-          const strength = params.fleeWeight * w * ripple * 1.6;
-          efx += gdx / gl * strength;
-          efy += gdy / gl * strength;
-          efz = 0;
-        }
-      }
-      // 信息级联：邻居上一帧的逃逸方向传播过来，形成波状逃逸
-      if (params.infoCascade && cascadeCount > 0) {
-        const s = 0.80 / cascadeCount;
-        efx += cfx * s; efy += cfy * s; efz += cfz * s;
-      }
-      const mag = Math.sqrt((efx) * (efx) + (efy) * (efy) + (efz) * (efz));
-      if (mag > 1e-6) {
-        fleeDir[k] = efx / mag; fleeDir[k + 1] = efy / mag; fleeDir[k + 2] = efz / mag;
-        fleeing[i] = 1;
-        fx += efx; fy += efy; fz += efz;
-      } else {
-        fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
-        fleeing[i] = 0;
-      }
-    } else {
-      fleeDir[k] = 0; fleeDir[k + 1] = 0; fleeDir[k + 2] = 0;
-      fleeing[i] = 0;
-    }
-
-    // 爆发只有一种动机：被逼近时的逃命。归队/合群不消耗体力、不爆发，
-    // 掉队的鸟靠常规转向力慢慢追上大部队。
-
-    sprinting = time < sprintUntil[i];
-    if (sprinting) sprintingCount++;
-    else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
-
-    // 墙不存在：不再有贴边判定带 / 掷骰子 / 急转掉头（那些都等于把墙挪进场内）。
-    // 越界时统一穿墙，见积分之后的 wrapThroughWall。
-    // 绕开草地：不休息的鸟会主动沿着草地边缘滑过去，而不是直接从草地上方穿过去。
-    // 做法是「法向推开 + 沿当前运动方向的切向」——只推法向的话看起来像撞到墙弹开。
-    let insideG = -1;   // 当前正压在哪片草地上（-1 = 不在任何草地上）
-    if (params.grassOn && grass.length) {
-      for (let g = 0; g < grass.length; g++) {
-        const gp = grass[g];
-        const gdx = px - gp.x, gdy = py - gp.y;
-        const gd2 = gdx * gdx + gdy * gdy;
-        const reach = gp.R * 1.3 + 7;
-        if (gd2 > reach * reach) continue;
-        const gd = Math.sqrt(gd2) || 1e-4;
-        const th = Math.atan2(gdy, gdx);
-        const rr = gp.R * (1 + gp.a1 * Math.sin(3 * th + gp.p1) + gp.a2 * Math.sin(5 * th + gp.p2));
-        const nx = gdx / gd, ny = gdy / gd;
-        if (gd < rr) {
-          insideG = g;
-          // 已经压在草地上（比如刚起飞）：先往外推，力度随深入程度加大
-          const k = Math.min(1, (rr - gd) / Math.max(1, rr * 0.5));
-          fx += nx * (10 + 14 * k); fy += ny * (10 + 14 * k);
-        } else {
-          const w = 1 - (gd - rr) / 7;          // 0~1，越靠近边缘越强
-          if (w <= 0) continue;
-          const tx2 = -ny, ty2 = nx;
-          // 往自己正在走的那一侧绕。用「切向速度 / 速率」的连续值而不是 ±1：
-          // 鸟在边缘几乎停住时切向速度≈0，若还按符号硬选边，力会每帧左右翻，看着就是抖。
-          const tv = vx * tx2 + vy * ty2;
-          const sgn = tv / (Math.sqrt((vx) * (vx) + (vy) * (vy)) + 0.8);
-          fx += (nx * 9 + tx2 * sgn * 7) * w;
-          fy += (ny * 9 + ty2 * sgn * 7) * w;
-        }
-      }
-      // 掠过草地：刚进入草地范围的那一刻，10% 概率顺势减速落下来。
-      // 只在「边沿进入」时掷一次骰子，不会每帧都掷。
-      if (insideG >= 0) {
-        // 同样不能用 fleeing 判断有没有危险（信息级联会让全群都是 fleeing），
-        // 直接看最近的捕食者有多远。
-        // 概率也按个体作息相位浮动（5%~13%）：整群一起掠过草地时不会同时落下一大片
-        if (!overGrass[i] && time >= sprintUntil[i]
-            && Math.random() < 0.05 + restPhase[i] * 0.08) {
-          let safe = true;
-          const safe2 = fleeR * 1.6 * (fleeR * 1.6);
-          for (let p = 0; p < P; p++) {
-            const q = p * 3;
-            const ex = px - predPos[q], ey = py - predPos[q + 1];
-            if (ex * ex + ey * ey < safe2) { safe = false; break; }
-          }
-          if (safe) landHere(i, insideG, time);
-        }
-        overGrass[i] = 1;
-      } else {
-        overGrass[i] = 0;
-      }
-    }
-    // ---- 实体墙的提前避让 ----
-    // 关掉「屏幕边缘穿越」后墙是实体。只在撞上那一刻反弹的话，鸟会贴着墙一路蹭、
-    // 或者满屏往一个角堆——所以提前一个身位带就开始往外拐：边缘 8 个单位内给一个
-    // 指向场内的推力，越贴越强（非线性：远处几乎不管，临近才明显）。
-    // 它只改方向、不瞬移，所以看起来是「有意识地绕开边缘」。
-    if (!params.wrapEdges) {
-      const m = 8;
-      if (px > hx - m) { const k = (px - (hx - m)) / m; fx -= k * k * 26; }
-      else if (px < -hx + m) { const k = ((-hx + m) - px) / m; fx += k * k * 26; }
-      if (py > hy - m) { const k = (py - (hy - m)) / m; fy -= k * k * 26; }
-      else if (py < -hy + m) { const k = ((-hy + m) - py) / m; fy += k * k * 26; }
-    }
-    fx += Math.sin(py * 0.11 + flowT) * params.flow;
-    fy += Math.cos(px * 0.09 - flowT * 0.8) * params.flow * 0.7;
-    // 个体游走：每只鸟带一条缓慢漂移的私人航向。邻居越多，群体把它「稳住」的力度越大，
-    // 所以队形仍由三条规则决定，只是落单的个体会自己晃——这正是弹珠感消失的来源。
-    wAng[i] += (Math.random() - 0.5) * 6 * dt;
-    const wanderMag = WANDER_BASE * wAmp[i] / (1 + count * 0.06);
-    fx += Math.cos(wAng[i]) * wanderMag;
-    fy += Math.sin(wAng[i]) * wanderMag;
-    // 到点了：附近没有捕食者，就去最近的草地歇一会儿。
-    // 注意不能用 fleeing[i] 判断「有没有危险」——信息级联会把整个群体都
-    // 标记成 fleeing（实测 1000 只里 997 只），那样谁也别想落地。
-    if (params.grassOn && !resting[i] && time >= restDue[i] && time >= sprintUntil[i]) {
-      let safe2 = fleeR * 2.2 * (fleeR * 2.2), ok = true;
-      for (let p = 0; p < P; p++) {
-        const q = p * 3;
-        const ex = px - predPos[q], ey = py - predPos[q + 1];
-        if (ex * ex + ey * ey < safe2) { ok = false; break; }
-      }
-      // 附近有猛禽时重试也要错峰，否则猛禽一走开，整批鸟会在同一秒一起出发
-      if (ok) startRest(i, time);
-      else restDue[i] = time + 1200 + Math.random() * 3000 + restPhase[i] * 2500;
-    }
-
-    // 合力一阶低通：只盯 7 只邻居时，逐帧的注意力合力抖动很大，直接积分会让群体
-    // 在「被聚合力收紧 → 分离力炸开 → 再收紧」之间来回摆（用户看到的聚成一坨又分开）。
-    // 时间常数约 2 帧（~65ms）；逃逸爆发走的是独立的速度通道，不受这一层影响。
-    const FSM = 0.55;
-    acc[k] += (fx - acc[k]) * FSM; acc[k + 1] += (fy - acc[k + 1]) * FSM; acc[k + 2] = 0;
-  }
   if (aliveN > 0) {
     groupX += cx / aliveN; groupY += cy / aliveN; groupZ = 0;
     // 质心也夹回场内：它外面还有「测距、声像、巡逻点」一堆代码按场地坐标在用它。
@@ -2926,6 +2693,41 @@ function step(dt, time) {
     }
     pos[k + 2] = 0; vel[k + 2] = 0;
 
+    // ---- 落地（原在算力那一遍，现在积分之后：落点要查同片草地的间距、还要占
+    // 「本帧出发配额」，只能串行做；晚一帧生效，观感上看不出来）----
+    if (params.grassOn && grass.length) {
+      const g = grassTouch[i];
+      if (g >= 0) {
+        // 掠过草地：刚进入草地范围的那一刻，按个体相位给 5%~13% 概率顺势减速落下来。
+        // 只在「边沿进入」时掷一次骰子；也不能用 fleeing 判断有没有危险（信息级联会让全群都是 fleeing）。
+        if (!overGrass[i] && time >= sprintUntil[i]
+            && Math.random() < 0.05 + restPhase[i] * 0.08) {
+          let safe = true;
+          const safe2 = fleeR * 1.6 * (fleeR * 1.6);
+          for (let p = 0; p < P; p++) {
+            const q = p * 3;
+            const ex = pos[k] - predPos[q], ey = pos[k + 1] - predPos[q + 1];
+            if (ex * ex + ey * ey < safe2) { safe = false; break; }
+          }
+          if (safe) landHere(i, g, time);
+        }
+        overGrass[i] = 1;
+      } else {
+        overGrass[i] = 0;
+      }
+    }
+    // 到点了：附近没有捕食者，就去最近的草地歇一会儿。
+    if (params.grassOn && !resting[i] && time >= restDue[i] && time >= sprintUntil[i]) {
+      let safe2 = fleeR * 2.2 * (fleeR * 2.2), ok = true;
+      for (let p = 0; p < P; p++) {
+        const q = p * 3;
+        const ex = pos[k] - predPos[q], ey = pos[k + 1] - predPos[q + 1];
+        if (ex * ex + ey * ey < safe2) { ok = false; break; }
+      }
+      if (ok) startRest(i, time);
+      else restDue[i] = time + 1200 + Math.random() * 3000 + restPhase[i] * 2500;
+    }
+
     // 捕获：捕食者是锐角三角形，有实际碰撞体积，接触即算捕食成功（仍受进食冷却限制）。
     // 用上一帧到当前帧的线段做扫掠判定：高速追击时不会一帧跨过猎物。
     if (P > 0 && !caught[i]) {
@@ -2957,7 +2759,7 @@ function step(dt, time) {
     }
   }
 
-  perfParts.loop = performance.now() - tGrid1;
+  perfParts.loop = performance.now() - F.tGrid1;
   const tStats0 = performance.now();
   // 延迟补位：1 秒后在离捕食者最远、离边界有余量的位置出生
   for (let i = 0; i < n; i++) {
@@ -3012,6 +2814,233 @@ function step(dt, time) {
   // 碰撞强度只作为统计保留，不再触发音效。
   collisionImpulse = Math.max(impact, boundaryImpact) / Math.pow(maxSpeed, 1.2);
   perfParts.stats = performance.now() - tStats0;
+}
+
+// ---------------------------------------------------------------- 单核入口
+// 多核模式下 render() 把「前半段 + 受力」与「积分」拆到两帧里做（见 dispatchStep），
+// 但两半调用的就是上面这同一组函数——不存在第二份仿真逻辑。
+function step(dt, time) {
+  const F = frameBegin(dt, time);
+  updateResting(dt, time);
+  const M = prepareForces(F, dt, time);
+  Object.assign(forceCtx, M);
+  // 网格数组在窗口/缩放变化时会重新分配（frameBegin 里），forceCtx 存的是旧引用，
+  // 必须每帧重新指一次，否则邻域扫描会读到一张空网格（表现为「邻居数恒为 0」）。
+  forceCtx.cellStart = cellStart; forceCtx.cellEnd = cellEnd; forceCtx.cellItems = cellItems;
+  const t0 = performance.now();
+  lastForceResult = computeForces(forceCtx, 0, F.n);
+  perfParts.force = performance.now() - t0;
+  frameFinish(F, lastForceResult, dt, time);
+}
+
+
+// ---------------------------------------------------------------- 多核调度
+// 一帧 dispatch、下一帧收齐再积分。Worker 只算力；积分 / 捕获 / 休息调度 / 统计
+// 全部留在主线程——它们要写全局状态，并行会打架。
+// 任何一步失败都自动回退单核：Worker 构造失败、脚本加载失败、超过 timeoutMs 没回。
+function slotBufs(s) {
+  return [s.pos.buffer, s.vel.buffer, s.prevFlee.buffer, s.sprintUntil.buffer,
+          s.wAng.buffer, s.wAmp.buffer, s.caught.buffer, s.resting.buffer,
+          s.oAcc.buffer, s.oFlee.buffer, s.oDen.buffer, s.oNear.buffer,
+          s.oNb.buffer, s.oFl.buffer, s.oTouch.buffer,
+          s.gStart.buffer, s.gEnd.buffer, s.gItems.buffer];
+}
+
+// Transferable 转移后原来的 TypedArray 视图会 detached（即使 buffer 又还回来，
+// 视图也不会自动复活），所以每次收发都要按 buffer 重建视图。
+function bindSlot(s, b) {
+  s.pos = new Float32Array(b[0]);
+  s.vel = new Float32Array(b[1]);
+  s.prevFlee = new Float32Array(b[2]);
+  s.sprintUntil = new Float64Array(b[3]);
+  s.wAng = new Float32Array(b[4]);
+  s.wAmp = new Float32Array(b[5]);
+  s.caught = new Uint8Array(b[6]);
+  s.resting = new Uint8Array(b[7]);
+  s.oAcc = new Float32Array(b[8]);
+  s.oFlee = new Float32Array(b[9]);
+  s.oDen = new Float32Array(b[10]);
+  s.oNear = new Float32Array(b[11]);
+  s.oNb = new Uint16Array(b[12]);
+  s.oFl = new Uint8Array(b[13]);
+  s.oTouch = new Int8Array(b[14]);
+  s.gStart = new Int32Array(b[15]);
+  s.gEnd = new Int32Array(b[16]);
+  s.gItems = new Int32Array(b[17]);
+}
+
+function makeSlot() {
+  const w = new Worker(new URL('./sim-worker.js', import.meta.url), { type: 'module' });
+  const slot = { w };
+  bindSlot(slot, [
+    new Float32Array(MAX_N * 3).buffer, new Float32Array(MAX_N * 3).buffer,
+    new Float32Array(MAX_N * 3).buffer, new Float64Array(MAX_N).buffer,
+    new Float32Array(MAX_N).buffer, new Float32Array(MAX_N).buffer,
+    new Uint8Array(MAX_N).buffer, new Uint8Array(MAX_N).buffer,
+    new Float32Array(MAX_N * 3).buffer, new Float32Array(MAX_N * 3).buffer,
+    new Float32Array(MAX_N).buffer, new Float32Array(MAX_N).buffer,
+    new Uint16Array(MAX_N).buffer, new Uint8Array(MAX_N).buffer,
+    new Int8Array(MAX_N).buffer,
+    new Int32Array(4096).buffer, new Int32Array(4096).buffer, new Int32Array(MAX_N).buffer
+  ]);
+  w.onmessage = (e) => onWorkerDone(slot, e.data);
+  w.onerror = () => abortMultiCore('worker-error');
+  return slot;
+}
+
+function initMultiCore() {
+  if (MC.tried) return;
+  MC.tried = true;
+  if (!params.multiCore) { MC.reason = 'off'; return; }
+  if (typeof Worker === 'undefined') { MC.reason = 'no-worker'; return; }
+  const cores = navigator.hardwareConcurrency || 4;
+  // 留两个核给主线程（渲染、积分、界面）与系统，避免和 worker 抢满。
+  const want = Math.max(1, Math.min(6, cores - 2));
+  try {
+    for (let i = 0; i < want; i++) MC.workers.push(makeSlot());
+  } catch (e) {
+    MC.workers = [];
+    MC.reason = 'spawn';
+    return;
+  }
+  MC.enabled = MC.workers.length > 0;
+  MC.reason = MC.enabled ? 'on' : 'empty';
+}
+
+function abortMultiCore(reason) {
+  if (!MC.enabled) return;
+  MC.enabled = false;
+  MC.reason = reason;
+  MC.job = null;
+  toast('多核加速不可用，已切回单核');
+}
+
+
+// 运行时开关：关掉立刻停用并释放 worker；重新打开会重建（已存在的先终止，避免泄漏）。
+function setMultiCore(on) {
+  params.multiCore = !!on;
+  saveParams();
+  if (!params.multiCore) {
+    for (const s of MC.workers) { try { s.w.terminate(); } catch (_) {} }
+    MC.workers = [];
+    MC.enabled = false;
+    MC.job = null;
+    MC.reason = 'off';
+    return false;
+  }
+  // 重新打开：先把旧池（可能还在跑）停掉，否则会越开越多。
+  for (const s of MC.workers) { try { s.w.terminate(); } catch (_) {} }
+  MC.workers = [];
+  MC.job = null;
+  MC.tried = false;
+  MC.reason = 'idle';
+  initMultiCore();
+  return MC.enabled;
+}
+
+// 主线程 → worker：填好只读副本，把 15 个 buffer 的所有权一起交出去。
+function dispatchMulti(F, dt, time) {
+  const M = prepareForces(F, dt, time);
+  const P3 = Math.max(1, F.P) * 3;
+  M.predPos = predPos.slice(0, P3);
+  M.predVel = predVel.slice(0, P3);
+  // grass 里带 members（Set），不能直接结构化克隆；只挑受力用得到的形状参数。
+  M.grass = grass.map((g) => ({ x: g.x, y: g.y, R: g.R, a1: g.a1, p1: g.p1, a2: g.a2, p2: g.p2 }));
+
+  const k = MC.workers.length;
+  const n = F.n;
+  // 网格由主线程建一次、复制给每个 worker —— 比让 6 个 worker 各自重建省 6 倍的
+  // O(n) 三趟计数排序（8000 只时每份约 0.5ms）。尺寸只随窗口/缩放变，扩容很少发生。
+  const gcells = gridW * gridH;
+  for (let s = 0; s < k; s++) {
+    const slot = MC.workers[s];
+    if (slot.gStart.length < gcells || slot.gEnd.length < gcells) {
+      const cap = Math.max(gcells, slot.gStart.length * 2);
+      slot.gStart = new Int32Array(cap); slot.gEnd = new Int32Array(cap);
+    }
+    slot.gStart.set(cellStart.subarray(0, gcells));
+    slot.gEnd.set(cellEnd.subarray(0, gcells));
+    slot.gItems.set(cellItems.subarray(0, F.accCells));
+  }
+  const job = MC.job = {
+    F, dt, time, left: k, ready: false, epoch: MC.epoch,
+    sumN: 0, cx: 0, cy: 0, minPair2: Infinity, impact: 0,
+    t0: performance.now(), ms: 0
+  };
+  // 按「上一帧邻居数」的累计量切连续区间，而不是等分个体数：
+  // 群体是一团，等分会让正好覆盖密团的那些 worker 承担几倍的工作量，整帧被最慢的拖住。
+  // 也不能按空间表切——那会把 pos 的顺序访问变成随机访问，缓存未命中让总耗时反而涨 4 倍。
+  // 用上一帧的 neighbors 做权重（连续变化，误差很小），既均衡又保持顺序遍历。
+  const wsum = mcWeights;
+  wsum[0] = 0;
+  for (let i = 0; i < n; i++) {
+    wsum[i + 1] = wsum[i] + ((caught[i] || resting[i]) ? 0 : 1 + neighbors[i]);
+  }
+  const totalW = wsum[n];
+  const cuts = mcCuts;
+  cuts[0] = 0;
+  let seg = 0;
+  if (totalW > 0) {
+    for (let i = 1; i < n && seg < k - 1; i++) {
+      if (wsum[i] >= totalW * (seg + 1) / k) cuts[++seg] = i;
+    }
+  }
+  while (seg < k) cuts[++seg] = n;
+  for (let s = 0; s < k; s++) {
+    const slot = MC.workers[s];
+    const i0 = cuts[s], i1 = cuts[s + 1];
+    slot.pos.set(pos.subarray(0, n * 3));
+    slot.vel.set(vel.subarray(0, n * 3));
+    slot.prevFlee.set(prevFlee.subarray(0, n * 3));
+    slot.sprintUntil.set(sprintUntil.subarray(0, n));
+    slot.wAng.set(wAng.subarray(0, n));
+    slot.wAmp.set(wAmp.subarray(0, n));
+    slot.caught.set(caught.subarray(0, n));
+    slot.resting.set(resting.subarray(0, n));
+    const bufs = slotBufs(slot);
+    slot.w.postMessage({ cmd: 'run', id: ++MC.serial, i0, i1, meta: M, bufs }, bufs);
+  }
+  return job;
+}
+
+function onWorkerDone(slot, m) {
+  bindSlot(slot, m.bufs);           // 先把 buffer 收回来，任何情况下都不丢
+  const job = MC.job;
+  if (!job) return;                 // 已超时 / 已取消
+  if (job.epoch !== MC.epoch) { job.left--; return; }   // 数组被重置：只回收，不合并
+  const { i0, i1 } = m;
+  const a3 = i0 * 3, b3 = i1 * 3;
+  acc.set(slot.oAcc.subarray(a3, b3), a3);
+  fleeDir.set(slot.oFlee.subarray(a3, b3), a3);
+  localDen.set(slot.oDen.subarray(i0, i1), i0);
+  nearD2A.set(slot.oNear.subarray(i0, i1), i0);
+  neighbors.set(slot.oNb.subarray(i0, i1), i0);
+  fleeing.set(slot.oFl.subarray(i0, i1), i0);
+  grassTouch.set(slot.oTouch.subarray(i0, i1), i0);
+  job.sumN += m.res.sumN;
+  job.cx += m.res.cx;
+  job.cy += m.res.cy;
+  if (m.res.minPair2 < job.minPair2) job.minPair2 = m.res.minPair2;
+  if (m.res.impact > job.impact) job.impact = m.res.impact;
+  job.ms += m.res.ms;
+  if (--job.left === 0) {
+    job.ready = true;
+    // 真正的并行耗时：dispatch → 最后一个 worker 返回（不含等下一帧 rAF）。
+    MC.lastWall = performance.now() - job.t0;
+  }
+}
+
+function finishMulti() {
+  const job = MC.job;
+  MC.job = null;
+  if (!job) return;
+  // force 记「各 worker 实际计算时间之和」，可以和单核的 force 直接对比；
+  // 墙钟里还包含消息往返与主线程复制，单独记在 lastWall。
+  perfParts.force = +job.ms.toFixed(2);
+  frameFinish(job.F, {
+    sumN: job.sumN, cx: job.cx, cy: job.cy,
+    minPair2: job.minPair2, impact: job.impact
+  }, job.dt, job.time);
 }
 
 // ---------------------------------------------------------------- 渲染
@@ -3107,8 +3136,18 @@ let last = performance.now();
 let fps = 60, fpsAcc = 0, fpsFrames = 0, hudTimer = 0;
 const perf = { step: 0, prep: 0, draw: 0 };
 
+const mcWeights = new Float64Array(MAX_N + 1);   // 负载切分用的权重前缀和
+const mcCuts = new Int32Array(64);                // 切分点（worker 数上限 62）
+let simAcc = 0;        // 等待 worker 期间累积的 dt
+let mcBootAt = 0;      // 首屏稳定后再建 worker
+
 function render(now) {
   requestAnimationFrame(render);
+  // 页面加载 1.8 秒后才建 Worker：一开始那几帧全部留给着色器编译和首屏。
+  if (!MC.tried) {
+    if (!mcBootAt) mcBootAt = now + 1800;
+    else if (now >= mcBootAt) initMultiCore();
+  }
   const pT0 = performance.now();
   const rawDt = (now - last) / 1000;
   last = now;
@@ -3116,7 +3155,32 @@ function render(now) {
   fpsAcc += rawDt; fpsFrames++;
   if (fpsAcc > 0.5) { fps = fpsFrames / fpsAcc; fpsAcc = 0; fpsFrames = 0; }
 
-  if (!params.paused) step(dt, now);
+  // ---- 仿真推进 ----
+  // 多核：一帧 dispatch、下一帧收齐再积分。dt 用累积的真实时间，
+  // 排队等 worker 的那一两帧不会让仿真变慢（上限 60ms，防止切标签页回来一次跳太远）。
+  if (!params.paused) {
+    if (MC.enabled) {
+      if (MC.job && MC.job.ready) finishMulti();
+      if (MC.job && !MC.job.ready && performance.now() - MC.job.t0 > MC.timeoutMs) {
+        abortMultiCore('timeout');
+      }
+      if (!MC.enabled) { step(dt, now); simAcc = 0; }          // 本帧刚回退：立刻补一步
+      else if (!MC.job) {
+        if (activeCount < MC.minN) {
+          step(dt, now);                                        // 小群体并行不划算
+        } else {
+          simAcc = Math.min(0.06, simAcc + dt);
+          const F = frameBegin(simAcc, now);
+          updateResting(simAcc, now);
+          dispatchMulti(F, simAcc, now);
+          simAcc = 0;
+        }
+      }
+    } else {
+      step(dt, now);
+      simAcc = 0;
+    }
+  }
   const pT1 = performance.now();
 
   // 音乐跟着群体状态走：聚集度决定和声厚度与节奏密度，
@@ -3561,6 +3625,24 @@ window.FlockLab = {
   },
   get orthoHalfH() { return +((orthoCam.top - orthoCam.bottom) / 2).toFixed(2); },
   get count() { return activeCount; },
+  get gridDebug() {
+    const last = cellEnd.length ? cellEnd[cellEnd.length - 1] : -1;
+    return {
+      w: gridW, h: gridH, x0: gridX0, y0: gridY0, cells: cellStart.length,
+      filled: last, item0: cellItems[0],
+      fc: { w: forceCtx.gridW, h: forceCtx.gridH, x0: forceCtx.gridX0, cell: forceCtx.cell,
+            cs: forceCtx.cellStart.length, items: forceCtx.cellItems.length,
+            per2: forceCtx.per2, sepCap: forceCtx.sepCap, n: forceCtx.n, same: forceCtx.cellStart === cellStart }
+    };
+  },
+  get multiCore() {
+    return {
+      enabled: MC.enabled, workers: MC.workers.length, reason: MC.reason,
+      cores: navigator.hardwareConcurrency || 0,
+      lastWall: +MC.lastWall.toFixed(2), budget: MC.timeoutMs
+    };
+  },
+  setMultiCore(on) { return setMultiCore(on); },
   get paused() { return !!params.paused; },
   get sepCap() { return sepCapFor(activeCount); },
   set sepCap(v) { dbgSepCap = Math.max(0, Math.round(v)); return sepCapFor(activeCount); },
@@ -3842,7 +3924,7 @@ window.FlockLab = {
     return {
       step: +perf.step.toFixed(2), prep: +perf.prep.toFixed(2), draw: +perf.draw.toFixed(2),
       total: +(perf.step + perf.prep + perf.draw).toFixed(2),
-      grid: +perfParts.grid.toFixed(2), loop: +perfParts.loop.toFixed(2),
+      grid: +perfParts.grid.toFixed(2), force: +perfParts.force.toFixed(2), loop: +perfParts.loop.toFixed(2),
       stats: +perfParts.stats.toFixed(2), color: +perfParts.color.toFixed(2),
       fps: +fps.toFixed(1), count: activeCount
     };

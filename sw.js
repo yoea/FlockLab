@@ -6,7 +6,7 @@
 // 缓存策略刻意选「stale-while-revalidate」而不是「cache-first」：
 // 前者最多落后一个版本（第二次打开就是新的），后者会让改了代码的页面一直发不出去。
 
-const VER = 'v2';
+const VER = 'v3';
 const CACHE = `flocklab-${VER}`;
 
 // 应用壳：离线也必须能起来
@@ -15,6 +15,8 @@ const SHELL = [
   './index.html',
   './css/style.css',
   './js/main.js',
+  './js/forces.js',
+  './js/sim-worker.js',
   './js/audio.js',
   './js/grass.js',
   './js/backdrop.js',

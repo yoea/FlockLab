@@ -50,7 +50,9 @@ flocklab/
 ├── sw.js               Service Worker：离线壳缓存 + CDN 依赖缓存
 ├── manifest.json PWA 清单（standalone / 图标 / 主题色）
 ├── css/style.css       全部界面样式（含隐藏动画、右下角按钮 / 控制台定位）
-├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 3900 行，核心）
+├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 4050 行，核心）
+├── js/forces.js        邻域受力（约 380 行，全项目最热的一段；单核与 Worker 共用同一份实现）
+├── js/sim-worker.js    多核 Worker 壳（约 120 行，只调 forces.js，不含任何规则逻辑）
 ├── js/audio.js         Web Audio 事件音效 + 六层生成式音乐（约 730 行）
 ├── js/grass.js         草地几何、谐波轮廓、面积校准、着色（约 180 行）
 ├── js/backdrop.js      背景地貌（草地斑 / 河流 / 村庄剪影）+ 漂移云层（约 250 行）
@@ -74,7 +76,9 @@ flocklab/
 | GPU 箭头 | `arrowGeo` + `arrowMat`（GLSL 画 ">" 形，朝向在顶点着色器里按速度旋转） |
 | 加速尾迹 | `MAX_TRAILS=4800` 环形槽位池 + `trailMat`（详见 §3.4） |
 | 捕食者渲染 | `predGeo`/`predMat`（锐角三角形 SDF）、警戒圈 `threatRings` |
-| `step(dt, time)` | **物理**：网格重建 → 逐鸟邻域扫描/三力/逃逸/休息 → 速度积分 → 穿墙 → 统计 |
+| `frameBegin` / `updateResting` / `prepareForces` / `frameFinish` | **物理**（v44 起把原来的 `step` 巨函数拆成这四段，理由见 §2.4）：网格重建+捕食者 AI → 休息调度 → 每帧一次的状态推进 → 受力 → 质心归位+积分+穿墙+捕获+统计 |
+| `step(dt, time)` | **单核整帧**：`frameBegin` → `updateResting` → `prepareForces` → `computeForces` → `frameFinish` |
+| 多核调度 `MC` / `dispatchMulti` | 把 `computeForces` 按个体区间分给 Worker，见 §2.4 |
 | `render()` | **着色**：逐鸟颜色尺寸 → 尾迹发射 → 捕食者位置颜色 → 音乐驱动 → 提交实例 |
 | GUI | `lil-gui` 面板绑定，`bindNum`/`bindBool` 自带说明文本与持久化 |
 | `window.FlockLab` | 调试接口（见 §4.2） |
@@ -107,6 +111,33 @@ requestAnimationFrame(render)
 ```
 
 **关键**：`step` 只写 `pos/vel/acc` 等物理数组；颜色尺寸在 `render` 里算（读物理数组）。两趟循环作用域不同，跨趟传数据要用模块级数组（见 §6.3）。
+
+### 2.4 多核（v44 起）：只并行邻域受力这一段
+
+**先看数据，再看设计**。把「邻域扫描配额」临时压到 1（等于关掉 90% 的配对），2000 只整帧从 31.4ms 掉到 3.2ms、4000 只从 58.3ms 掉到 6.5ms；同期网格重建 0.1~1ms、统计 0~0.5ms、渲染 0.2ms。**瓶颈 90% 就在 `forces.js` 那一个循环里**，所以并行边界就是它，其余（休息调度、捕获、积分、统计）留在主线程串行。
+
+| 决定 | 选择 | 为什么不是另一个 |
+| --- | --- | --- |
+| 通信 | `Transferable ArrayBuffer` 双程传递（去程交出、回程原样归还同一批 buffer） | `SharedArrayBuffer` 要 COOP/COEP 响应头，会牵动 nginx 配置、CDN 与 SW 离线缓存，为一个纯计算改部署面不划算 |
+| 受力实现 | 单核与 Worker **共用同一份 `forces.js`** | 两份实现必然随时间漂移，「多核开着的群和多核关掉的群行为不一样」是最难查的 bug |
+| 切分 | 按**上一帧 `neighbors`** 的加权前缀和切**连续区间** | 等分个体数会让正好覆盖密团的 worker 承担几倍工作量，整帧被最慢的拖住；按空间表 `cellItems` 切均衡但把 `pos` 的顺序访问变成随机访问，实测 4000 只 `force` 从 5.4ms 涨到 24.2ms |
+| 网格 | 主线程建一次，`.set()` 复制给每个 worker | 让 6 个 worker 各自重建 = 6 份 O(n) 计数排序（8000 只每份约 0.5ms） |
+| 节奏 | 本帧 dispatch，**下一帧**收齐后 `frameFinish` | 同一帧内等待会把 rAF 卡成两帧一次，帧率直接砍半 |
+| 回退 | 单次 job 超过 800ms、`worker.onerror`、无 `Worker`、`n < 320` → 自动回单核并 toast | 宁可慢也不能冻屏 |
+
+**拆函数本身就有 5~7 倍收益**：原 `step()` 是 1000+ 行的巨型函数，V8 拒绝优化它。拆成四段后单核 2000 只 `step` 从 30.4ms 降到 2.7~5.4ms，**这一步的收益比多核还大**，且与多核互不冲突。
+
+参数 `multiCore`（默认开，存档 `flocklab.params.v7`；读到 v6 存档时整份继承、只让新键走默认值）。运行时入口：GUI「高级参数 → 多核加速」、`FlockLab.setMultiCore(bool)`、`FlockLab.multiCore`（含 `enabled/workers/reason/lastWall`）、`FlockLab.perf.force`。
+
+| 实测（Chrome，20 核） | 单核 `step` | 多核 `wall` |
+| --- | --- | --- |
+| 800 只 | 1.1~3.9ms | 0.6ms |
+| 2000 只 | 2.7~5.4ms（旧版 30.4ms） | 1.1~2.9ms |
+| 4000 只 | 5.2~6.2ms（旧版 57.7ms） | 1.6ms |
+| 8000 只 | 9.3~10.6ms | 2.3ms |
+| 10000 只 | 12.6ms | 6.7ms |
+
+1 万只时主线程每帧要向 6 个 worker 各复制一遍 `pos/vel/prevFlee`（约 540KB/份），带宽开始成为新瓶颈——再往上优化的方向是增量区间或环形 buffer，而不是加 worker 数。
 
 ---
 
@@ -280,7 +311,9 @@ requestAnimationFrame(render)
 
 **边界与穿墙**：`portalChance`（恒为 **1**）/ `teleports`（累计穿墙次数）/ `displayRect`
 
-**性能**：`perf` → `{step, prep, draw, total, fps, count, grid, loop, stats, color}`（毫秒，指数平滑）
+**性能**：`perf` → `{step, prep, draw, total, fps, count, grid, loop, stats, color, force}`（毫秒，指数平滑；`force` 单核模式是 `computeForces` 的耗时、多核模式是**各 worker 计算时间之和**，可直接和单核对比）
+
+**多核**：`multiCore` → `{enabled, workers, reason, cores, lastWall, budget}`（`reason` 为 `on` / `off` / `timeout` / `worker-error` / `no-worker` / `spawn`；`lastWall` 是真实并行墙钟，不含等下一帧的时间）/ `setMultiCore(bool)`
 
 **邻域扫描配额**：`sepCap`（get/set，只是安全阀；v41 起没有注意力上限）
 
