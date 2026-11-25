@@ -515,14 +515,26 @@ const PRED_SEP_FORCE = 34;
 // 角速度有限 → 不能原地掉头，只能画一个大弧；角加速度有限 → 转弯是先起转再收住。
 const PRED_MAX_ACCEL = 22;      // 单位/秒²：从巡航加到全速约 0.6s，符合猛禽扑击前的加速段
 const PRED_MAX_DECEL = 30;      // 收速（改出俯冲 / 放弃追击）比加速快，但也不是瞬间
-const PRED_TURN_ACCEL = 7.0;    // 角加速度 rad/s²：转向靠倾斜身体，有惯性
-const PRED_TURN_SOFT = 1.7;     // 急转掉速的软化尺度（rad/s）：超过它的部分按平方扣速度
-const PRED_TURN_PEN = 0.35;     // 急转最多扣掉多少速率（0.35 → 追尾急转时还剩 77%）
+// 转向（v1.4.18 提速）：原来角加速度 7、追击档上限 2.25 rad/s，转弯半径 v/ω 恒在 11 左右，
+// 看上去只能画大弧、贴着鸟群兜圈子。猛禽真实扑击是「侧身压一下就能改向」，半径小得多。
+// 现在把上限提高到 4 rad/s（半径 ≈ 6），同时把角加速度提到 14 —— 上限决定「能转多小圈」，
+// 角加速度决定「多久转入这个圈」，两者一起提才有「急转」而不是「瞬间掉头」。
+const PRED_TURN_ACCEL = 14.0;   // 角加速度 rad/s²：0 → 满角速度约 0.29s，起转明显快但仍平滑
+// 急转掉速的尺度必须跟着角速度上限一起抬高，否则一转向速度就被扣掉一半（用户要的是
+// 「转得更利索」而不是「转一下就失速」）：4 rad/s 时约剩 87%，平均速度回到原来的水平。
+const PRED_TURN_SOFT = 3.6;     // 急转掉速的软化尺度（rad/s）：超过它的部分按平方扣速度
+const PRED_TURN_PEN = 0.14;     // 急转最多扣掉多少速率（0.14 → 最狠时还剩 87%）
 const PRED_MIN_FLY = 0.10;      // 最低飞行速度（相对 predSpeed）：猛禽不会悬停
+// 警戒圈（逃逸半径的红色范围提示）是否画出来。v1.4.18 起关闭：用户觉得它太抢眼。
+// **只影响绘制**——逃逸判定用的是 forces.js 里的 params.fleeRange，与这个 mesh 无关，
+// 距离参数、触发条件、捕食者行为都不变。想恢复显示改 true（位置/半径/两态配色都还在算）。
+const THREAT_RING_SHOWN = false;
 // 飞行档位：目标速度倍率 + 该档允许的最大角速度
 // glide 滑翔（吃饱后省力巡游）/ cruise 巡航（丢了目标在找）/ pursue 追击 / dive 俯冲
 const PRED_TIER_V = [0.42, 0.68, 1.00, 1.18];
-const PRED_TIER_TURN = [0.95, 1.55, 2.25, 1.70];   // 俯冲时反而转不动：真实猛禽俯冲是一条线
+// 转弯半径 = 速度 / 角速度：滑翔 10.5/1.9≈5.5、巡航 17/3.0≈5.7、追击 25/4.0≈6.3、俯冲 29.5/2.8≈10.5。
+// 俯冲档仍然「转不动」（只比原来略好）：真实猛禽俯冲是一条线，靠的是提前对准而不是半路拐弯。
+const PRED_TIER_TURN = [1.90, 3.00, 4.00, 2.80];
 const PRED_MODE_GLIDE = 0, PRED_MODE_CRUISE = 1, PRED_MODE_PURSUE = 2, PRED_MODE_DIVE = 3;
 const PRED_DIVE_RANGE = 11.0;   // 进入这个距离且大致对准了，才切俯冲档
 const PRED_DIVE_CONE = 0.70;    // 俯冲的「对准」容差（弧度）：偏太多直接俯冲会白扔高度
@@ -718,7 +730,7 @@ function syncPredDraw() {
   syncMouseSlot();
   const P = predCountNow();
   if (predGeo) predGeo.instanceCount = P;
-  for (let p = 0; p < MAX_SLOT; p++) threatRings[p].visible = p < P;
+  for (let p = 0; p < MAX_SLOT; p++) threatRings[p].visible = THREAT_RING_SHOWN && p < P;
   predMesh.visible = P > 0;
 }
 function setPredCount(v) {
@@ -1697,6 +1709,8 @@ scene.add(predMesh);
 // 警戒圈：标示该捕食者的逃逸半径 R（大小仍由「危险感知距离」决定）。
 // 圈永远可见，只是分成两态：饱食/冷却 = 稳定可见的暗红圈；捕食阶段 = 高饱和亮红圈。
 // 这样既不会「吃饱了圈就消失」，又能在远处一眼读出它现在有没有威胁。
+//
+// v1.4.18：警戒圈只关掉绘制，判定与状态计算全不动（常量见文件前部 THREAT_RING_SHOWN）。
 const ringGeo = new THREE.PlaneGeometry(2, 2);   // 局部坐标 -1~1，正好对应半径 1
 const threatRings = [];
 // 多造一个：最后一格留给鼠标捕食者（索引 = AI 数量）。
@@ -1867,34 +1881,68 @@ addEventListener('pointermove', (e) => {
   mouseTgt.x = w.x; mouseTgt.y = w.y;
 }, { passive: true });
 
-// 捕杀特效三段式：0ms 亮核爆闪 → 90ms 内环扩张 + 火花 → 240ms 外环余波。
-// 三段分别对应 predate() 的三段音。
-const SPARKS = 10;
-const burstInnerGeo = new THREE.RingGeometry(0.88, 1.0, 40);
-const burstOuterGeo = new THREE.RingGeometry(0.72, 1.0, 48);
+// 捕杀特效：烟花式炸开（v1.4.18）。
+// 原来是「白核 + 两个扩张圆环 + 10 个单色火花」，俯视图里像水波纹、缺少冲击感。
+// 现在改成：一次极短的白核爆闪（撞击那一下）+ 几十个**多色**粒子各自带阻尼向外炸开、
+// 按各自寿命熄灭。粒子用一张径向渐变贴图（圆点、边缘透明）+ 顶点色，加法混合下
+// 一个 draw call 就够，颜色衰减靠写顶点色（累加到 0 就等于熄灭，不用逐点 alpha）。
+const FW_N = 72;                // 每次爆炸的粒子数（要够密，才像一朵炸开的花而不是撒了一把纸屑）
+const FW_DAMP = 3.6;            // 阻尼：r(t) = v0·(1−e^{−kt})/k，越飞越慢，不会匀速飞出去
+const FW_G = 1.2;               // 轻微下坠：俯视图里给一点「落下来」的重量感（幅度很小）
+// 炸开的最终半径 = v0/k（5.5~9.5 那档只有 1.9 单位，比鸟大不了多少、看着像一层光晕），
+// 所以初速要抬到 12~26、阻尼降到 3.6，终值 ≈ 3.3~7.2 单位，才是一朵炸得开的烟花。
+const FW_COLORS = [0xffd166, 0xff8a3d, 0xff4d9d, 0x7ce7ff, 0xa78bfa, 0x8dff7a];
 const burstCoreGeo = new THREE.CircleGeometry(1, 32);
+// 圆形柔边点：默认 Points 是硬边方块，炸开时能看到一格格的像素块。
+const fwTex = (() => {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.38, 'rgba(255,255,255,0.62)');
+  grd.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+})();
+const tmpFwCol = new THREE.Color();
 const killBursts = [];
 for (let b = 0; b < 14; b++) {
   const common = {
     transparent: true, side: THREE.DoubleSide, depthWrite: false,
     blending: THREE.AdditiveBlending, fog: false
   };
-  const core = new THREE.Mesh(burstCoreGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xffffff, opacity: 0 }));
-  const inner = new THREE.Mesh(burstInnerGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xffd6a0, opacity: 0 }));
-  const outer = new THREE.Mesh(burstOuterGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xff7a3d, opacity: 0 }));
+  const core = new THREE.Mesh(burstCoreGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xfff1d8, opacity: 0 }));
   const sparkGeo = new THREE.BufferGeometry();
-  sparkGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(SPARKS * 3), 3));
+  sparkGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 3), 3));
+  sparkGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 3), 3));
   const sparks = new THREE.Points(sparkGeo, new THREE.PointsMaterial({
-    color: 0xffdcae, size: 3.6, sizeAttenuation: false,
-    transparent: true, opacity: 0, depthWrite: false,
+    size: 11, sizeAttenuation: false, vertexColors: true, map: fwTex,
+    transparent: true, opacity: 1, depthWrite: false,
     blending: THREE.AdditiveBlending, fog: false
   }));
-  for (const o of [core, inner, outer, sparks]) {
+  // 火花尾：每个粒子一根从内到外的短线段（WebGL 线宽固定 1px，配合圆点正好是一颗
+  // 「带尾巴的火星」）。只画外半段，不然整团会糊成一个发光的饼。
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 6), 3));
+  lineGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 6), 3));
+  const lines = new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({
+    vertexColors: true, transparent: true, opacity: 0.75,
+    depthWrite: false, blending: THREE.AdditiveBlending, fog: false
+  }));
+  for (const o of [core, sparks, lines]) {
     o.visible = false; o.frustumCulled = false; scene.add(o);
   }
   killBursts.push({
-    core, inner, outer, sparks,
-    dirs: new Float32Array(SPARKS * 2),
+    core, sparks, lines,
+    dirX: new Float32Array(FW_N), dirY: new Float32Array(FW_N),
+    v0: new Float32Array(FW_N), life: new Float32Array(FW_N),
+    dly: new Float32Array(FW_N),          // 起飞延迟（秒）：错峰才有「花心 + 外缘」的层次
+    ef0: new Float32Array(FW_N),          // 该延迟下已经走过的位移因子，运行时直接减掉
+    base: new Float32Array(FW_N * 3),     // 各粒子的本色（随寿命衰减后写进顶点色）
     active: false, born: 0, x: 0, y: 0
   });
 }
@@ -1902,16 +1950,35 @@ function spawnBurst(x, y, z, now) {
   let slot = killBursts.find((b) => !b.active);
   if (!slot) slot = killBursts.reduce((a, b) => (a.born < b.born ? a : b)); // 池满则复用最老
   slot.active = true; slot.born = now; slot.x = x; slot.y = y;
-  for (let s = 0; s < SPARKS; s++) {
+  for (let s = 0; s < FW_N; s++) {
+    // 方向均匀撒开；初速与寿命都随机，炸开后才会是一团有层次的火花而不是一个同心圆。
     const a = Math.random() * Math.PI * 2;
-    slot.dirs[s * 2] = Math.cos(a); slot.dirs[s * 2 + 1] = Math.sin(a);
+    slot.dirX[s] = Math.cos(a); slot.dirY[s] = Math.sin(a);
+    // 初速用 1.6 次幂偏向慢速：多数粒子留在花心慢慢散，少数冲到外缘，
+    // 整团才有体积感。等速的话所有粒子同时到同一个半径，看上去是一圈珠子。
+    slot.v0[s] = 4 + Math.pow(Math.random(), 1.6) * 26;
+    slot.life[s] = 0.40 + Math.random() * 0.45;
+    const dly = Math.random() * 0.07;
+    slot.dly[s] = dly;
+    slot.ef0[s] = (1 - Math.exp(-FW_DAMP * dly)) / FW_DAMP;
+    const o = s * 3;
+    if (s % 11 === 0) {
+      // 每 8 个里留一个近白闪点：烟花的「针尖亮」，让整团不至于糊成一片同色。
+      slot.base[o] = 1; slot.base[o + 1] = 0.97; slot.base[o + 2] = 0.9;
+    } else {
+      tmpFwCol.set(FW_COLORS[(Math.random() * FW_COLORS.length) | 0]);
+      const k = 0.85 + Math.random() * 0.40;    // 亮度也抖一下，层次更散
+      slot.base[o] = tmpFwCol.r * k;
+      slot.base[o + 1] = tmpFwCol.g * k;
+      slot.base[o + 2] = tmpFwCol.b * k;
+    }
   }
-  for (const o of [slot.core, slot.inner, slot.outer, slot.sparks]) o.visible = true;
+  for (const o of [slot.core, slot.sparks, slot.lines]) o.visible = true;
 }
 function clearBursts() {
   for (const b of killBursts) {
     b.active = false;
-    for (const o of [b.core, b.inner, b.outer, b.sparks]) o.visible = false;
+    for (const o of [b.core, b.sparks, b.lines]) o.visible = false;
   }
 }
 
@@ -2755,8 +2822,10 @@ function frameBegin(dt, time) {
       predPos[q + 2] = 0;
       // 拖尾 / 音效强度：改用「能量消耗」= 纵向加速度 + 横向（转弯）加速度。
       // 匀速直线时几乎是 0，加速和急转时才窜起来，和原来「只在扑击、急转时闪现」一致。
+      // 横向系数随 v1.4.18 的角速度上限一起下调（0.35 → 0.22）：转向能力提高后，
+      // 同样的「拐一下」ω 更大，系数不降的话拖尾会一直挂着一大团、音效也会变吵。
       predAccel[p] = Math.abs(v - speed0) / Math.max(dt, 1e-4)
-        + Math.abs(predTurnRate[p]) * v * 0.35;
+        + Math.abs(predTurnRate[p]) * v * 0.22;
 
       // 边界：与鸟完全相同的规则。开穿越 → 对侧同高度继续飞（方向不变）；
       // 关穿越 → 撞到实体墙，越界方向的分量反转（保留 92%）。朝向必须同步镜像，
@@ -3922,8 +3991,10 @@ function render(now) {
       ring.position.set(predPos[k], predPos[k + 1], predPos[k + 2]);
       ring.quaternion.copy(camera.quaternion);
       ring.scale.setScalar(params.fleeRange);   // 半径仍由「危险感知距离」控制
-      ring.visible = true;
-      // 圈永远显示：饱食是稳定可见的暗色圈，饿了抬亮成高饱和的亮色圈。
+      // 只关显示（THREAT_RING_SHOWN=false）：位置、半径、两态亮度照常算，
+      // 这样将来把开关拨回 true 时不需要重算任何东西，调试接口也读得到真实状态。
+      ring.visible = THREAT_RING_SHOWN;
+      // 两态配色：饱食是稳定可见的暗色圈，饿了抬亮成高饱和的亮色圈。
       // 呼吸只做轻微起伏（±12%），避免冷却期忽隐忽现被误当成「圈消失了」。
       const ph = ring.material.uniforms.uPhase.value;
       const breathe = 0.5 + 0.5 * Math.sin(now * 0.0014 + ph);
@@ -3965,55 +4036,75 @@ function render(now) {
 
   // 锁定高亮直接写在箭头自己身上（见上面的鸟着色循环），这里不再有独立的框需要更新。
 
-  // 捕杀三段动画，节拍与 predate() 的三段音一致
+  // 捕杀特效：一记白核爆闪 + 几十个多色粒子径向炸开（见 spawnBurst）
   for (const b of killBursts) {
     if (!b.active) continue;
     const age = now - b.born;
     if (age >= BURST_MS) {
       b.active = false;
-      for (const o of [b.core, b.inner, b.outer, b.sparks]) o.visible = false;
+      for (const o of [b.core, b.sparks, b.lines]) o.visible = false;
       continue;
     }
-    // 第一段 0ms：亮核闪灭（撞击音）
-    const cu = Math.min(1, age / 160);
+    // 撞击那一下：一个极短的白核，0.2 秒闪灭（只负责「砰」的瞬间，不再画环）
+    const cu = Math.min(1, age / 120);
     b.core.position.set(b.x, b.y, 0.3);
     b.core.quaternion.copy(camera.quaternion);
-    b.core.scale.setScalar(0.25 + 1.35 * cu);
-    b.core.material.opacity = Math.pow(1 - Math.min(1, age / 260), 2);
+    // 只做「砰」的那一下：半径压在 1 单位内、亮度 0.55，否则一团白会把彩色粒子全吃掉。
+    b.core.scale.setScalar(0.22 + 0.85 * cu);
+    b.core.material.opacity = 0.48 * Math.pow(Math.max(0, 1 - age / 140), 2);
 
-    // 第二段 90ms：内环扩张（撕裂音）
-    const ia = age - 90;
-    if (ia > 0) {
-      const iu = Math.min(1, ia / 420);
-      b.inner.position.set(b.x, b.y, 0.2);
-      b.inner.quaternion.copy(camera.quaternion);
-      b.inner.scale.setScalar(0.35 + 2.6 * (1 - Math.pow(1 - iu, 3)));
-      b.inner.material.opacity = 0.85 * (1 - iu);
-    } else b.inner.material.opacity = 0;
-
-    // 第三段 240ms：外环余波（低沉尾音）
-    const u = age / BURST_MS;
-    const ease = 1 - Math.pow(1 - u, 3);
-    b.outer.position.set(b.x, b.y, 0.1);
-    b.outer.quaternion.copy(camera.quaternion);
-    b.outer.scale.setScalar(0.5 + 5.0 * ease);
-    b.outer.material.opacity = 0.75 * Math.pow(1 - u, 1.4);
-
-    // 火花：随内环一起飞散
-    const sa = age - 90;
-    if (sa > 0 && sa < 560) {
-      const su = sa / 560, se = 1 - Math.pow(1 - su, 2);
-      const arr = b.sparks.geometry.attributes.position.array;
-      for (let s = 0; s < SPARKS; s++) {
-        const r = 0.4 + 5.2 * se;
-        arr[s * 3] = b.x + b.dirs[s * 2] * r;
-        arr[s * 3 + 1] = b.y + b.dirs[s * 2 + 1] * r;
-        arr[s * 3 + 2] = 0.25;
+    // 粒子：径向炸开 + 阻尼减速（阻尼项提出来算一次，每个粒子只乘自己的初速），
+    // 颜色按各自寿命衰减——加法混合下衰减到 0 就等于熄灭，所以不需要逐点 alpha。
+    const t = age / 1000;
+    const efT = (1 - Math.exp(-FW_DAMP * t)) / FW_DAMP;   // 每帧只算一次 exp
+    const pa = b.sparks.geometry.attributes.position.array;
+    const ca = b.sparks.geometry.attributes.color.array;
+    const la = b.lines.geometry.attributes.position.array;
+    const lc = b.lines.geometry.attributes.color.array;
+    const fall = FW_G * t * t;
+    for (let s = 0; s < FW_N; s++) {
+      const o = s * 3;
+      const lt = (t - b.dly[s]) / b.life[s];
+      if (lt >= 1) {
+        ca[o] = 0; ca[o + 1] = 0; ca[o + 2] = 0;
+        pa[o] = b.x; pa[o + 1] = b.y; pa[o + 2] = 0.25;
+        const lo0 = s * 6;
+        la[lo0] = b.x; la[lo0 + 1] = b.y; la[lo0 + 3] = b.x; la[lo0 + 4] = b.y;
+        lc[lo0] = 0; lc[lo0 + 1] = 0; lc[lo0 + 2] = 0;
+        lc[lo0 + 3] = 0; lc[lo0 + 4] = 0; lc[lo0 + 5] = 0;
+        continue;
       }
-      b.sparks.geometry.attributes.position.needsUpdate = true;
-      b.sparks.material.opacity = 0.9 * (1 - su);
-      b.sparks.visible = true;
-    } else b.sparks.visible = false;
+      // 还没到起飞时刻的粒子压在中心（花心），随着 delay 到点再散开。
+      const r = lt <= 0 ? 0 : Math.max(0, b.v0[s] * (efT - b.ef0[s]));
+      pa[o] = b.x + b.dirX[s] * r;
+      pa[o + 1] = b.y + b.dirY[s] * r - fall;
+      pa[o + 2] = 0.25;
+      // 亮度先满后收：刚炸开最亮，寿命末段快速暗下去（幂次 1.7 让尾巴收得干脆）
+      const f = Math.pow(1 - lt, 1.7);
+      ca[o] = b.base[o] * f;
+      ca[o + 1] = b.base[o + 1] * f;
+      ca[o + 2] = b.base[o + 2] * f;
+
+      // 同一颗火星的尾巴：外端就是粒子本身，内端退到 55% 半径，颜色更暗，
+      // 于是看上去是「从中心射出来的一道短光」，而不是一颗孤零零的点。
+      const lo = s * 6;
+      const ox = b.x + b.dirX[s] * r, oy = b.y + b.dirY[s] * r - fall;
+      la[lo] = b.x + b.dirX[s] * r * 0.55;
+      la[lo + 1] = b.y + b.dirY[s] * r * 0.55 - fall;
+      la[lo + 2] = 0.24;
+      la[lo + 3] = ox;
+      la[lo + 4] = oy;
+      la[lo + 5] = 0.24;
+      const f2 = f * 0.22;
+      lc[lo] = b.base[o] * f2; lc[lo + 1] = b.base[o + 1] * f2; lc[lo + 2] = b.base[o + 2] * f2;
+      lc[lo + 3] = b.base[o] * f; lc[lo + 4] = b.base[o + 1] * f; lc[lo + 5] = b.base[o + 2] * f;
+    }
+    b.sparks.geometry.attributes.position.needsUpdate = true;
+    b.sparks.geometry.attributes.color.needsUpdate = true;
+    b.lines.geometry.attributes.position.needsUpdate = true;
+    b.lines.geometry.attributes.color.needsUpdate = true;
+    b.sparks.visible = true;
+    b.lines.visible = true;
   }
 
   const pT2 = performance.now();
@@ -4446,11 +4537,14 @@ window.FlockLab = {
     }));
   },
   // 警戒圈状态：heat 0=饱食（暗色圈）1=捕食阶段（亮色圈）；
-  // alpha 始终 > 0、visible 始终为 true —— 圈不会因为吃饱就被藏起来。
+  // alpha 是本帧算出来的真实亮度（0.38~0.84，照常计算），drawn=false 表示只是没画出来（v1.4.18）。
+  // 判定用的是 forces.js 里的 fleeRange，跟这个 mesh 完全无关，所以隐藏它不影响任何行为。
   get ringState() {
     return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
       heat: +predHeat[p].toFixed(2),
       alpha: +threatRings[p].material.uniforms.uAlpha.value.toFixed(3),
+      radius: +threatRings[p].scale.x.toFixed(2),
+      drawn: THREAT_RING_SHOWN,
       visible: threatRings[p].visible
     }));
   },

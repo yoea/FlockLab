@@ -77,7 +77,7 @@ flocklab/
 | 音频 | `audio` / `music` 挂载 |
 | GPU 箭头 | `arrowGeo` + `arrowMat`（GLSL 画 ">" 形，朝向在顶点着色器里按速度旋转） |
 | 加速尾迹 | `MAX_TRAILS=4800` 环形槽位池 + `trailMat`（详见 §3.4） |
-| 捕食者渲染 | `predGeo`/`predMat`（锐角三角形 SDF）、警戒圈 `threatRings` |
+| 捕食者渲染 | `predGeo`/`predMat`（锐角三角形 SDF）、警戒圈 `threatRings`（v1.4.18 起只算不画，`THREAT_RING_SHOWN=false`） |
 | `frameBegin` / `updateResting` / `prepareForces` / `frameFinish` | **物理**（v1.4.4 起把原来的 `step` 巨函数拆成这四段，理由见 §2.4）：网格重建+捕食者 AI → 休息调度 → 每帧一次的状态推进 → 受力 → 质心归位+积分+穿墙+捕获+统计 |
 | `step(dt, time)` | **单核整帧**：`frameBegin` → `updateResting` → `prepareForces` → `computeForces` → `frameFinish` |
 | 多核调度 `MC` / `dispatchMulti` | 把 `computeForces` 按个体区间分给 Worker，见 §2.4 |
@@ -443,7 +443,11 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **捕食者**：`predatorCount` / `predatorPositions` / `predatorSpeeds` / `predatorCaps` / `predatorCooling` / `predatorTargets` / `catches` / `deadCount` / `respawnDelays` / `catchRadius` / `predShape` / `reaction` / `ringState` / `mouseHunter` / `mousePredator` / `mouseDrawCount`
 
-**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时 / `cooling`(吃饱冷却中) / `givingUp`(扑空拉起中)）、`predatorLocks`（锁定目标索引 `target` + 该鸟当前的描边粗细倍数 `thick`，1 = 正常、被锁定约 2.0~2.35 + 已锁定秒数 `locked`）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 7 rad/s² 限制（撞墙反弹那一帧除外）。排查「捕食者在空处打转」看 `cooling`/`givingUp` 两个布尔：冷却期的巡逻点是以鸟群质心为圆心的切向环带（半径 10~26），不该出现「朝一个方向直线飞出几十单位」；被锁定的鸟在 `predatorLocks.thick` 上应读到 >2（1 就是没高亮），并在画面上表现为**变红 + 描边加粗**——锁定标记直接画在箭头自己身上，不再有单独的聚焦框。`FlockLab.respawnOn` / `setRespawnOn(bool)` 控制「被吃后是否补一只」：关掉后 `deadCount` 只增不减、HUD 元素数量显示 `存活/设定`。
+**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时 / `cooling`(吃饱冷却中) / `givingUp`(扑空拉起中)）、`predatorLocks`（锁定目标索引 `target` + 该鸟当前的描边粗细倍数 `thick`，1 = 正常、被锁定约 2.0~2.35 + 已锁定秒数 `locked`）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 14 rad/s² 限制（撞墙反弹那一帧除外）。转弯半径看 `speed / |turnRate|`：滑翔/巡航/追击应落在 5~6 单位、俯冲约 10（v1.4.18 之前恒为 11）；连续采样里 `turnRate` 的符号翻转率应接近 0（翻转多说明在目标两侧来回摆头）。排查「捕食者在空处打转」看 `cooling`/`givingUp` 两个布尔：冷却期的巡逻点是以鸟群质心为圆心的切向环带（半径 10~26），不该出现「朝一个方向直线飞出几十单位」；被锁定的鸟在 `predatorLocks.thick` 上应读到 >2（1 就是没高亮），并在画面上表现为**变红 + 描边加粗**——锁定标记直接画在箭头自己身上，不再有单独的聚焦框。`FlockLab.respawnOn` / `setRespawnOn(bool)` 控制「被吃后是否补一只」：关掉后 `deadCount` 只增不减、HUD 元素数量显示 `存活/设定`。
+
+**捕杀特效（v1.4.18）**：`spawnBurst()` + `killBursts` 池，一次「短白核爆闪 + 72 个多色粒子」。粒子用 `Points`（径向渐变贴图 + 顶点色）与 `LineSegments`（每颗火星一根从 55% 半径到粒子的短尾）两组几何；运动是 `r = v0·(1−e^{−kt})/k`（阻尼，终值 `v0/k`），每个粒子另有独立初速/寿命/起飞延迟，颜色按各自寿命 `(1−lt)^1.7` 衰减到 0 —— 加法混合下颜色归零就等于熄灭，不需要逐点 alpha。想调爆炸大小改 `v0` 与 `FW_DAMP`（终半径 = v0/k），想调密度改 `FW_N`。
+
+**警戒圈**：`THREAT_RING_SHOWN=false` 只关绘制；`ringState` 里的 `heat`/`alpha`/`radius` 仍按 `params.fleeRange` 实时计算，`drawn` 字段标明当前是否画出来。逃逸判定在 `forces.js`，与这个 mesh 无关。
 
 **尾迹**：`trailCount` / `trailStats` → `{live, oldestAge, spanX, spanY, capacity}` / `trailSample`（最近 4 颗的 `pos/dir/age/len/wid`，可验证位置冻结与航向各异）
 
