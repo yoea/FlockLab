@@ -1088,10 +1088,12 @@ export class FlockMusic {
     //    只改这一个倍率，音高、三档和声的切换、低通随 C 打开的行为全都不动。
     n.padGain.gain.setTargetAtTime((0.004 + 0.012 * c) * PAD_TRIM, t, 0.5);
     n.padLp.frequency.setTargetAtTime(760 + 2400 * c, t, 0.5);
-    // 鼓点与贝斯都很轻：kick 峰值约 0.022、镲约 0.006，都低于和声层的总和，
-    // 作用是把拍子垫出来，不是当主角。聚集度只在这个范围内微调，不会突然变响。
-    n.pulseGain.gain.setTargetAtTime(0.010 + 0.018 * c, t, 0.4);
-    n.bassPluckGain.gain.setTargetAtTime(0.010 + 0.016 * c, t, 0.6);
+    // 鼓点与贝斯：v1.4.27 各降约 3.8dB。原来这两层是按「低于和声层总和」设计的
+    // （kick 0.026 vs pad 0.016），pad 压到 15% 之后它们反而成了最响的两层，
+    // 拍子从「垫底」变成「打点」。压回来让它们重新落在 drone（0.0076）之上一点点的位置。
+    // 峰值关系（强 kick 0.92 / 弱 0.58）与镲 1/5 的比例都没动，只改总线刻度。
+    n.pulseGain.gain.setTargetAtTime(0.007 + 0.011 * c, t, 0.4);
+    n.bassPluckGain.gain.setTargetAtTime(0.007 + 0.010 * c, t, 0.6);
     n.shimmerGain.gain.setTargetAtTime(0.0012 + 0.012 * Math.max(0, c - 0.28), t, 0.6);
     // 常驻低音长音：v1.4.24 再降 10dB（×0.316）。用户确认「每隔几秒浮上来、响几秒」
     // 的那层嗡嗡声就是它——用 bassGate 的 3~5.5s 渐入 + 5~13s 保持 + 3.5~6.5s 落下
