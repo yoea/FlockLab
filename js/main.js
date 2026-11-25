@@ -391,6 +391,10 @@ predCap.fill(params.predSpeed);
 // 朝它滑过去，到点或超时再换——这样吃饱后不会一头扎到墙上反复弹。
 const predWp = new Float32Array(MAX_SLOT * 2);      // 巡逻目标点（世界坐标）
 const predWpUntil = new Float64Array(MAX_SLOT);     // 目标点过期时间
+// 这个航点属于哪一次「吃饱」：冷却刚开始时如果还挂着上一次留下的旧点，
+// 它会先照直飞过去（可能正好在几十单位外的空地上）——看起来就像「跑远处空转」。
+const predWpStamp = new Float64Array(MAX_SLOT);     // 选点时的 predFeedAt
+predWpStamp.fill(-Infinity);
 // 捕食者拖尾：由「加速度」驱动——加速度越大，尾巴越长越亮；
 // 几乎不加速（匀速直线）时完全不出拖尾，所以它只在扑击、急转时闪现。
 const predAccel = new Float32Array(MAX_SLOT);       // 当帧加速度大小（转向力模长）
@@ -655,6 +659,7 @@ function initPredators(from, to) {
     predCap[p] = params.predSpeed;
     predWp[p * 2] = 0; predWp[p * 2 + 1] = 0;
     predWpUntil[p] = 0;
+    predWpStamp[p] = -Infinity;
     predTrailAmt[p] = 0; predTrailP[p] = 0; predHeat[p] = 1;
     predSpdJit[p] = 0.9 + Math.random() * 0.2;
     predWobble[p] = Math.random() * Math.PI * 2;
@@ -1705,7 +1710,7 @@ const lockGeo = new THREE.PlaneGeometry(2, 2);
 const lockFrames = [];
 for (let p = 0; p < MAX_SLOT; p++) {
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uAlpha: { value: 0 } },
+    uniforms: { uAlpha: { value: 0 }, uPx: { value: 22 }, uLine: { value: 1.6 } },
     vertexShader: `
       varying vec2 vLocal;
       void main() {
@@ -1716,21 +1721,24 @@ for (let p = 0; p < MAX_SLOT; p++) {
     fragmentShader: `
       varying vec2 vLocal;
       uniform float uAlpha;
+      uniform float uPx;      // 框半宽对应的屏幕像素数
+      uniform float uLine;    // 线宽（屏幕像素）
       void main() {
         vec2 a = abs(vLocal);
-        // 线宽按半宽比例给：mesh 跟着鸟缩放，看上去始终是「一根极细的线」。
-        float w = 0.028;
-        float al = 0.014;                       // 抗锯齿过渡，避免硬边闪烁
+        // 线宽按「屏幕像素」折算，而不是按世界比例。框的世界尺寸会随相机缩放变化，
+        // 但线本身必须始终是同样粗的 1~2 像素——否则缩远了细成一缕、缩近了糊成一片。
+        float w = uLine / max(uPx, 1.0);
+        float al = w * 0.6;                     // 抗锯齿过渡，避免硬边闪烁
         float lineX = smoothstep(1.0 - w - al, 1.0 - w, a.x);
         float lineY = smoothstep(1.0 - w - al, 1.0 - w, a.y);
-        float len = 0.34;                       // 角线长度（相对半宽）
+        float len = 0.32;                       // 角线长度（相对半宽）
         float segX = lineX * smoothstep(1.0 - len - al, 1.0 - len, a.y);
         float segY = lineY * smoothstep(1.0 - len - al, 1.0 - len, a.x);
-        // 四角括号实、整框只有一成的亮度：既是「准星」，又不会盖住鸟本身。
-        float m = max(max(segX, segY), max(lineX, lineY) * 0.16);
+        // 四角括号实、整框三成亮度：一眼能看出「有人在瞄这只」，又不至于盖住鸟。
+        float m = max(max(segX, segY), max(lineX, lineY) * 0.30);
         float a2 = m * uAlpha;
         if (a2 < 0.004) discard;
-        gl_FragColor = vec4(0.80, 0.95, 1.0, a2);
+        gl_FragColor = vec4(0.88, 0.98, 1.0, a2);
         #include <colorspace_fragment>
       }
     `,
@@ -1752,7 +1760,8 @@ for (let p = 0; p < MAX_SLOT; p++) {
 const lockAlpha = new Float32Array(MAX_SLOT);
 const lockPosX = new Float32Array(MAX_SLOT);
 const lockPosY = new Float32Array(MAX_SLOT);
-const lockHalf = new Float32Array(MAX_SLOT);
+const lockHalf = new Float32Array(MAX_SLOT);   // 世界坐标下的半宽
+const lockPx = new Float32Array(MAX_SLOT);     // 同一时刻的屏幕半宽（像素），着色器换线宽用
 const lockIdx = new Int32Array(MAX_SLOT);   // 本帧被锁定的鸟索引，鸟着色循环里用
 let lockIdxN = 0;
 
@@ -2491,7 +2500,8 @@ function frameBegin(dt, time) {
       predPrev[q] = ppx; predPrev[q + 1] = ppy; predPrev[q + 2] = 0;
       const pvx = predVel[q], pvy = predVel[q + 1];
       const speed0 = Math.sqrt(pvx * pvx + pvy * pvy);
-      // 进食冷却：吃饱后不再追击，以滑翔档省力巡游。
+      // 进食冷却：吃饱了这一段时间不再追捕（真实猛禽吃完要消化）。
+      // 注意「不追」不等于「看不见」——巡逻点始终跟着鸟群走，见下面的滑翔段。
       const cooling = time - predFeedAt[p] < params.feedCooldown * 1000;
       // 放弃冷却：刚扑空，先拉起来绕一圈再重新进近。
       const givingUp = time < predGiveUpUntil[p];
@@ -2503,33 +2513,54 @@ function frameBegin(dt, time) {
       let mode = PRED_MODE_CRUISE;
 
       if (cooling || givingUp) {
-        // 滑翔段：朝场地内部的一个目标点飞。到点、超时或有人在追（这里没有）
-        // 就换新点；新点限制在内缩 38% 的区域里，且离当前位置足够远，
-        // 所以它不会贴着墙来回弹，也不会原地打转。
+        // 滑翔段（吃饱 / 刚扑空拉起）。这里的巡逻点**不再在整片场地上随机取**：
+        // 原来取在 ±62% 半场里，鸟群一旦被赶到一角，它就在中间的空气里独自绕
+        // 十几秒，看上去像迷路了。现在点落在「鸟群质心周围的环带」上——
+        // 一直是贴着鸟群外围滑翔，既不会穿过吃不下的鸟群正中，也不会跑到空处。
         mode = PRED_MODE_GLIDE;
         predTarget[p] = -1; predChaseFrom[p] = 0;
         let wx = predWp[p * 2], wy = predWp[p * 2 + 1];
         let dwx = wx - ppx, dwy = wy - ppy;
-        if (Math.sqrt(dwx * dwx + dwy * dwy) < 5 || time > predWpUntil[p]) {
-          let bx = 0, by = 0;
-          for (let tries = 0; tries < 10; tries++) {
-            bx = (Math.random() * 2 - 1) * hx * 0.62;
-            by = (Math.random() * 2 - 1) * hy * 0.62;
-            // 饱食时巡逻点也别落在草地上：路径天然从草地边上绕过去，
+        const reached = Math.sqrt(dwx * dwx + dwy * dwy) < 5 || time > predWpUntil[p];
+        // 放弃后的「拉起绕行」目标由上面的放弃分支给好（背离猎物 26 单位），
+        // 这里只在冷却期间重选点，免得把刚拉起来的绕行动作又拉回去。
+        // 换点条件除了「到点 / 超时」，还有「这个点是上一次吃饱时留下的」——
+        // 否则每次吃完都会先朝旧航点直线飞出去，看着像跑去远处发呆。
+        if (cooling && (reached || predWpStamp[p] !== predFeedAt[p])) {
+          // 沿鸟群外缘「切向」选下一个点：以当前位置相对群心的方位角转 ±25°~60°，
+          // 半径取当前距离的 0.85~1.15 倍并夹在 10~26。
+          // 于是它是在鸟群外围盘旋（真鹰吃完就是这么飞的），而不是像早期那样
+          // 在整片场地里随机取点——那会让它横穿到对角、在没鸟的地方绕十几秒。
+          // 顺带一个好处：一旦它被追得离群很远，半径会被上限拉回来，自己归队。
+          const curAng = Math.atan2(ppy - groupY, ppx - groupX);
+          const curRad = Math.sqrt((ppx - groupX) * (ppx - groupX) + (ppy - groupY) * (ppy - groupY));
+          let bx = groupX, by = groupY;
+          for (let tries = 0; tries < 12; tries++) {
+            const ang = curAng + (Math.random() < 0.5 ? -1 : 1) * (0.45 + Math.random() * 0.55);
+            const rad = clampNum(curRad * (0.85 + Math.random() * 0.30), 10, 26);
+            const rx = clampNum(groupX + Math.cos(ang) * rad, -hx * 0.94, hx * 0.94);
+            const ry = clampNum(groupY + Math.sin(ang) * rad, -hy * 0.94, hy * 0.94);
+            // 巡逻点别落在草地上：路径天然从草地边上绕过去，
             // 配合下面的避让偏航，看上去就是「有意识地避开」而不是硬撞后弹开。
             let onGrass = false;
             for (let g = 0; g < grass.length; g++) {
               const gp = grass[g];
-              const ddx = bx - gp.x, ddy = by - gp.y;
+              const ddx = rx - gp.x, ddy = ry - gp.y;
               const rr = gp.R * 1.15;
               if (ddx * ddx + ddy * ddy < rr * rr) { onGrass = true; break; }
             }
-            const dd = Math.sqrt((bx - ppx) * (bx - ppx) + (by - ppy) * (by - ppy));
-            if (!onGrass && dd > Math.min(16, hy * 0.6)) break;
+            const dd = Math.sqrt((rx - ppx) * (rx - ppx) + (ry - ppy) * (ry - ppy));
+            if (!onGrass && dd > Math.min(14, hy * 0.45)) { bx = rx; by = ry; break; }
           }
           predWp[p * 2] = wx = bx; predWp[p * 2 + 1] = wy = by;
-          predWpUntil[p] = time + 6000 + Math.random() * 5000;
+          predWpUntil[p] = time + 3000 + Math.random() * 2500;
+          predWpStamp[p] = predFeedAt[p];
           dwx = wx - ppx; dwy = wy - ppy;
+        }
+        // 冷却末段（最后 2.5 秒）直接朝鸟群中心收：冷却一结束就已经贴在射程边上，
+        // 不会出现「休息完还在远处慢慢飘过来」的空档。
+        if (cooling && params.feedCooldown * 1000 - (time - predFeedAt[p]) < 2500) {
+          dwx = groupX - ppx; dwy = groupY - ppy;
         }
         hdgWant = Math.atan2(dwy, dwx);
       } else {
@@ -2566,6 +2597,32 @@ function frameBegin(dt, time) {
         }
         if (best < 0) {
           predTarget[p] = -1; predChaseFrom[p] = 0;
+          // 视野里一只可猎的都没有：不能就这么保持航向——那会在同一片空域里
+          // 反复撞墙（或穿墙）打转十几秒。改成主动搜索：朝最近的、还在飞的鸟
+          // 一路巡航过去，进入视野后自动接回上面的评分索敌。
+          // 真实猛禽找猎物也是先朝鸟群飞，而不是在原地盘旋。
+          let srX = 0, srY = 0, srD2 = Infinity, srFound = false;
+          // 全都落在草地上歇着时的备选：朝最近那片「停着鸟的地方」飞（去门口等）。
+          let rsX = 0, rsY = 0, rsD2 = Infinity, rsFound = false;
+          for (let j = 0; j < n; j++) {
+            if (caught[j]) continue;
+            const m2 = j * 3;
+            const dx2 = pos[m2] - ppx, dy2 = pos[m2 + 1] - ppy;
+            const d2b = dx2 * dx2 + dy2 * dy2;
+            if (resting[j]) {
+              if (d2b < rsD2) { rsD2 = d2b; rsX = pos[m2]; rsY = pos[m2 + 1]; rsFound = true; }
+              continue;
+            }
+            if (d2b < srD2) { srD2 = d2b; srX = pos[m2]; srY = pos[m2 + 1]; srFound = true; }
+          }
+          if (srFound) {
+            mode = PRED_MODE_CRUISE;
+            hdgWant = Math.atan2(srY - ppy, srX - ppx);
+          } else if (rsFound) {
+            // 一只能飞的都没有：别在原地转，去歇脚的鸟群那边守着，等它们起飞。
+            mode = PRED_MODE_CRUISE;
+            hdgWant = Math.atan2(rsY - ppy, rsX - ppx);
+          }
         } else {
           if (predTarget[p] !== best) predLockFrom[p] = time;   // 换了目标 → 聚焦框重新收拢一次
           predTarget[p] = best;
@@ -3742,11 +3799,11 @@ function render(now) {
     // 优先级最高——新生、爆发、争地盘都盖不住它，因为「正在被瞄准」是最该被读到的事。
     for (let li = 0; li < lockIdxN; li++) {
       if (lockIdx[li] !== i) continue;
-      const w = 0.70;
-      col[k] = col[k] * (1 - w) + 0.93 * w;
-      col[k + 1] = col[k + 1] * (1 - w) + 0.97 * w;
+      const w = 0.86;
+      col[k] = col[k] * (1 - w) + 0.95 * w;
+      col[k + 1] = col[k + 1] * (1 - w) + 0.98 * w;
       col[k + 2] = col[k + 2] * (1 - w) + 1.00 * w;
-      size *= 1.12 + 0.05 * Math.sin(now * 0.011);
+      size *= 1.26 + 0.07 * Math.sin(now * 0.011);
       break;
     }
     siz[i] = size;
@@ -3909,18 +3966,27 @@ function render(now) {
   // 目标被抓走时框停在原地淡掉，不会跳到捕食者身上。
   {
     const bp = predBaseCount();
+    // 世界坐标 → 屏幕像素的换算（正交相机 + 当前缩放 + 相机摇动都要算进去）。
+    // 框按「屏幕像素」定尺寸，所以缩放、切窗口大小都不会让它小到看不见。
+    const rectPx = cv.getBoundingClientRect();
+    const halfHNow = view2DFitHalfH() / Math.max(0.05, view2D.zoom * SHAKE.zoom);
+    const worldPerPx = (2 * halfHNow) / Math.max(1, rectPx.height);
     for (let p = 0; p < MAX_SLOT; p++) {
       const fr = lockFrames[p];
       const tg = p < bp ? predTarget[p] : -1;
       const on = tg >= 0 && tg < n && !caught[tg] && siz[tg] > 0.001;
-      lockAlpha[p] += ((on ? 0.95 : 0) - lockAlpha[p]) * (1 - Math.exp(-dt / (on ? 0.10 : 0.20)));
+      lockAlpha[p] += ((on ? 1.0 : 0) - lockAlpha[p]) * (1 - Math.exp(-dt / (on ? 0.09 : 0.22)));
       let ease = 1;
       if (on) {
         const m = tg * 3;
         const age = Math.max(0, now - predLockFrom[p]);
         // 收拢：刚锁定时框比鸟大一圈，0.19 秒收到贴合，像镜头对焦。
         ease = 1 - Math.pow(1 - Math.min(1, age / 190), 3);
-        lockHalf[p] = siz[tg] * (1.75 + (1 - ease) * 1.45);
+        // 半宽按屏幕像素给：至少 26px（原来只有 4.7px，细线一成亮度 → 等于没画）。
+        // 鸟特别大（arrowSize 拉高）时跟着放大一点，但夹在 26~56px 之间。
+        const pxHalf = clampNum(siz[tg] * worldPerPx * 2.4, 22, 52) * (1.34 - 0.34 * ease);
+        lockHalf[p] = pxHalf * worldPerPx;
+        lockPx[p] = pxHalf;
         lockPosX[p] = pos[m];
         lockPosY[p] = pos[m + 1];
       }
@@ -3931,8 +3997,9 @@ function render(now) {
       // 相机摇晃带来的滚转不该让它跟着歪。位置仍用世界坐标，所以不会脱靶。
       fr.quaternion.copy(camera.quaternion);
       fr.scale.set(lockHalf[p], lockHalf[p], 1);
+      fr.material.uniforms.uPx.value = lockPx[p];
       // 刚咬住的那 0.2 秒额外亮一档（收拢时「咔哒」一下），随后回落到常态。
-      fr.material.uniforms.uAlpha.value = Math.min(1.4, lockAlpha[p] * (1 + 0.45 * (1 - ease)));
+      fr.material.uniforms.uAlpha.value = Math.min(1.5, lockAlpha[p] * (1 + 0.5 * (1 - ease)));
     }
   }
 
@@ -4589,6 +4656,9 @@ window.FlockLab = {
       accel: +predAccel[p].toFixed(1),
       chasing: +(predChaseFrom[p] > 0 ? (performance.now() - predChaseFrom[p]) / 1000 : 0).toFixed(2),
       giveUpIn: +Math.max(0, (predGiveUpUntil[p] - performance.now()) / 1000).toFixed(2),
+      // 两种「不追」的原因分开报，排查「一直在空处绕」时一眼能看出是哪一条
+      cooling: (performance.now() - predFeedAt[p]) < params.feedCooldown * 1000,
+      givingUp: performance.now() < predGiveUpUntil[p],
     }));
   },
   // 锁定聚焦框的状态：哪只鸟被锁、框的透明度与半宽、是否可见。
@@ -4597,6 +4667,7 @@ window.FlockLab = {
       target: predTarget[p],
       alpha: +lockAlpha[p].toFixed(2),
       half: +lockHalf[p].toFixed(2),
+      px: +lockPx[p].toFixed(1),          // 屏幕上的半宽（像素）：验证「看得见」用
       visible: !!(lockFrames[p] && lockFrames[p].visible),
     }));
   },

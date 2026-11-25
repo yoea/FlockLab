@@ -443,7 +443,7 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **捕食者**：`predatorCount` / `predatorPositions` / `predatorSpeeds` / `predatorCaps` / `predatorCooling` / `predatorTargets` / `catches` / `deadCount` / `respawnDelays` / `catchRadius` / `predShape` / `reaction` / `ringState` / `mouseHunter` / `mousePredator` / `mouseDrawCount`
 
-**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时）、`predatorLocks`（锁定目标索引 + 聚焦框的 alpha / 半宽 / 是否可见）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 7 rad/s² 限制（撞墙反弹那一帧除外）。
+**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时 / `cooling`(吃饱冷却中) / `givingUp`(扑空拉起中)）、`predatorLocks`（锁定目标索引 + 聚焦框的 alpha / 世界半宽 `half` / **屏幕半宽 `px`** / 是否可见）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 7 rad/s² 限制（撞墙反弹那一帧除外）。排查「捕食者在空处打转」看 `cooling`/`givingUp` 两个布尔：冷却期的巡逻点是以鸟群质心为圆心的切向环带（半径 10~26），不该出现「朝一个方向直线飞出几十单位」；`px` 应稳定在 26 以上（低于 20 说明屏幕恒定尺寸那段没生效，框会看不见）。
 
 **尾迹**：`trailCount` / `trailStats` → `{live, oldestAge, spanX, spanY, capacity}` / `trailSample`（最近 4 颗的 `pos/dir/age/len/wid`，可验证位置冻结与航向各异）
 
