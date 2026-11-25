@@ -824,6 +824,10 @@ const pentaFreq = (deg, oct = 0) => {
 };
 // 三档和声（五声音阶的度数索引：0=A 1=C 2=D 3=E 4=G，5 起为高八度）
 const CHORDS = [[0, 3], [0, 2, 3], [0, 2, 3, 4, 5]];
+// ② pad 的总倍率（v1.4.26）。用户用这张调音台逐层独奏，指认「那层嗡声」是 pad 和声，
+// 要求压到现有音量的 15%。**滑块 100% 就是压过之后的电平**，再往上拉最多回到 30%；
+// 干声与湿声走同一个 PAD_TRIM，所以拖滑块时音色不变、只是远近。
+const PAD_TRIM = 0.15;
 
 export class FlockMusic {
   constructor(audio, params) {
@@ -875,7 +879,9 @@ export class FlockMusic {
     // 混响送出的「跟随增益」（v1.4.25）：pad / shimmer 各一个，系数跟着该层的调音台走。
     // 直接让音符节点送 send 的话，把 pad 拉到 0 仍能听到它的混响尾巴——「独奏」就不干净。
     // 也不能接在 padGain 之后：那是 0.004~0.016 的设计电平，送进去等于没有混响。
-    const padSend = ctx.createGain(); padSend.gain.value = 1; padSend.connect(send);
+    // 初值就是 PAD_TRIM（v1.4.26）：建图到第一次 applyMix 之间若真有音符排出，
+    // 湿声不该比干声大 6.7 倍。applyMix 之后这里跟 eff('pad') 走。
+    const padSend = ctx.createGain(); padSend.gain.value = PAD_TRIM; padSend.connect(send);
     const shimSend = ctx.createGain(); shimSend.gain.value = 1; shimSend.connect(send);
 
     // ① drone：原来以 55Hz 为基音，在大多数扬声器上就是一段持续的低频嗡鸣，
@@ -1124,9 +1130,11 @@ export class FlockMusic {
     const k = (f) => (fast ? 0.06 : f);
     // drone：110Hz 那层是最容易被听成「电器没关」的持续嗡声，只当底色。
     n.droneGain.gain.setTargetAtTime((0.0023 + 0.0053 * c) * this.eff('drone'), t, k(0.35));
-    n.padGain.gain.setTargetAtTime((0.004 + 0.012 * c) * this.eff('pad'), t, k(0.5));
+    // v1.4.26：pad 压到 15%（PAD_TRIM）。eff('pad') 仍是滑块倍率，两者相乘——
+    // 滑块 100% = 压过之后的电平，这样「面板默认听感」与主分支完全一致。
+    n.padGain.gain.setTargetAtTime((0.004 + 0.012 * c) * PAD_TRIM * this.eff('pad'), t, k(0.5));
     // 混响送出跟着本层走，独奏 / 静音时尾巴一起消失
-    n.padSend.gain.setTargetAtTime(this.eff('pad'), t, k(0.5));
+    n.padSend.gain.setTargetAtTime(PAD_TRIM * this.eff('pad'), t, k(0.5));
     n.shimSend.gain.setTargetAtTime(this.eff('shimmer'), t, k(0.6));
     // 鼓点与贝斯都很轻：作用是把拍子垫出来，不是当主角。
     n.pulseGain.gain.setTargetAtTime((0.010 + 0.018 * c) * this.eff('kick'), t, k(0.4));
