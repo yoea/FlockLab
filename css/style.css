@@ -311,17 +311,30 @@
   }
   .bar.mini { width: 30px; height: 3px; }
 
-  /* 版本行：版本 · commit · 构建时间 · 作者，字号最小，视觉上退到最底层 */
+  /* 版本行：v1.4.11 cde0632 build: 202611251530，©yoea.
+     commit 是直达 GitHub 的链接；构建时间压成 12 位数字，窄条里省一半宽度。
+     间距用 margin（不用 gap），这样 build 与 ©作者 之间的中文逗号能紧贴。 */
   .hud-ver {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+    display: flex; flex-wrap: wrap; align-items: center;
     margin-top: 7px; padding-top: 6px;
     border-top: 1px solid rgba(126, 170, 235, .08);
     font-size: 9px; color: #5d7090; letter-spacing: .05em;
     font-variant-numeric: tabular-nums;
   }
-  .hud-ver i { font-style: normal; color: #3d4c63; }
-  .hud-ver #hVer { color: #7e93b5; }
-  .hud-ver #hCommit { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .hud-ver > span, .hud-ver > a { flex: 0 0 auto; }
+  .hud-ver #hVer { color: #7e93b5; margin-right: 6px; }
+  .hud-ver #hBuild::after { content: '，'; }
+  .hud-ver #hCommit {
+    margin-right: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #8fb4e8; cursor: pointer;
+    -webkit-user-select: text; user-select: text;   /* 允许选中复制哈希 */
+    text-decoration: underline dotted rgba(143, 180, 232, .55);
+    text-underline-offset: 2.5px;
+    transition: color .18s ease, text-decoration-color .18s ease;
+  }
+  .hud-ver #hCommit:hover { color: #c6e4ff; text-decoration-color: currentColor; }
+  .hud-ver #hCommit:focus-visible { outline: 1px solid rgba(143, 180, 232, .7); outline-offset: 2px; }
 
   .bar {
     position: relative; width: 92px; height: 4px; border-radius: 4px;

@@ -3330,12 +3330,25 @@ function setMeter(barId, valId, pct, est) {
 }
 
 // 版本行与关于弹窗里的版本号：只在启动时写一次（构建元数据是常量）。
+// 版本行排版固定成「vX.Y.Z <commit> build: 202611251530，©作者.」：
+// commit 是链接，点开直达 GitHub 那一次提交；构建时间压成 12 位纯数字，窄条里省一半宽度。
+const GH_COMMIT_BASE = 'https://github.com/yoea/FlockLab/commit/';
 (function fillVersion() {
   const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
-  set('hVer', VERSION); set('hCommit', COMMIT); set('hBuild', BUILD_TIME); set('hAuthor', AUTHOR);
+  set('hVer', VERSION);
+  const digits = BUILD_TIME.replace(/\D/g, '');
+  set('hBuild', 'build: ' + (digits.length === 12 ? digits : BUILD_TIME));
+  set('hAuthor', '©' + AUTHOR + '.');
   set('aVer', VERSION);
+  const link = document.getElementById('hCommit');
+  if (link) {
+    link.textContent = COMMIT;
+    // 工作区有未提交改动时 COMMIT 带 *，链接只认十六进制部分
+    const sha = COMMIT.replace(/[^0-9a-f]/gi, '');
+    link.href = GH_COMMIT_BASE + (sha || 'main');
+  }
   const line = document.getElementById('hVerLine');
-  if (line) line.title = `FlockLab ${VERSION}｜commit ${COMMIT}｜构建 ${BUILD_TIME}｜作者 ${AUTHOR}`;
+  if (line) line.title = `FlockLab ${VERSION}｜commit ${COMMIT}｜构建 ${BUILD_TIME}｜作者 ${AUTHOR}｜点击 commit 查看 GitHub 提交`;
 })();
 
 const mcWeights = new Float64Array(MAX_N + 1);   // 负载切分用的权重前缀和

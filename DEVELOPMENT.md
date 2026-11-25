@@ -337,6 +337,13 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 - 语义是「构建时的 HEAD」。发布流程是「提交代码 → 生成 → 再提交一次 build 元数据」，所以页面显示的 commit 是**代码那一次提交**，不是元数据那次。
 - 它进了 `sw.js` 的离线壳：**忘了加会导致离线冷启动白屏**（module import 404）。
 
+**版本行排版**：`v1.4.11 cde0632 build: 202611251530，©yoea.`，全部由 `fillVersion()` 在启动时写一次。
+
+- `#hCommit` 是 `<a target="_blank" rel="noopener noreferrer">`，href 拼 `https://github.com/yoea/FlockLab/commit/<sha>`；脏构建的 `*` 先用 `replace(/[^0-9a-f]/gi,'')` 剥掉，否则链接 404。
+- 构建时间由 `BUILD_TIME.replace(/\D/g,'')` 压成 12 位，长度不是 12 就原样输出——兜底的 `—` 被压完是空串，直接用会变成「build: 」后面空白。
+- 排版用 `margin-right` 而不是 flex `gap`：`build` 与 `©作者` 之间的中文逗号必须紧贴（由 `#hBuild::after` 输出），`gap` 会把它推开。
+- `body` 是全局 `user-select: none`，commit 链接单独放回 `user-select: text`，否则哈希选不中、复制不了。
+
 **控制台分组**：按「看什么 → 怎么飞 → 谁吃谁 → 画面与性能」排，默认只展开「鸟群」「捕食者」。lil-gui 的 folder **默认就是展开的**，想让某组收起必须显式 `folder.close()`——只写 `fA.open()` 不管其他组，结果会是全开、面板直接拉出屏幕。
 
 ### 3.9d 界面闲置自动隐藏与全屏（v1.4.9）
@@ -623,6 +630,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v1.4.8 | **修「开声后画面定格」**：`params.master` 在 v1.4.7 被删但 `audio.js` 仍在读，`AudioParam.value = undefined` 抛 TypeError；异常发生在 `render` 的仿真段（`prepareForces → audio.sprint()`），每帧中断 → 画面定格，静音后 `canPlay()` 早退即恢复。改为常量 `MASTER_GAIN`，`connectOutput()` 内 try/catch 兜底（音频故障只能没声音，不能停鸟群），音频建图拆两段可续建。同批补回 v1.4.4 丢失的 `stamina` 恢复与 `sprintingCount` 累加——后者必须与累加同在 `frameFinish`：多核是「本帧 dispatch、下帧收尾」，在 `frameBegin` 清零会被下一帧立刻抹掉 |
 | v1.4.9 | **界面交互重做**：右下角「重新初始化」→ **全屏**（`requestFullscreen` / `exitFullscreen` 带 webkit 回退，只切全屏不动参数，`fullscreenchange` + `webkitfullscreenchange` 双事件同步图标与高亮）；**闲置 5 秒自动隐藏**控制台 / 状态卡 / 右下角按钮，光标同时隐藏，任意输入调 `wake()` 恢复并重置计时；`#hud.pinned` 靠 CSS `:not(.pinned)` 排除在隐藏之外，卡内按钮跟着常驻；「关于」弹窗打开期间不计时；删除小眼睛按钮、`autoHideUi` 的载入 1 秒收起与 `eyeTimer` 那套淡出；`applyDefaults()` 保留给调试接口 `resetAll()`。见 §3.9d |
 | v1.4.10 | **暂停 = 画面 + 音乐**：`setPaused(on)` 只在状态边沿调 `music.pauseForSim()` / `resumeFromSim()`（不进每帧循环——每帧写 AudioParam 正是 v1.4.8 定格事故的成因）；停法是音乐总线渐隐 0 + 停 25ms 调度器，恢复时 `nextTime = now + 0.06` 不补排欠下的音符，振荡器不重建。新增 `simPaused` 标志，被 `start` / `mute` / `resumeScheduler` 三处引用，防止暂停期间被静音开关或后台恢复偷偷放声；`applyDefaults()` 改走 `setPaused(false)`。见 §3.9e |
+| v1.4.11 | **版本行排版**：`vX.Y.Z <commit> build: 202611251530，©作者.` 连排。commit 改 `<a target="_blank" rel="noopener noreferrer">` 指向 GitHub commit 页，href 先剥掉脏构建的 `*` 再拼；构建时间压成 12 位纯数字，长度不对时退回原样（避免兜底 `—` 被压成空串）。间距从 flex `gap` 改成 `margin-right`，让 build 与 ©作者 之间的中文逗号紧贴（由 `#hBuild::after` 输出）。见 §3.9c |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
