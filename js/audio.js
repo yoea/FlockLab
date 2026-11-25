@@ -37,6 +37,9 @@ export class FlockAudio {
     // 静音是「用户意图」，必须跨刷新记住。否则刷新时 enable() 会擅自开声，
     // 看起来就像「明明静音了还有声音」。
     this.mutedPref = false;
+    // 音效总线的额外倍率（调音台用，1 = 出厂）。和音乐各层的 trim 是同一套思路：
+    // 设计电平不动，只在上面对一个 0~2 的系数，随时可以还原。
+    this.sfxTrim = 1;
     // v2：v1.4.0 之前这个 key 存过实验用的静音状态，会让人「刷新后一直是静音」。
     // 换 key 等于一次性重置为「默认开声」，之后用户的静音选择照常记住。
     try { this.mutedPref = localStorage.getItem('flocklab.audio.muted.v2') === '1'; } catch (e) {}
@@ -218,8 +221,8 @@ export class FlockAudio {
       // 音效总线：所有事件音先进这里，再进 master。
       // 这样「音效音量」只影响提示音，不会把音乐一起推大。
       this.fxBus = ctx.createGain();
-      // 面板刻度直接就是增益：1.0 对应单位响度
-      this.fxBus.gain.value = this.p.fxLevel;
+      // 面板刻度直接就是增益：1.0 对应单位响度；再乘调音台的倍率
+      this.fxBus.gain.value = this.p.fxLevel * this.sfxTrim;
       this.fxBus.connect(this.master);
 
       // 噪声缓冲：逃逸气流、咬合、捕食者喷射共用。
@@ -279,6 +282,17 @@ export class FlockAudio {
   }
 
   // v1.4.23：buildTexture() / setDensity() 已删除，见文件顶部关于「密度纹理层」的说明。
+
+  // 音效总线电平 = 出厂刻度 × 调音台倍率。所有写 fxBus 的地方都走这里，
+  // 免得「重置参数」和「调音台」各写一半、互相把对方的改动抹掉。
+  applySfxGain(tau = 0.08) {
+    if (!this.fxBus || !this.ctx) return;
+    this.fxBus.gain.setTargetAtTime(this.p.fxLevel * this.sfxTrim, this.ctx.currentTime, tau);
+  }
+  setSfxTrim(v) {
+    this.sfxTrim = Math.max(0, Math.min(2, +v || 0));
+    this.applySfxGain();
+  }
 
   refreshButton() {
     const btn = document.getElementById('audioBtn');
@@ -830,6 +844,11 @@ export class FlockMusic {
     // 这个标志同时管住 start / mute / resumeScheduler，避免暂停期间被它们偷偷复活。
     this.simPaused = false;
     this.counts = { chord: 0, kick: 0, hat: 0, bassNote: 0, shimmer: 0, bass: 0 };
+    // 调音台（v1.4.25）：每层一个 0~2 的倍率，乘在「设计电平」上，1 = 原样，
+    // 0 = 静音，2 = 拉满两倍（用来把某层从背景里揪出来听）。solo 非空时只有那一层出声。
+    // 这些系数不写进 AudioParam 的公式，所以随时都能还原，不会跟随 C 变化的电平打架。
+    this.trim = { drone: 1, pad: 1, kick: 1, hat: 1, bassPluck: 1, shimmer: 1, bassDrone: 1, orbit: 1 };
+    this.solo = null;
     // 捕食者状态（由 main.js 每帧喂标量，音频参数的平滑与写入只在 25ms 调度器里做）
     this.pred = { active: false, x: 0, heat: 0, dist: 100 };
   }
@@ -852,6 +871,12 @@ export class FlockMusic {
     send.connect(delay); delay.connect(damp);
     damp.connect(fb); fb.connect(delay);
     damp.connect(wet); wet.connect(bus);
+
+    // 混响送出的「跟随增益」（v1.4.25）：pad / shimmer 各一个，系数跟着该层的调音台走。
+    // 直接让音符节点送 send 的话，把 pad 拉到 0 仍能听到它的混响尾巴——「独奏」就不干净。
+    // 也不能接在 padGain 之后：那是 0.004~0.016 的设计电平，送进去等于没有混响。
+    const padSend = ctx.createGain(); padSend.gain.value = 1; padSend.connect(send);
+    const shimSend = ctx.createGain(); shimSend.gain.value = 1; shimSend.connect(send);
 
     // ① drone：原来以 55Hz 为基音，在大多数扬声器上就是一段持续的低频嗡鸣，
     //    听感像"机器没关"。改为以 110Hz（A2）为基音、只叠五度，直链高通切掉 55Hz 以下的隆隆声，
@@ -886,6 +911,12 @@ export class FlockMusic {
     //    现在固定每小节第 1 拍落 kick、第 3 拍一记弱 kick，反拍镲才随聚集度加入。
     const pulseGain = ctx.createGain(); pulseGain.gain.value = 0;
     pulseGain.connect(bus);
+    // 闭镲单独一条增益（v1.4.25）：它和 kick 共用总线时没法分开试听，
+    // 一个「高频嚓」一个「低频咚」，正是最该分开调的两端。
+    // 注意必须**直连 bus**：串在 pulseGain 下面的话，独奏闭镲时 pulseGain 被压到 0，
+    // 镲会跟着一起哑掉——「独奏」就名存实亡了。
+    const hatGain = ctx.createGain(); hatGain.gain.value = 1;
+    hatGain.connect(bus);
 
     // ③b 贝斯拨音（v1.4.23）：跟着 kick 走的短低音，独立增益以便与下面的
     //     「⑤ 常驻低音长音」分开调——两者都在低频，挂在同一条总线上就没法分别压。
@@ -943,8 +974,9 @@ export class FlockMusic {
     air.connect(airBp); airBp.connect(airGain); airGain.connect(orbitGain);
     air.start();
 
-    this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, bassPluckGain,
-                   shimmerGain, bassGain, bassGate, orbitGain, orbitLp, orbitPan };
+    this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, hatGain,
+                   bassPluckGain, shimmerGain, bassGain, bassGate, orbitGain, orbitLp, orbitPan,
+                   padSend, shimSend };
   }
 
   start() {
@@ -1027,7 +1059,7 @@ export class FlockMusic {
     const prox = 1 - Math.min(1, Math.max(0, p.dist / 40));
     // 电平刻意压得极低：最响也只有主层的 1/3，饱食远巡时几乎为零
     const target = p.active
-      ? 0.0009 + 0.0032 * (0.35 + 0.65 * p.heat) * (0.35 + 0.65 * prox)
+      ? (0.0009 + 0.0032 * (0.35 + 0.65 * p.heat) * (0.35 + 0.65 * prox)) * this.eff('orbit')
       : 0;
     n.orbitGain.gain.setTargetAtTime(target, t, 1.1);
     n.orbitLp.frequency.setTargetAtTime(170 + 210 * p.heat, t, 1.2);
@@ -1070,23 +1102,68 @@ export class FlockMusic {
     this.tension += (tension - this.tension) * (1 - Math.exp(-dt / 1.4));
     if (Math.abs(this.smooth - this.applied) < 0.004) return;
     this.applied = this.smooth;
-    const c = this.smooth, n = this.nodes, ctx = this.a.ctx, t = ctx.currentTime;
-    // drone 再压一档（−6dB）：110Hz 那层是最容易被听成「电器没关」的持续嗡声，
-    // 它只需要垫在底下，不该在没有事件的时候抢注意力。
-    n.droneGain.gain.setTargetAtTime(0.0023 + 0.0053 * c, t, 0.35);
-    n.droneLp.frequency.setTargetAtTime(220 + 700 * c * c, t, 0.45);
-    n.padGain.gain.setTargetAtTime(0.004 + 0.012 * c, t, 0.5);
-    n.padLp.frequency.setTargetAtTime(760 + 2400 * c, t, 0.5);
-    // 鼓点与贝斯都很轻：kick 峰值约 0.022、镲约 0.006，都低于和声层的总和，
-    // 作用是把拍子垫出来，不是当主角。聚集度只在这个范围内微调，不会突然变响。
-    n.pulseGain.gain.setTargetAtTime(0.010 + 0.018 * c, t, 0.4);
-    n.bassPluckGain.gain.setTargetAtTime(0.010 + 0.016 * c, t, 0.6);
-    n.shimmerGain.gain.setTargetAtTime(0.0012 + 0.012 * Math.max(0, c - 0.28), t, 0.6);
-    // 常驻低音长音：v1.4.24 再降 10dB（×0.316）。用户确认「每隔几秒浮上来、响几秒」
-    // 的那层嗡嗡声就是它——用 bassGate 的 3~5.5s 渐入 + 5~13s 保持 + 3.5~6.5s 落下
-    // 对得上实测曲线（3 秒爬到顶、6.5 秒保持）。降到这个电平后它只剩极微弱的底衬，
-    // 低频骨架交给节奏贝斯；再想更干净就直接删掉这一层，其余层不依赖它。
-    n.bassGain.gain.setTargetAtTime(0.00022 + 0.00051 * c, t, 0.9);
+    const n = this.nodes, ctx = this.a.ctx, t = ctx.currentTime;
+    n.droneLp.frequency.setTargetAtTime(220 + 700 * this.smooth * this.smooth, t, 0.45);
+    n.padLp.frequency.setTargetAtTime(760 + 2400 * this.smooth, t, 0.5);
+    this.applyMix(false);
+  }
+
+  // 调音台系数：把「层名 → 有效倍率」集中在一处，update / applyMix / 独奏都走它。
+  eff(key) {
+    if (this.solo) return this.solo === key ? this.trim[key] : 0;
+    return this.trim[key];
+  }
+
+  // 把所有层电平按当前聚集度 + 调音台系数写一遍。
+  // fast = true 时时间常数压到 60ms：拖滑块要「立刻听见」，而不是等 0.9s 慢慢滑过去。
+  // update() 里爬升的平滑（0.35~0.9s）保持不变——那是「呼吸」，这里是「调音」。
+  applyMix(fast) {
+    const n = this.nodes;
+    if (!n) return;
+    const t = this.a.ctx.currentTime, c = this.smooth;
+    const k = (f) => (fast ? 0.06 : f);
+    // drone：110Hz 那层是最容易被听成「电器没关」的持续嗡声，只当底色。
+    n.droneGain.gain.setTargetAtTime((0.0023 + 0.0053 * c) * this.eff('drone'), t, k(0.35));
+    n.padGain.gain.setTargetAtTime((0.004 + 0.012 * c) * this.eff('pad'), t, k(0.5));
+    // 混响送出跟着本层走，独奏 / 静音时尾巴一起消失
+    n.padSend.gain.setTargetAtTime(this.eff('pad'), t, k(0.5));
+    n.shimSend.gain.setTargetAtTime(this.eff('shimmer'), t, k(0.6));
+    // 鼓点与贝斯都很轻：作用是把拍子垫出来，不是当主角。
+    n.pulseGain.gain.setTargetAtTime((0.010 + 0.018 * c) * this.eff('kick'), t, k(0.4));
+    n.hatGain.gain.setTargetAtTime(this.eff('hat'), t, k(0.4));
+    n.bassPluckGain.gain.setTargetAtTime((0.010 + 0.016 * c) * this.eff('bassPluck'), t, k(0.6));
+    n.shimmerGain.gain.setTargetAtTime((0.0012 + 0.012 * Math.max(0, c - 0.28)) * this.eff('shimmer'), t, k(0.6));
+    // 常驻低音长音：用户确认「每隔几秒浮上来、响几秒」的嗡嗡声就是它，已降到只剩底衬。
+    n.bassGain.gain.setTargetAtTime((0.00022 + 0.00051 * c) * this.eff('bassDrone'), t, k(0.9));
+    // orbit 的电平在 applyPredator 里按饥饿度/远近算，这里不重算，只让它立刻跟上新系数
+    if (this.running) this.applyPredator();
+  }
+
+  // 面板接口：单层倍率（0~2）与独奏（传 null 取消）。
+  setTrim(key, v) {
+    if (!(key in this.trim)) return false;
+    this.trim[key] = Math.max(0, Math.min(2, +v || 0));
+    this.applyMix(true);
+    return true;
+  }
+  setSolo(key) {
+    this.solo = (key && key in this.trim) ? key : null;
+    this.applyMix(true);
+    return this.solo;
+  }
+  // 当前系数 + 实际写下去的电平，面板与自动化验证都读它
+  get mixState() {
+    const n = this.nodes;
+    const g = (node) => (node ? +node.gain.value.toFixed(5) : null);
+    return {
+      solo: this.solo,
+      trim: { ...this.trim },
+      gains: n ? {
+        drone: g(n.droneGain), pad: g(n.padGain), kick: g(n.pulseGain), hat: g(n.hatGain),
+        bassPluck: g(n.bassPluckGain), shimmer: g(n.shimmerGain),
+        bassDrone: g(n.bassGain), orbit: g(n.orbitGain)
+      } : null
+    };
   }
 
   tick() {
@@ -1162,7 +1239,7 @@ export class FlockMusic {
       g.gain.linearRampToValueAtTime(peak, t + atk);
       g.gain.setValueAtTime(peak, t + Math.max(atk, dur - rel));
       g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-      o.connect(g); g.connect(n.padLp); g.connect(n.send);
+      o.connect(g); g.connect(n.padLp); g.connect(n.padSend);
       o.start(t); o.stop(t + dur + 0.05);
     }
   }
@@ -1197,7 +1274,7 @@ export class FlockMusic {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.18 + Math.random() * 0.07, t + 0.004);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
-    src.connect(hp); hp.connect(g); g.connect(n.pulseGain);
+    src.connect(hp); hp.connect(g); g.connect(n.hatGain);
     src.start(t, Math.random() * 0.9, 0.07);
     this.counts.hat++;
   }
@@ -1232,7 +1309,7 @@ export class FlockMusic {
     g.gain.setValueAtTime(0.0001, t);
     g.gain.exponentialRampToValueAtTime(0.8, t + 0.02);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 1.5);
-    o.connect(g); g.connect(n.shimmerGain); g.connect(n.send);
+    o.connect(g); g.connect(n.shimmerGain); g.connect(n.shimSend);
     o.start(t); o.stop(t + 1.6);
     this.counts.shimmer++;
   }

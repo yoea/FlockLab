@@ -53,7 +53,7 @@ flocklab/
 ├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 4050 行，核心）
 ├── js/forces.js        邻域受力（约 380 行，全项目最热的一段；单核与 Worker 共用同一份实现）
 ├── js/sim-worker.js    多核 Worker 壳（约 120 行，只调 forces.js，不含任何规则逻辑）
-├── js/audio.js         Web Audio 九类事件音效 + 空间化（声像/混响）+ 七层生成式音乐（约 1100 行）
+├── js/audio.js         Web Audio 九类事件音效 + 空间化（声像/混响）+ 七层生成式音乐 + 逐层调音台（约 1310 行）
 ├── js/grass.js         草地几何、谐波轮廓、面积校准、着色（约 180 行）
 ├── js/backdrop.js      背景地貌（草地斑 / 河流 / 村庄剪影）+ 漂移云层（约 250 行）
 ├── js/version.js       **生成的**构建元数据（版本 / commit / 构建时间 / 作者），勿手改
@@ -474,6 +474,38 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
   72BPM、每小节 8 个八分音符 ⇒ 一小节 3.33s，kick 理论值约 36 次/分（第 1、3 拍各一记）；
   实测 24 秒 14 次（理论 14.4）即为正确。
 
+### 3.9i 逐层调音台（v1.4.25）
+
+起因是一次**判断失误**：用户说「背景里的嗡嗡声降一下」，按频段排除后断定是 ① drone（110Hz 持续正弦），
+降了 6dB；他再听还在，采样 `bassGate` 才确认真正响的是 ⑤ bass 长音。**耳朵在用户那边，推断只能当假设。**
+所以做的不再是「继续猜着调」，而是把每层拆成可听、可独奏的滑块。
+
+- **系数而非新电平**：`FlockMusic.trim[key]`（0~2，1 = 原样）乘在原有设计电平上，
+  `eff(key)` 统一算「本层有效倍率」（独奏时非本层返回 0），`applyMix(fast)` 一处把所有层写一遍。
+  **好处**：音高、包络、门控、随聚集度变化的公式一行都不用改，还原就是系数回 1；坏处是没有，
+  因为它压根不进入那些公式本身。
+- **两种时间常数**：`applyMix(true)` 用 60ms（拖滑块要立刻听见），`applyMix(false)` 用各层原来的
+  0.35~0.9s（那是「呼吸」，不能让调音把它变成阶跃）。`update()` 里只保留滤波器截止频率，电平交给 `applyMix`。
+- **必须补的两个节点**（少了独奏就不干净）：
+  1. 闭镲原来与 kick 共用 `pulseGain`，一个高频「嚓」一个低频「咚」根本没法分听 → 拆出 `hatGain`；
+  2. pad / shimmer 的混响送出原来是**音符节点直连 `send`**，把本层拉到 0 后仍有混响尾巴 →
+     改为 `padSend` / `shimSend` 两个跟随本层系数的节点。**也不能接在 `padGain` 之后**，
+     那是 0.004~0.016 的设计电平，送进去等于没有混响。
+- **存档分两半**：滑块值存 `localStorage['flocklab.mix.v1']`，**独奏不存**。
+  独奏一开就只剩一层，面板要是也关着，用户只会觉得「音乐坏了」——这类「状态在暗处」比丢一次设置更糟。
+- **`audio.applySfxGain()` 统一出口**：音效总线电平 = 出厂 1.5 × `sfxTrim`。
+  写 `fxBus` 的地方（`enable()` 建图、`applyDefaults()`）都走它，否则「恢复出厂」会把调音台的设置悄悄抹掉。
+
+**无头环境的一个大坑（别再拿它验衰减时间）**：CDP 里没有真实音频输出时，
+`AudioParam` 的自动化**不随墙钟推进**——`setTargetAtTime` 排一次后数值就冻住，只有下一次写入才前进一步。
+实测：单次调度后 hat 增益在 0.56 冻了 2.8 秒，恢复每帧写入才一路走到 0。
+所以无头验证只能看**末态**（独奏后其余层是否为 0）与**读数**，别断言「0.4 秒内衰减到 −40dB」。
+
+**面板实现**：`#mixer` 静态骨架在 `index.html`，行由 `js/main.js` 的 `MIX_LAYERS` 生成（一处定义，标签与层名不会两头写重），
+每行 `input[type=range]` 走 `input`（实时听）+ `change`（落盘）两个事件；`S` 键互斥（再点取消）。
+位置与控制台一致（右下、按钮上方），**开一个就收起另一个**（`gui.close()`），否则两层面板正面叠住；
+`body.ui-hidden` 时跟其它界面一起淡出，拖动滑块会 `wake()` 重新计时，不会拖到一半消失。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
@@ -565,6 +597,7 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 **音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0–1.5)` / `music.running` / `paused` / `pauseSim(on)`（等价于点暂停按钮，暂停时音乐一起停）
 **空间音频（v1.4.21）**：`audioSpatial` → `{view:{x,y,halfW}, lastPan, reverb}`（v1.4.23 起不再有 `texture`，密度层已删除）；`panAt(x)` 把世界 X 换算成声像（左右各夹在 ±0.92），用来核对「左边的鸟在不在左边」。`view` 每帧由 `audio.setView(camX, camY, orthoCam.right)` 喂入，所以它本身就是「相机是否与音频对齐」的证据。
 **调音（v1.4.22 / v1.4.23）**：`dashTest(amp = 0.85)` 立刻把「捕食者加速」四层音在视野中心偏左响一次（不必等真扑击，适合反复听层次）；`musicState.drone` 读 drone 层实际增益；`musicState.beat` → `{kickBus, bassBus}` 读鼓点 / 贝斯两条总线的增益（两者都要求很轻，看数比听感稳）。
+**调音台（v1.4.25）**：`mixer` → `{solo, pct{8 层 + sfx}, gains{drone…orbit}, sfxTrim, open}`——`gains` 是**实际写进 AudioParam 的电平**，验「独奏是否真的只剩一层」看它；`setMix(key, pct)` 等价于拖那条滑块（0~200），`soloMix(key|null)` 切换独奏，`openMixer(on)` 开关面板。注意 headless 下 AudioParam 自动化不推进（见 §3.9i），只能看末态。
 
 **出生动画 / 背景**：`hatchPending`（还在涌出中的个体数，加载后应逐渐归 0）/ `respawn(n)`（立刻让 n 只原地重生，验证涌出动画）/ `backdrop`（背景层本体：`uniforms.uGain` 拉高可看清地貌形状，`uniforms.uGN=0` 可 A/B 对比草地避让）
 

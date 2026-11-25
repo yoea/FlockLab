@@ -8,7 +8,7 @@
 
 // 缓存代次：跟产品版本走。每次发版改这一行，旧缓存在新 SW 激活时整批清掉，
 // 装成应用的用户重开一次就能拿到新代码（不依赖 stale-while-revalidate 的第二次刷新）。
-const VER = 'v1.4.24';
+const VER = 'v1.4.25';
 const CACHE = `flocklab-${VER}`;
 
 // 应用壳：离线也必须能起来

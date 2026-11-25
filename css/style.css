@@ -133,6 +133,7 @@
   body.ui-hidden #hud:not(.pinned),
   body.ui-hidden #topbar .ico:not(#uiBtn),
   body.ui-hidden #topbar .sep,
+  body.ui-hidden #mixer,
   body.ui-hidden .lil-gui.root {
     opacity: 0; visibility: hidden; pointer-events: none;
     transition: opacity .45s ease, visibility 0s linear .45s;
@@ -408,6 +409,72 @@
     background: #05070f; color: #ffb4b4; font-size: 14px; text-align: center; line-height: 1.8;
   }
 
+  /* ---------------------------------------------------------------- 音量调试面板（v1.4.25）
+     位置与 lil-gui 控制台一样贴右下、叠在图标按钮上方，但两者不同时展开
+     （打开一个就把另一个收起），否则两层面板会正面叠住。
+     行的内容由 js/main.js 按音频层表生成。 */
+  #mixer {
+    position: fixed; right: 18px; bottom: 68px; z-index: 9;
+    width: 292px; max-height: 70vh;
+    display: flex; flex-direction: column;
+    opacity: 0; visibility: hidden; pointer-events: none;
+    transform: translateY(8px);
+    transition: opacity .28s ease, transform .28s ease, visibility .28s ease;
+  }
+  #mixer.open { opacity: 1; visibility: visible; pointer-events: auto; transform: none; }
+  .mix-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 10px 8px 14px; border-bottom: 1px solid var(--line);
+  }
+  .mix-title { font-size: 12px; font-weight: 600; letter-spacing: .08em; }
+  .mix-solo-tag {
+    font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 999px;
+    color: #08131f; background: var(--accent);
+    opacity: 0; transition: opacity .2s ease;
+  }
+  #mixer.has-solo .mix-solo-tag { opacity: 1; }
+  .mix-x {
+    margin-left: auto; width: 26px; height: 26px; padding: 0;
+    border-radius: 50%; background: none; border: 1px solid transparent;
+    color: var(--dim); font-size: 16px; line-height: 1; cursor: pointer;
+  }
+  .mix-x:hover { color: var(--ink); border-color: var(--line); }
+  .mix-tip { margin: 8px 14px 0; font-size: 10.5px; line-height: 1.5; color: var(--dim); }
+  .mix-tip b { color: var(--ink); font-weight: 600; }
+  #mixBody { padding: 2px 12px 8px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .mix-row { padding: 4px 2px; }
+  .mix-row + .mix-row { border-top: 1px solid rgba(126, 170, 235, 0.10); }
+  .mix-line { display: flex; align-items: center; gap: 6px; }
+  .mix-name {
+    flex: 1; min-width: 0; font-size: 11.5px; color: var(--ink);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .mix-val { font-size: 10.5px; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .mix-solo {
+    width: 21px; height: 21px; padding: 0; border-radius: 6px; cursor: pointer;
+    font-size: 10px; font-weight: 700; color: var(--dim);
+    background: rgba(46, 66, 100, 0.5); border: 1px solid transparent;
+  }
+  .mix-solo:hover { color: var(--ink); }
+  .mix-row.soloing .mix-solo { color: #08131f; background: var(--accent); border-color: var(--accent); }
+  .mix-row.soloing .mix-name { color: var(--accent); }
+  .mix-row.dim { opacity: .34; }
+  .mix-slider {
+    display: block; width: 100%; height: 16px; margin: 1px 0 0;
+    accent-color: var(--accent); cursor: pointer; background: none;
+  }
+  /* 音效总线单独分组：它是「事件音」，和背景音乐不是一回事，调色也不同 */
+  .mix-row.sfx { margin-bottom: 3px; }
+  .mix-row.sfx .mix-name { color: #ffcf8a; }
+  .mix-foot { padding: 8px 12px 10px; border-top: 1px solid var(--line); }
+  .mix-foot button {
+    width: 100%; height: 30px; border-radius: 8px; cursor: pointer;
+    font-size: 11.5px; color: var(--ink);
+    background: rgba(46, 66, 100, 0.6); border: 1px solid var(--line);
+  }
+  .mix-foot button:hover { background: rgba(64, 92, 138, 0.75); }
+  #mixBtn.on { border-color: rgba(99, 230, 255, 0.72); box-shadow: 0 0 16px rgba(99, 230, 255, 0.16); }
+
   .lil-gui {
     --background-color: rgba(9, 15, 29, 0.82);
     --widget-color: rgba(46, 66, 100, 0.85);
@@ -452,6 +519,14 @@
   body.touch .lil-gui .controller { min-height: 30px; }
   body.touch .lil-gui .controller input,
   body.touch .lil-gui .controller .slider { touch-action: none; }
+
+  /* 触控屏上的调音台：滑块和 S 键都放大到能稳定点中 */
+  body.touch .mix-row { padding: 5px 2px; }
+  body.touch .mix-name { font-size: 12.5px; }
+  body.touch .mix-val { font-size: 11.5px; }
+  body.touch .mix-solo { width: 27px; height: 27px; font-size: 11px; }
+  body.touch .mix-slider { height: 22px; touch-action: none; }
+  body.touch .mix-x { width: 32px; height: 32px; }
 
   @media (max-width: 720px) {
     #brand { left: 12px; top: 12px; padding: 6px 12px 6px 9px; }
@@ -522,6 +597,17 @@
     #hud .bar.mini { width: 26px; }
     #hud .pc .pv { min-width: 24px; }
     #hud .hud-perf { gap: 3px 7px; }
+
+    /* 音量调试面板：同样贴底整宽，但比控制台矮一点，上方仍能看到鸟群 */
+    #mixer {
+      left: max(6px, env(safe-area-inset-left));
+      right: max(6px, env(safe-area-inset-right));
+      width: auto; bottom: calc(54px + env(safe-area-inset-bottom));
+      max-height: 62vh;
+      background: rgba(8, 13, 25, 0.97);
+      backdrop-filter: blur(18px) saturate(150%);
+      -webkit-backdrop-filter: blur(18px) saturate(150%);
+    }
 
     /* 控制台：贴底整宽，限高 52vh，内部滚动 */
     .lil-gui.root {

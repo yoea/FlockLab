@@ -2484,7 +2484,7 @@ function applyDefaults() {
   syncGrassVisibility();
   liftAllResting();
   music.setLevel(params.musicLevel);
-  if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel, audio.ctx.currentTime, 0.08);
+  audio.applySfxGain();   // 出厂刻度 × 调音台倍率（调音台的设置不该被「恢复出厂」抹掉）
   // multiCore 不是「读 params 就生效」的参数：必须真的建 / 拆 worker 池。
   // 少了这一句，重置后面板显示「开」但实际还在单核跑，要刷新才恢复。
   setMultiCore(params.multiCore);
@@ -2492,6 +2492,127 @@ function applyDefaults() {
   saveParams();
   resetBoids();
 }
+
+// ---------------------------------------------------------------- 音量调试面板
+// 为什么要有它：前几轮判断「用户听到的是哪一层」，只能靠频段排除 + 采样包络，
+// 有一次就判断错了——把 drone 降了 6dB，真正响的却是 ⑤ bass 长音。耳朵在用户那边，
+// 与其继续推，不如把每层做成一条滑块 + 一个独奏键，让他两下就能指出来。
+// 系数是「乘在设计电平上的倍率」，不改任何一层的声音性格，随时能还原。
+const MIX_KEY = 'flocklab.mix.v1';
+// 层编号与 README 的①…⑥一致，方便对照文字描述
+const MIX_LAYERS = [
+  ['drone', '① drone 低频底', '110Hz（A2）+ 五度的持续正弦，常驻不歇，0.07Hz 极慢呼吸'],
+  ['pad', '② pad 和声', '正弦音簇：开放五度 → 小三和弦 → 加九度，每两小节换一次'],
+  ['kick', '③ kick 鼓点', '每小节第 1 拍强、第 3 拍弱；纯正弦 92→44Hz'],
+  ['hat', '③c 反拍闭镲', '6.2kHz 以上的噪声 45ms，抱团后才出现'],
+  ['bassPluck', '③b 节奏贝斯', '跟 kick 走的短低音，A1 55Hz（偶尔跳到五度）'],
+  ['shimmer', '④ shimmer 泛音点', '零星的高音亮点，1.5 秒衰减，只在抱团时出现'],
+  ['bassDrone', '⑤ bass 长音', '每隔几秒浮上来、响几秒的那层（渐入 3~5.5s / 保持 5~13s / 落下 3.5~6.5s）'],
+  ['orbit', '⑥ orbit 盘旋声', '只在猛禽活跃时出现，越饿越近越明显，声像缓慢左右游走']
+];
+const mixPct = {};          // 面板刻度（0~200%），100 = 设计电平原样
+for (const [k] of MIX_LAYERS) mixPct[k] = 100;
+mixPct.sfx = 100;
+let mixSolo = null;
+{
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(MIX_KEY) || 'null'); } catch (_) { saved = null; }
+  if (saved && typeof saved === 'object' && saved.trim && typeof saved.trim === 'object') {
+    for (const k in mixPct) {
+      const v = saved.trim[k];
+      if (typeof v === 'number' && isFinite(v)) mixPct[k] = Math.max(0, Math.min(200, Math.round(v)));
+    }
+  }
+}
+const mixerEl = document.getElementById('mixer');
+const mixBodyEl = document.getElementById('mixBody');
+const mixBtn = document.getElementById('mixBtn');
+const mixRows = new Map();
+
+function saveMix() {
+  try {
+    // 只存滑块值：独奏不跨刷新（见上面 loadParams 附近的说明）
+    localStorage.setItem(MIX_KEY, JSON.stringify({
+      trim: mixPct, open: mixerEl.classList.contains('open')
+    }));
+  } catch (_) { /* 隐私模式写不进去就只当次生效 */ }
+}
+
+// 把某个键的百分比写进音频层，并把面板显示同步过去（滑块 / 数字 / 置零灰显）
+function applyMixPct(key, pct, fromSlider) {
+  pct = Math.max(0, Math.min(200, Math.round(pct)));
+  mixPct[key] = pct;
+  const row = mixRows.get(key);
+  if (row) {
+    const slider = row.querySelector('.mix-slider');
+    if (!fromSlider) slider.value = String(pct);
+    row.querySelector('.mix-val').textContent = pct + '%';
+    row.classList.toggle('mute', pct === 0);
+  }
+  if (key === 'sfx') audio.setSfxTrim(pct / 100);
+  else music.setTrim(key, pct / 100);
+}
+
+function applyMixSolo(key) {
+  mixSolo = key && key in mixPct && key !== 'sfx' ? key : null;
+  music.setSolo(mixSolo);
+  mixerEl.classList.toggle('has-solo', !!mixSolo);
+  for (const [k, row] of mixRows) {
+    row.classList.toggle('soloing', k === mixSolo);
+    // 音效那一行不跟着变灰：独奏时正好能听出「还有声音 = 来自音效，不是音乐」
+    row.classList.toggle('dim', !!mixSolo && k !== mixSolo && k !== 'sfx');
+  }
+  saveMix();
+}
+
+function addMixRow(key, label, hint) {
+  const row = document.createElement('div');
+  row.className = 'mix-row' + (key === 'sfx' ? ' sfx' : '');
+  row.dataset.key = key;
+  row.title = hint || '';
+  row.innerHTML =
+    '<div class="mix-line">' +
+      '<span class="mix-name">' + label + '</span>' +
+      '<span class="mix-val"></span>' +
+      '<button class="mix-solo" type="button" title="只留这一层（再点一次取消）">S</button>' +
+    '</div>' +
+    '<input class="mix-slider" type="range" min="0" max="200" step="1" aria-label="' + label + ' 音量">';
+  const slider = row.querySelector('.mix-slider');
+  const soloBtn = row.querySelector('.mix-solo');
+  // input 连续触发（拖动时实时听），change 只在松手时落盘——避免每像素写一次 localStorage
+  slider.addEventListener('input', () => { wake(); applyMixPct(key, +slider.value, true); });
+  slider.addEventListener('change', () => { applyMixPct(key, +slider.value, true); saveMix(); });
+  if (key === 'sfx') soloBtn.style.display = 'none';
+  else soloBtn.addEventListener('click', () => {
+    wake();
+    applyMixSolo(mixSolo === key ? null : key);
+  });
+  mixRows.set(key, row);
+  mixBodyEl.appendChild(row);
+  applyMixPct(key, mixPct[key], false);
+}
+
+for (const [k, label, hint] of MIX_LAYERS) addMixRow(k, label, hint);
+addMixRow('sfx', '音效（事件音）', '捕食、加速逃逸、出生、起落等事件音的总音量；不受独奏影响');
+
+// 面板与 lil-gui 控制台占同一个位置，打开一个就把另一个收起
+function setMixerOpen(on) {
+  on = !!on;
+  mixerEl.classList.toggle('open', on);
+  mixerEl.setAttribute('aria-hidden', on ? 'false' : 'true');
+  mixBtn.classList.toggle('on', on);
+  if (on) gui.close();
+  saveMix();
+}
+mixBtn.addEventListener('click', () => { wake(); setMixerOpen(!mixerEl.classList.contains('open')); });
+document.getElementById('mixClose').addEventListener('click', () => { wake(); setMixerOpen(false); });
+document.getElementById('mixResetAll').addEventListener('click', () => {
+  wake();
+  applyMixSolo(null);
+  for (const key of mixRows.keys()) applyMixPct(key, 100, false);
+  saveMix();
+});
+// 面板默认收起：它是一个排查工具，不该每次进页面都占着屏幕。
 
 // ---------------------------------------------------------------- 空间哈希
 // 二维计数排序网格：每帧重建，但不分配任何对象。
@@ -4816,6 +4937,17 @@ window.FlockLab = {
       ...music.counts
     };
   },
+  // 音量调试面板的读数与直控（面板拖的就是这几个数）。
+  // 验证「独奏是不是真的只剩一层」用 gains 里那八个实际写入 AudioParam 的电平。
+  get mixer() {
+    return {
+      ...music.mixState, sfxTrim: +audio.sfxTrim.toFixed(3),
+      pct: { ...mixPct }, solo: mixSolo, open: mixerEl.classList.contains('open')
+    };
+  },
+  setMix(key, pct) { applyMixPct(key, pct, false); saveMix(); return mixPct[key]; },
+  soloMix(key) { applyMixSolo(key || null); return mixSolo; },
+  openMixer(on) { setMixerOpen(on === undefined ? true : on); return true; },
   get audioState() { return audio.ctx ? audio.ctx.state : null; },
   get masterGain() { return audio.master ? +audio.master.gain.value.toFixed(4) : null; },
   get audioOutputConnected() { return audio.outputConnected; },

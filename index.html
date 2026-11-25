@@ -67,6 +67,15 @@
       </svg>
     </button>
 
+    <button id="mixBtn" class="ico" type="button" title="音量调试：逐层试听" aria-label="音量调试：逐层试听">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path class="st" d="M3.6 6.6h16.8M3.6 12h16.8M3.6 17.4h16.8" />
+        <circle class="st" cx="9" cy="6.6" r="2.1" />
+        <circle class="st" cx="15.4" cy="12" r="2.1" />
+        <circle class="st" cx="8" cy="17.4" r="2.1" />
+      </svg>
+    </button>
+
     <button id="audioBtn" class="ico muted" type="button" title="开启声音与音乐" aria-label="开启声音与音乐">
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path class="spk" d="M4 9h4l5-4v14l-5-4H4z" />
@@ -74,6 +83,22 @@
         <path class="cross" d="M17 9.5l5 5M22 9.5l-5 5" />
       </svg>
     </button>
+  </div>
+
+  <!-- 音量调试面板：把背景音乐的每一层与音效总线各给一条滑块，
+       S（独奏）= 只留这一层、别的全静音。用来回答「到底哪一个声音在响」，
+       不必再靠频段和包络去猜。行由 js/main.js 按音频层表生成，避免两处写重。 -->
+  <div id="mixer" class="glass" aria-hidden="true" aria-label="音量调试面板">
+    <div class="mix-head">
+      <span class="mix-title">音量调试</span>
+      <span class="mix-solo-tag">独奏中</span>
+      <button id="mixClose" class="mix-x" type="button" aria-label="关闭面板">×</button>
+    </div>
+    <p class="mix-tip">拖动试听，<b>S</b> = 只留这一层（再点取消）。改动会记住。</p>
+    <div id="mixBody"></div>
+    <div class="mix-foot">
+      <button id="mixResetAll" type="button">全部恢复 100%</button>
+    </div>
   </div>
 
   <div id="about" aria-hidden="true">
