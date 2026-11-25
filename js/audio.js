@@ -1137,9 +1137,9 @@ export class FlockMusic {
     n.padSend.gain.setTargetAtTime(PAD_TRIM * this.eff('pad'), t, k(0.5));
     n.shimSend.gain.setTargetAtTime(this.eff('shimmer'), t, k(0.6));
     // 鼓点与贝斯都很轻：作用是把拍子垫出来，不是当主角。
-    n.pulseGain.gain.setTargetAtTime((0.010 + 0.018 * c) * this.eff('kick'), t, k(0.4));
+    n.pulseGain.gain.setTargetAtTime((0.007 + 0.011 * c) * this.eff('kick'), t, k(0.4));
     n.hatGain.gain.setTargetAtTime(this.eff('hat'), t, k(0.4));
-    n.bassPluckGain.gain.setTargetAtTime((0.010 + 0.016 * c) * this.eff('bassPluck'), t, k(0.6));
+    n.bassPluckGain.gain.setTargetAtTime((0.007 + 0.010 * c) * this.eff('bassPluck'), t, k(0.6));
     n.shimmerGain.gain.setTargetAtTime((0.0012 + 0.012 * Math.max(0, c - 0.28)) * this.eff('shimmer'), t, k(0.6));
     // 常驻低音长音：用户确认「每隔几秒浮上来、响几秒」的嗡嗡声就是它，已降到只剩底衬。
     n.bassGain.gain.setTargetAtTime((0.00022 + 0.00051 * c) * this.eff('bassDrone'), t, k(0.9));
