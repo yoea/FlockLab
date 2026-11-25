@@ -432,7 +432,7 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **视角与坐标**：`view` / `displayRect`（活动边界半宽高）/ `orthoHalfH` / `toWorld(cx, cy)`（屏幕像素 → 世界坐标）/ `xyExtent` / `bound`
 
-**群体状态**：`count` / `paused` / `orderParam`（Vicsek 有序度 Φ）/ `groupRms` / `cohesion` / `density` / `avgSpeed` / `temperature` / `pressure` / `groupAlert` / `fleeingCount` / `sprintingCount` / `sprintCount` / `sprintingPositions` / `maxAbsZ` / `newbornCount`
+**群体状态**：`count` / `paused` / `orderParam`（Vicsek 有序度 Φ）/ `groupRms` / `cohesion` / `density` / `avgSpeed` / `temperature` / `pressure` / `groupAlert` / `fleeingCount` / `sprintingCount` / `sprintCount` / `sprintingPositions` / `maxAbsZ` / `newbornCount` / `recoveringCount` / `avgStamina`（已归一化 0~1）/ `staminaState`
 
 **间距与密度分布（判断「有没有叠在一起」）**：
 - `sepStats` → `{n, p05, p25, p50, p75, p95, below03, below05}`：每只鸟到最近邻的距离分位数，`below05` = 视觉重叠占比
@@ -445,7 +445,12 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时 / `cooling`(吃饱冷却中) / `givingUp`(扑空拉起中)）、`predatorLocks`（锁定目标索引 `target` + 该鸟当前的描边粗细倍数 `thick`，1 = 正常、被锁定约 2.0~2.35 + 已锁定秒数 `locked`）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 14 rad/s² 限制（撞墙反弹那一帧除外）。转弯半径看 `speed / |turnRate|`：滑翔/巡航/追击应落在 5~6 单位、俯冲约 10（v1.4.18 之前恒为 11）；连续采样里 `turnRate` 的符号翻转率应接近 0（翻转多说明在目标两侧来回摆头）。排查「捕食者在空处打转」看 `cooling`/`givingUp` 两个布尔：冷却期的巡逻点是以鸟群质心为圆心的切向环带（半径 10~26），不该出现「朝一个方向直线飞出几十单位」；被锁定的鸟在 `predatorLocks.thick` 上应读到 >2（1 就是没高亮），并在画面上表现为**变红 + 描边加粗**——锁定标记直接画在箭头自己身上，不再有单独的聚焦框。`FlockLab.respawnOn` / `setRespawnOn(bool)` 控制「被吃后是否补一只」：关掉后 `deadCount` 只增不减、HUD 元素数量显示 `存活/设定`。
 
-**捕杀特效（v1.4.18）**：`spawnBurst()` + `killBursts` 池，一次「短白核爆闪 + 72 个多色粒子」。粒子用 `Points`（径向渐变贴图 + 顶点色）与 `LineSegments`（每颗火星一根从 55% 半径到粒子的短尾）两组几何；运动是 `r = v0·(1−e^{−kt})/k`（阻尼，终值 `v0/k`），每个粒子另有独立初速/寿命/起飞延迟，颜色按各自寿命 `(1−lt)^1.7` 衰减到 0 —— 加法混合下颜色归零就等于熄灭，不需要逐点 alpha。想调爆炸大小改 `v0` 与 `FW_DAMP`（终半径 = v0/k），想调密度改 `FW_N`。
+**逃逸体力（v1.4.19，双格制）**：`stamina` 存的是 **0~2 的格数**（`STAMINA_MAX`），每段冲刺 `-= 1`。起爆要同时满足 `stamina >= 1 && time >= sprintUntil`，且满足其一：满格（`>= STAMINA_MAX-0.01`，任意距离）= **完整冲刺**（`sprintDuration` × `sprintSpeed`）；只剩 1 格时必须在 `dist < fleeRange × SECOND_WIND_R`（0.60，默认 5.7 单位）以内 = **恐慌二段**（时长 ×0.75、速度 ×0.93）。二段的速度上限写在 `sprintCap[i]`，**不进 worker**——`forces.js` 仍按全局 `sprintSpeed` 给逃逸力，真正的截断在主线程积分那一步（`topSpeed = sprinting ? (sprintCap[i] || sprintSpeed) : ...`）。恢复：`stamina < 1` 用 `sprintRecovery` 秒/格，`>= 1` 用 `1.8 ×` 秒/格，所以「完整 + 二段」烧完要 8.4 秒回满，二段是攒出来的。**改体力逻辑时必查三处**：`PRED_SCORE_TIRED` 的输入要归一化 `1 - stamina/STAMINA_MAX`（否则半格会被当成满格，索敌评分失真）；死亡、`spawnFar` 重生、面板重置要同时清 `stamina/sprintCap/sprintTier`；`sprintingFull`/`sprintingSecond` 要和 `sprintingCount` 同帧清零累加（多核下是「本帧 dispatch、下帧收尾」，放错地方会永远是 0）。`staminaState` → `{full, half, empty, secondWindTotal, avg}`，`avg` 归一化到 0~1，和 v1.4.18 的曲线可直接对比。
+
+**捕杀特效（v1.4.19）**：`spawnBurst(x, y, z, now, ix, iy)` + `killBursts` 池，一次「有方向的撞碎」。`ix/iy` 是**撞轴**（捕食者速度方向；速度≈0 时退化为「捕食者→猎物」）。每个池位一套 `InstancedMesh`（48 片三角碎屑）+ 一张 `PlaneGeometry` 白芒：
+- **碎片**：方向 = 撞轴 + 锥形偏角（`SHARD_SPREAD` = 0.95 rad ≈ ±54°），14% 走逆溅分支朝来向崩回；位置 `r = v0·(1−e^{−kt})/k` 叠加 `SHARD_PUSH × t` 的撞轴位移（这一项才是「被撞飞」而不是「原地爆炸」）；每片另有自转 `spin`、初始角 `ang0`（偏向撞轴）、起点沿撞轴垂线的偏移 `off`。颜色按 `(1−lt)^0.75 × (1 − min(0.45, r/22))` 衰减，所以锥形根部亮、外沿暗。
+- **白芒**：长轴沿撞轴、位置沿撞轴前移 0.42 个身长（落在「撞过去的方向」而不是两侧平分），用**普通混合**而不是加法混合——加法在深色背景上只能提亮一点，看着像灰烟。
+- 撞轴直接决定一切：`0°` 与 `225°` 两次生成的碎法互为镜像，改 `SHARD_N` 调密度、`SHARD_DAMP` 调飞散距离（终值 `v0/k`）、`SHARD_PUSH` 调撞飞位移。
 
 **警戒圈**：`THREAT_RING_SHOWN=false` 只关绘制；`ringState` 里的 `heat`/`alpha`/`radius` 仍按 `params.fleeRange` 实时计算，`drawn` 字段标明当前是否画出来。逃逸判定在 `forces.js`，与这个 mesh 无关。
 
@@ -622,6 +627,10 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 ---
 
 ## 8. 版本历史（要点）
+
+> v1.4.14 之后的版本（v1.4.15 猛禽飞行动力学、v1.4.16 锁定框、v1.4.17 变红加粗、
+> v1.4.18 急转与烟花、v1.4.19 双格体力与撞碎特效）只记在 `README.md` 的版本表里，
+> 这里保留到 v1.4.14 的旧表不再追加。
 
 | 版本 | 要点 |
 | --- | --- |

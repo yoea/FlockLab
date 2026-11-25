@@ -249,10 +249,20 @@ const caught = new Uint8Array(MAX_N);           // 1=已被捕食，等待重新
 const respawnAt = new Float64Array(MAX_N);      // 重新出生的时间戳（ms），0 表示无需等待
 const birthAt = new Float64Array(MAX_N);       // 新生时间戳：-Infinity 表示普通个体
 birthAt.fill(-Infinity);
-// 逃逸体力：1=满，0=耗尽。爆发结束后按 sprintRecovery 秒恢复，未回满不能再爆发。
+// 逃逸体力：双格制（v1.4.19）。满 2 格，每段冲刺消耗 1 格。
+// 满格起爆 = 完整冲刺；只剩 1 格时必须贴身才能起爆，而且更短、更慢——这就是「恐慌二段」。
+// 恢复分两档：第 1 格 sprintRecovery 秒、第 2 格 1.8 倍，所以二段是「攒」出来的，
+// 不是随手可用的一次白送；也不会出现原来那种「10% 骰子连出五段」的长链。
+const STAMINA_MAX = 2;
+const SECOND_WIND_R = 0.60;        // 二段起爆的距离门槛（× fleeRange）
+const SECOND_WIND_DUR = 0.75;      // 二段时长系数（× sprintDuration）
+const SECOND_WIND_SPD = 0.93;      // 二段速度系数（× sprintSpeed）
+const SECOND_WIND_RECOVER = 1.8;   // 第 2 格恢复时长系数（× sprintRecovery）
 const stamina = new Float32Array(MAX_N);
-stamina.fill(1);
+stamina.fill(STAMINA_MAX);
 const sprintUntil = new Float64Array(MAX_N);   // 爆发到期时间（ms）
+const sprintCap = new Float32Array(MAX_N);     // 本段冲刺的速度上限（基准值，不含个体抖动）
+const sprintTier = new Uint8Array(MAX_N);      // 0=没在冲 1=完整冲刺 2=恐慌二段
 // 反应延迟：看到捕食者不等于立刻爆发。每只鸟有一个「危险感知计时器」，
 // 距离越近需要的累积时间越短（贴身约 45ms，感知圈边缘约 260ms，按距离平方过渡），
 // 再乘个体反应系数 0.78~1.32。这样爆发是从捕食者身边向外一圈圈亮起来，
@@ -374,6 +384,9 @@ function rollTraits(i) {
 const capNow = new Float32Array(MAX_N);        // 每只鸟当前生效的速度上限（只用于调试采样）
 capNow.fill(params.maxSpeed * 0.78);
 let sprintCount = 0, sprintingCount = 0;
+// 冲刺中再按「完整 / 恐慌二段」拆开计数：HUD 的「爆发中」是一个总数，
+// 拆开之后才知道那一数字里有多少是贴脸拼命、多少是正常起爆。
+let sprintingFull = 0, sprintingSecond = 0, secondWindCount = 0;
 let cohesion01 = 0;   // 0=散开 1=紧团
 let restingCount = 0;  // 当前在草地上休息的数量（HUD/调试用）
 // 上一帧的群体半径（RMS），用于相干度与群体尺度
@@ -591,7 +604,8 @@ function initBoids(from, to, isBirth = false) {
     birthAt[i] = isBirth ? performance.now() : -Infinity;
     // 出生动画错峰 0~900ms：开局 / 改数量时不是「啪」地一次全亮出来，而是一层层涌出来
     hatchAt[i] = performance.now() + (isBirth ? 0 : Math.random() * 900);
-    stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
+    stamina[i] = STAMINA_MAX; sprintUntil[i] = 0; sprintCap[i] = 0; sprintTier[i] = 0;
+    capNow[i] = params.maxSpeed * 0.78;
     alertMs[i] = 0; trailNextAt[i] = 0; birdTrailP[i] = 0;
     resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
     restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
@@ -636,7 +650,8 @@ function spawnFar(i, now) {
   birthAt[i] = now;
   hatchAt[i] = now;
   birthWisp(bestX, bestY, now);
-  stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
+  stamina[i] = STAMINA_MAX; sprintUntil[i] = 0; sprintCap[i] = 0; sprintTier[i] = 0;
+  fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
   alertMs[i] = 0; trailNextAt[i] = 0;
   resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
   restSwapAt[i] = Infinity; restFleeAt[i] = Infinity;
@@ -1881,19 +1896,19 @@ addEventListener('pointermove', (e) => {
   mouseTgt.x = w.x; mouseTgt.y = w.y;
 }, { passive: true });
 
-// 捕杀特效：烟花式炸开（v1.4.18）。
-// 原来是「白核 + 两个扩张圆环 + 10 个单色火花」，俯视图里像水波纹、缺少冲击感。
-// 现在改成：一次极短的白核爆闪（撞击那一下）+ 几十个**多色**粒子各自带阻尼向外炸开、
-// 按各自寿命熄灭。粒子用一张径向渐变贴图（圆点、边缘透明）+ 顶点色，加法混合下
-// 一个 draw call 就够，颜色衰减靠写顶点色（累加到 0 就等于熄灭，不用逐点 alpha）。
-const FW_N = 72;                // 每次爆炸的粒子数（要够密，才像一朵炸开的花而不是撒了一把纸屑）
-const FW_DAMP = 3.6;            // 阻尼：r(t) = v0·(1−e^{−kt})/k，越飞越慢，不会匀速飞出去
-const FW_G = 1.2;               // 轻微下坠：俯视图里给一点「落下来」的重量感（幅度很小）
-// 炸开的最终半径 = v0/k（5.5~9.5 那档只有 1.9 单位，比鸟大不了多少、看着像一层光晕），
-// 所以初速要抬到 12~26、阻尼降到 3.6，终值 ≈ 3.3~7.2 单位，才是一朵炸得开的烟花。
-const FW_COLORS = [0xffd166, 0xff8a3d, 0xff4d9d, 0x7ce7ff, 0xa78bfa, 0x8dff7a];
-const burstCoreGeo = new THREE.CircleGeometry(1, 32);
-// 圆形柔边点：默认 Points 是硬边方块，炸开时能看到一格格的像素块。
+// 捕杀特效：撞击撞碎（v1.4.19）。
+// 烟花是各向同性的——不管捕食者从哪个方向撞上来，炸出来的都是一朵圆花，俯视图里
+// 看不出「谁撞的、从哪来」。现在改成有方向的撞碎：
+//   · 撞轴 = 捕食者速度方向。碎片沿撞轴锥形抛出（±54°），整团再沿撞轴被推走一段；
+//   · 每片碎屑是一枚自转的小三角，初始朝向偏向撞轴，飞散途中越转越偏；
+//   · 撞击瞬间在撞轴上拉出一道柔边白芒，长轴方向就是攻击方向。
+// 于是「从右往左撞」和「从下往上撞」的碎裂方式完全不同，动画本身就在讲方向。
+const SHARD_N = 48;             // 每次撞碎的碎片数
+const SHARD_DAMP = 3.2;         // 阻尼：r(t) = v0·(1−e^{−kt})/k，碎片越飞越慢
+const SHARD_PUSH = 3.6;         // 整团沿撞轴的「撞飞」位移速度（单位/秒，线性）
+const SHARD_SPREAD = 0.95;      // 锥形半角（rad ≈ ±54°）
+const SHARD_HIT = 0.028;        // 撞击到碎裂的极短停顿：先「顶一下」再炸开
+// 柔边圆贴图：给白芒做径向衰减，免得那道亮痕是个硬边矩形。
 const fwTex = (() => {
   const c = document.createElement('canvas');
   c.width = c.height = 64;
@@ -1909,76 +1924,121 @@ const fwTex = (() => {
   return tex;
 })();
 const tmpFwCol = new THREE.Color();
+// 碎片形状：一个扁长的三角，指向 +x，和鸟的箭头同源——碎的是「那只鸟」。
+const shardGeo = new THREE.BufferGeometry();
+shardGeo.setAttribute('position', new THREE.Float32BufferAttribute([
+  -0.52, -0.34, 0,
+   0.64,  0.02, 0,
+  -0.52,  0.34, 0
+], 3));
+const shardMat = new THREE.MeshBasicMaterial({
+  transparent: true, opacity: 0.86, side: THREE.DoubleSide,
+  depthWrite: false, fog: false
+});
 const killBursts = [];
+// 每帧复用：14 个 burst × 48 片 = 672 次矩阵合成，不能每次都 new。
+const _shM = new THREE.Matrix4();
+const _shQ = new THREE.Quaternion();
+const _shV = new THREE.Vector3();
+const _shS = new THREE.Vector3();
+const _shZ = new THREE.Vector3(0, 0, 1);
 for (let b = 0; b < 14; b++) {
-  const common = {
-    transparent: true, side: THREE.DoubleSide, depthWrite: false,
-    blending: THREE.AdditiveBlending, fog: false
-  };
-  const core = new THREE.Mesh(burstCoreGeo, new THREE.MeshBasicMaterial({ ...common, color: 0xfff1d8, opacity: 0 }));
-  const sparkGeo = new THREE.BufferGeometry();
-  sparkGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 3), 3));
-  sparkGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 3), 3));
-  const sparks = new THREE.Points(sparkGeo, new THREE.PointsMaterial({
-    size: 11, sizeAttenuation: false, vertexColors: true, map: fwTex,
-    transparent: true, opacity: 1, depthWrite: false,
-    blending: THREE.AdditiveBlending, fog: false
+  const shards = new THREE.InstancedMesh(shardGeo, shardMat, SHARD_N);
+  shards.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  shards.frustumCulled = false;
+  shards.visible = false;
+  tmpFwCol.setHex(0xffffff);
+  for (let s = 0; s < SHARD_N; s++) shards.setColorAt(s, tmpFwCol);
+  shards.instanceColor.needsUpdate = true;
+  scene.add(shards);
+
+  // 白芒：一张柔边圆片，沿撞轴拉成细长的椭圆，几十毫秒内收干净。
+  // 用普通混合而不是加法混合——加法在深色背景上只能「提亮一点」，看着像一缕灰烟；
+  // 普通混合的纯白才是「撞上去那一下」该有的实心亮。
+  const flash = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
+    map: fwTex, color: 0xffffff, transparent: true, opacity: 0,
+    depthWrite: false, side: THREE.DoubleSide, fog: false
   }));
-  // 火花尾：每个粒子一根从内到外的短线段（WebGL 线宽固定 1px，配合圆点正好是一颗
-  // 「带尾巴的火星」）。只画外半段，不然整团会糊成一个发光的饼。
-  const lineGeo = new THREE.BufferGeometry();
-  lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 6), 3));
-  lineGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(FW_N * 6), 3));
-  const lines = new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({
-    vertexColors: true, transparent: true, opacity: 0.75,
-    depthWrite: false, blending: THREE.AdditiveBlending, fog: false
-  }));
-  for (const o of [core, sparks, lines]) {
-    o.visible = false; o.frustumCulled = false; scene.add(o);
-  }
+  flash.visible = false; flash.frustumCulled = false;
+  scene.add(flash);
+
   killBursts.push({
-    core, sparks, lines,
-    dirX: new Float32Array(FW_N), dirY: new Float32Array(FW_N),
-    v0: new Float32Array(FW_N), life: new Float32Array(FW_N),
-    dly: new Float32Array(FW_N),          // 起飞延迟（秒）：错峰才有「花心 + 外缘」的层次
-    ef0: new Float32Array(FW_N),          // 该延迟下已经走过的位移因子，运行时直接减掉
-    base: new Float32Array(FW_N * 3),     // 各粒子的本色（随寿命衰减后写进顶点色）
+    shards, flash,
+    ax: 1, ay: 0, ang: 0,                 // 撞轴（单位向量）与它的角度
+    dirX: new Float32Array(SHARD_N), dirY: new Float32Array(SHARD_N),
+    v0: new Float32Array(SHARD_N), life: new Float32Array(SHARD_N),
+    dly: new Float32Array(SHARD_N),       // 起飞延迟（秒）：错峰才有「先裂开、再散开」的层次
+    ef0: new Float32Array(SHARD_N),       // 该延迟下已经走过的位移因子，运行时直接减掉
+    spin: new Float32Array(SHARD_N),      // 自转角速度（rad/s）
+    ang0: new Float32Array(SHARD_N),      // 初始朝向（偏向撞轴）
+    sx: new Float32Array(SHARD_N),        // 碎片长 / 宽（不规则，不是统一的小三角形）
+    sy: new Float32Array(SHARD_N),
+    base: new Float32Array(SHARD_N * 3),  // 碎片本色（随寿命衰减后写进 instanceColor）
+    ox: 1, oy: 0,                         // 撞轴的垂线（单位向量）
+    off: new Float32Array(SHARD_N),       // 起点沿垂线的偏移：像一片被拍扁的薄片向两侧裂开
     active: false, born: 0, x: 0, y: 0
   });
 }
-function spawnBurst(x, y, z, now) {
+// spawnBurst(x, y, z, now, ix, iy)：ix/iy 是撞轴（捕食者速度方向）。
+function spawnBurst(x, y, z, now, ix, iy) {
   let slot = killBursts.find((b) => !b.active);
   if (!slot) slot = killBursts.reduce((a, b) => (a.born < b.born ? a : b)); // 池满则复用最老
+  let ax = ix || 0, ay = iy || 0;
+  const al = Math.sqrt(ax * ax + ay * ay);
+  if (al < 1e-4) { ax = 1; ay = 0; } else { ax /= al; ay /= al; }
+  const ang = Math.atan2(ay, ax);
   slot.active = true; slot.born = now; slot.x = x; slot.y = y;
-  for (let s = 0; s < FW_N; s++) {
-    // 方向均匀撒开；初速与寿命都随机，炸开后才会是一团有层次的火花而不是一个同心圆。
-    const a = Math.random() * Math.PI * 2;
+  slot.ax = ax; slot.ay = ay; slot.ang = ang;
+  const ox = -ay, oy = ax;                // 撞轴的垂线：碎片起点沿它铺开
+  for (let s = 0; s < SHARD_N; s++) {
+    // 14% 逆溅：被拍碎后朝来向崩回来，正前方的锥形才不会像个过于整齐的喇叭。
+    const back = Math.random() < 0.14;
+    // 锥形半角内取角；不压正轴，正轴留给白芒，不然整团会挤成一条线。
+    const off = (Math.random() * 2 - 1) * SHARD_SPREAD;
+    const a = ang + (back ? Math.PI * (0.72 + Math.random() * 0.5) : off);
     slot.dirX[s] = Math.cos(a); slot.dirY[s] = Math.sin(a);
-    // 初速用 1.6 次幂偏向慢速：多数粒子留在花心慢慢散，少数冲到外缘，
-    // 整团才有体积感。等速的话所有粒子同时到同一个半径，看上去是一圈珠子。
-    slot.v0[s] = 4 + Math.pow(Math.random(), 1.6) * 26;
-    slot.life[s] = 0.40 + Math.random() * 0.45;
-    const dly = Math.random() * 0.07;
+    // 初速偏慢（1.4 次幂）：多数碎片在近处翻落，少数甩到外圈，整团才有体积感。
+    // 场地半宽 60 单位、屏幕约 10px/单位，终值 v0/k 要落到 3~13 单位才看得出「散开」。
+    slot.v0[s] = (12 + Math.pow(Math.random(), 1.2) * 38) * (back ? 0.45 : 1);
+    slot.life[s] = 0.34 + Math.random() * 0.38;
+    const dly = Math.random() * SHARD_HIT;
     slot.dly[s] = dly;
-    slot.ef0[s] = (1 - Math.exp(-FW_DAMP * dly)) / FW_DAMP;
+    slot.ef0[s] = (1 - Math.exp(-SHARD_DAMP * dly)) / SHARD_DAMP;
+    // 大的碎片转得慢、小的乱翻，像碎骨和碎羽混在一起。
+    slot.spin[s] = (Math.random() * 2 - 1) * (16 - 6 * Math.random());
+    slot.ang0[s] = a + (Math.random() * 2 - 1) * 1.1;
+    const sz = 0.22 + Math.random() * 0.28;   // 比鸟的箭头略大：碎开后每一片都要有体积
+    slot.sx[s] = sz * (0.65 + Math.random() * 0.70);
+    slot.sy[s] = sz * (0.65 + Math.random() * 0.70);
+    // 起点沿垂线铺开：像一块被拍扁的薄片，从中间向两侧裂开，而不是从同一个点射出。
+    // 运行时用 ox/oy × off 把它落成世界坐标。
+    slot.off[s] = (Math.random() * 2 - 1) * 0.17;
     const o = s * 3;
-    if (s % 11 === 0) {
-      // 每 8 个里留一个近白闪点：烟花的「针尖亮」，让整团不至于糊成一片同色。
-      slot.base[o] = 1; slot.base[o + 1] = 0.97; slot.base[o + 2] = 0.9;
+    const pick = Math.random();
+    if (pick < 0.15) {
+      // 一成半暖色火星：撞击点迸出来的火
+      tmpFwCol.setHex(0xffa45a);
+    } else if (pick < 0.60) {
+      // 白色羽屑做主体：鸟群本身是粉紫色，只有高亮白才能在密集处分辨出来
+      tmpFwCol.setHex(0xfff6e8);
     } else {
-      tmpFwCol.set(FW_COLORS[(Math.random() * FW_COLORS.length) | 0]);
-      const k = 0.85 + Math.random() * 0.40;    // 亮度也抖一下，层次更散
-      slot.base[o] = tmpFwCol.r * k;
-      slot.base[o + 1] = tmpFwCol.g * k;
-      slot.base[o + 2] = tmpFwCol.b * k;
+      // 其余是这只鸟自己的青绿——碎的是它本人，不是放了一朵礼花
+      tmpFwCol.setHex(0x62e0c4);
     }
+    const k = 0.80 + Math.random() * 0.40;
+    slot.base[o] = tmpFwCol.r * k;
+    slot.base[o + 1] = tmpFwCol.g * k;
+    slot.base[o + 2] = tmpFwCol.b * k;
   }
-  for (const o of [slot.core, slot.sparks, slot.lines]) o.visible = true;
+  slot.ox = ox; slot.oy = oy;
+  slot.shards.visible = true;
+  slot.flash.visible = true;
 }
 function clearBursts() {
   for (const b of killBursts) {
     b.active = false;
-    for (const o of [b.core, b.sparks, b.lines]) o.visible = false;
+    b.shards.visible = false;
+    b.flash.visible = false;
   }
 }
 
@@ -2308,7 +2368,8 @@ bindBool(fPred, 'predatorOn', '开启捕食者',
     document.getElementById('hPred').textContent = v ? activeP : '0';
     if (v) {
       initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0);
-      predCatches = 0; sprintCount = 0; stamina.fill(1); sprintUntil.fill(0);
+      predCatches = 0; sprintCount = 0; secondWindCount = 0;
+      stamina.fill(STAMINA_MAX); sprintUntil.fill(0); sprintCap.fill(0); sprintTier.fill(0);
     }
   });
 bindNum(fPred, 'predatorCount', 1, MAX_P, 1, '捕食者数量',
@@ -2336,11 +2397,11 @@ bindNum(fFlee, 'fleeRange', 3, 24, 0.5, '危险感知距离',
 bindNum(fFlee, 'fleeWeight', 0, 6, 0.05, '逃跑力度',
   '逃跑力度｜调大：个体和整群都逃得更拼命，鱼群会更整齐地绕开捕食者。太大会盖过群聚，队形散掉。');
 bindNum(fFlee, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
-  '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
+  '爆发倍率｜完整冲刺的最高速度 = 巡航速度 × 此值（恐慌二段是这个峰值的 0.93 倍）。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
 bindNum(fFlee, 'sprintDuration', 0.2, 3, 0.1, '爆发持续(秒)',
-  '爆发持续时间｜一次逃命冲刺能维持几秒。调长：逃得更远、拖尾更长。调短：更像瞬间闪避。结束后速度回到巡航上限。');
+  '爆发持续时间｜一次完整冲刺能维持几秒；恐慌二段是本值的 0.75 倍（默认 1 秒 / 0.75 秒）。调长：逃得更远、拖尾更长。调短：更像瞬间闪避。结束后速度回到巡航上限。');
 bindNum(fFlee, 'sprintRecovery', 1, 12, 0.5, '体力恢复(秒)',
-  '体力恢复时间｜爆发后要几秒才能再次爆发。调大：几乎不能连续爆发，鸟更容易被抓。调小：可以频繁逃生。');
+  '体力恢复时间｜体力分两格，每段冲刺用掉一格。第 1 格按此值恢复，第 2 格要 1.8 倍（默认 3 秒 / 5.4 秒）。满两格可以随时起爆；只剩一格时必须在贴身距离内（危险圈的 60% 以内）才会把它烧掉——这就是恐慌二段：更短、更慢，但能让捕食者多扑一次空。');
 bindBool(fFlee, 'infoCascade', '警报传递',
   '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
 fFlee.close();
@@ -2652,7 +2713,8 @@ function frameBegin(dt, time) {
             if (d2 > vision2) continue;
             let sc = d2;
             sc *= 1 + PRED_SCORE_CROWD * localDen[j];             // 群越密越难下手
-            sc *= 1 - PRED_SCORE_TIRED * (1 - stamina[j]);        // 体力见底的跑不动
+            // 体力归一化到 0~1（双格制：stamina 存的是 0~2 的格数）
+            sc *= 1 - PRED_SCORE_TIRED * (1 - stamina[j] / STAMINA_MAX); // 体力见底的跑不动
             if (sprintUntil[j] > time) sc *= 1 + PRED_SCORE_ALERT; // 正在拼命的追不上
             if (sc < bestScore) { bestScore = sc; best = j; bestD2 = d2; }
           }
@@ -3025,6 +3087,8 @@ function prepareForces(F, dt, time) {
   const P = F.P;
   const fleeR = F.fleeR;
   const fleeR2 = F.fleeR2;
+  const sprintSpeed = F.sprintSpeed;
+  const secondR2 = (fleeR * SECOND_WIND_R) * (fleeR * SECOND_WIND_R);
 
   for (let i = 0; i < n; i++) {
     if (caught[i] || resting[i]) continue;
@@ -3043,16 +3107,26 @@ function prepareForces(F, dt, time) {
     // 所需时间随距离（平方）从贴身 45ms 增长到圈边缘 260ms，再乘个体系数，
     // 于是爆发会从捕食者身边向外扩散，而不是整群同时亮。
     if (nearest2 < fleeR2) {
-      if (stamina[i] >= 1 && time >= sprintUntil[i]) {
-        const dNorm = Math.min(1, Math.sqrt(nearest2) / fleeR);
+      // 双格体力：满格随时能起爆（完整冲刺）；只剩 1 格时必须在贴身距离内
+      // 才允许起爆，而且那一段更短更慢——「攒了半格力气、只够拼命一下」。
+      // 不贴脸就先把这半格留着，等真被逼到墙角再烧——否则远处路过的鸟就把二段用掉了。
+      const full = stamina[i] >= STAMINA_MAX - 0.01;
+      const canBurst = stamina[i] >= 1 && time >= sprintUntil[i]
+        && (full || nearest2 < secondR2);
+      if (canBurst) {
+        const d = Math.sqrt(nearest2);
+        const dNorm = Math.min(1, d / fleeR);
         const need = (REACT_NEAR_MS + (REACT_FAR_MS - REACT_NEAR_MS) * dNorm * dNorm) * reactJit[i];
         alertMs[i] += dt * 1000;
         if (alertMs[i] >= need) {
           alertMs[i] = 0;
-          sprintUntil[i] = time + params.sprintDuration * 1000;
-          stamina[i] = 0;
+          sprintUntil[i] = time + params.sprintDuration * 1000 * (full ? 1 : SECOND_WIND_DUR);
+          sprintCap[i] = sprintSpeed * (full ? 1 : SECOND_WIND_SPD);
+          sprintTier[i] = full ? 1 : 2;
+          stamina[i] = Math.max(0, stamina[i] - 1);
           sprintCount++;
-          audio.sprint(Math.min(1, Math.sqrt(nearest2) / fleeR));
+          if (!full) secondWindCount++;
+          audio.sprint(Math.min(1, d / fleeR));
           // 爆发只提高「速度上限」，提速由转向力在一帧内拉到位，不做额外积分。
         }
       } else {
@@ -3102,6 +3176,7 @@ function frameFinish(F, res, dt, time) {
   // 冲刺计数在 frameFinish 里清零 + 累加，必须同帧：多核是「本帧 dispatch、下一帧收尾」，
   // 若在 frameBegin 清零，累加结果会被下一帧开头的清零立刻抹掉，HUD 永远读到 0。
   sprintingCount = 0;
+  sprintingFull = 0; sprintingSecond = 0;
   // 多核专用补丁：worker 对「休息中 / 等待重生」的个体直接 continue（forces.js 第 74 行），
   // 回传的 acc / fleeDir / neighbors / fleeing 里这几只的位置保持**上一轮的旧值**，
   // 而 onWorkerDone 是整段覆盖回主线程的 —— 于是 updateResting 刚清零的合力又被写回非零。
@@ -3163,15 +3238,22 @@ function frameFinish(F, res, dt, time) {
     let vy = vel[k + 1] + acc[k + 1] * dt;
     let sp = Math.sqrt((vx) * (vx) + (vy) * (vy));
     const sprinting = time < sprintUntil[i];
-    // 体力：爆发期间不恢复，结束后按 sprintRecovery 秒线性回满；没回满不能再爆发。
-    // 这两句在 v1.4.4 拆 step 时丢了——stamina 一旦归零就永远是 0，每只鸟一辈子只能冲刺一次，
-    // sprintingCount 也再没累加过（HUD 的「逃逸涟漪」永远不亮）。补在这里，和冲刺判定同一处。
-    if (sprinting) sprintingCount++;
-    else if (stamina[i] < 1) stamina[i] = Math.min(1, stamina[i] + dt / params.sprintRecovery);
+    // 体力：冲刺期间不恢复；结束后按格恢复。第 1 格 sprintRecovery 秒，
+    // 第 2 格要 1.8 倍——所以「完整冲刺 + 恐慌二段」连着烧完，得等 8.4 秒才回满，
+    // 二段的价值来自「之前安静了多久」，不是白给。
+    if (sprinting) {
+      sprintingCount++;
+      if (sprintTier[i] === 2) sprintingSecond++; else sprintingFull++;
+    } else if (stamina[i] < STAMINA_MAX) {
+      const per = stamina[i] < 1 ? params.sprintRecovery : params.sprintRecovery * SECOND_WIND_RECOVER;
+      stamina[i] = Math.min(STAMINA_MAX, stamina[i] + dt / per);
+    }
     // 速度上限：爆发 > 受惊 > 巡航节奏，直接取目标值（不做加速度积分），
     // 起爆即可提速、威胁解除即刻降到巡航。
     // 每只鸟的巡航/受惊/爆发速度再乘自己的系数，整群不会以同一速度像刚体一样平移。
-    const capTarget = (sprinting ? sprintSpeed : (fleeing[i] ? maxSpeed : paceSpeed)) * spdJit[i];
+    // 冲刺段上限取起爆时定下的 sprintCap（二段比完整冲刺慢 7%），不是全局 sprintSpeed。
+    const topSpeed = sprinting ? (sprintCap[i] || sprintSpeed) : (fleeing[i] ? maxSpeed : paceSpeed);
+    const capTarget = topSpeed * spdJit[i];
     const cap = Math.max(params.minSpeed, Math.min(sprintSpeed * 1.15, capTarget));
     capNow[i] = cap;   // 仅作为调试采样保留
     if (sp > cap) { const q = cap / sp; vx *= q; vy *= q; sp = cap; }
@@ -3250,7 +3332,14 @@ function frameFinish(F, res, dt, time) {
         const vrel = Math.max(0.5, Math.sqrt((rvx) * (rvx) + (rvy) * (rvy)));
         const J = Math.pow(vrel, 1.2) / predNorm;
         audio.predate(J);
-        spawnBurst(pos[k], pos[k + 1], 0, time);
+        // 撞轴 = 捕食者速度方向。捕食者几乎悬停时（速度≈0）退化成「从捕食者指向猎物」，
+        // 总比固定朝右强——碎片的飞散方向必须对得上「刚才那一下是从哪撞过来的」。
+        let ix = predVel[q], iy = predVel[q + 1];
+        if (ix * ix + iy * iy < 1e-4) {
+          ix = pos[k] - predPos[q]; iy = pos[k + 1] - predPos[q + 1];
+          if (ix * ix + iy * iy < 1e-8) { ix = 1; iy = 0; }
+        }
+        spawnBurst(pos[k], pos[k + 1], 0, time, ix, iy);
         predFeedAt[p] = time;
         predPulseAt[p] = time;
         predTarget[p] = -1;
@@ -3260,7 +3349,7 @@ function frameFinish(F, res, dt, time) {
         // 数量只减不增，直到用户把开关拨回来（回调里会给它们补一次出生）。
         respawnAt[i] = params.respawnOn ? time + 1000 : Infinity;
         birthAt[i] = -Infinity;
-        stamina[i] = 0; sprintUntil[i] = 0;
+        stamina[i] = 0; sprintUntil[i] = 0; sprintCap[i] = 0; sprintTier[i] = 0;
         // 被吃掉 → 不再产生新尾迹（已有的粒子会按寿命自己淡出）
         trailNextAt[i] = Infinity; birdTrailP[i] = 0;
         if (resting[i]) endRest(i, time, true);   // 从草地上摘掉，别一直占着容量
@@ -4036,75 +4125,67 @@ function render(now) {
 
   // 锁定高亮直接写在箭头自己身上（见上面的鸟着色循环），这里不再有独立的框需要更新。
 
-  // 捕杀特效：一记白核爆闪 + 几十个多色粒子径向炸开（见 spawnBurst）
+  // 捕杀特效：沿撞轴撞碎的碎片 + 一道拉长的白芒（见 spawnBurst）
   for (const b of killBursts) {
     if (!b.active) continue;
     const age = now - b.born;
     if (age >= BURST_MS) {
       b.active = false;
-      for (const o of [b.core, b.sparks, b.lines]) o.visible = false;
+      b.shards.visible = false; b.flash.visible = false;
       continue;
     }
-    // 撞击那一下：一个极短的白核，0.2 秒闪灭（只负责「砰」的瞬间，不再画环）
-    const cu = Math.min(1, age / 120);
-    b.core.position.set(b.x, b.y, 0.3);
-    b.core.quaternion.copy(camera.quaternion);
-    // 只做「砰」的那一下：半径压在 1 单位内、亮度 0.55，否则一团白会把彩色粒子全吃掉。
-    b.core.scale.setScalar(0.22 + 0.85 * cu);
-    b.core.material.opacity = 0.48 * Math.pow(Math.max(0, 1 - age / 140), 2);
+    // 白芒：长轴就是撞轴，靠加法混合在撞击点拉出一道亮痕——「撞上了」这一下全靠它。
+    // 位置沿撞轴偏移 0.42 个身长：光痕主要落在「撞过去的方向」，而不是均匀铺在两侧。
+    // 先跟相机朝向对齐（相机有 roll 时会侧倾），再在屏幕平面内转到撞角。
+    const fe = 1 - Math.exp(-age / 55);
+    const flen = 1.4 + 10.5 * fe, fwid = 0.35 + 0.55 * fe;
+    b.flash.position.set(b.x + b.ax * flen * 0.42, b.y + b.ay * flen * 0.42, 0.24);
+    b.flash.quaternion.copy(camera.quaternion);
+    b.flash.rotateZ(b.ang);
+    b.flash.scale.set(flen, fwid, 1);
+    b.flash.material.opacity = Math.exp(-age / 190);
 
-    // 粒子：径向炸开 + 阻尼减速（阻尼项提出来算一次，每个粒子只乘自己的初速），
-    // 颜色按各自寿命衰减——加法混合下衰减到 0 就等于熄灭，所以不需要逐点 alpha。
     const t = age / 1000;
-    const efT = (1 - Math.exp(-FW_DAMP * t)) / FW_DAMP;   // 每帧只算一次 exp
-    const pa = b.sparks.geometry.attributes.position.array;
-    const ca = b.sparks.geometry.attributes.color.array;
-    const la = b.lines.geometry.attributes.position.array;
-    const lc = b.lines.geometry.attributes.color.array;
-    const fall = FW_G * t * t;
-    for (let s = 0; s < FW_N; s++) {
+    const efT = (1 - Math.exp(-SHARD_DAMP * t)) / SHARD_DAMP;
+    const ic = b.shards.instanceColor.array;
+    for (let s = 0; s < SHARD_N; s++) {
       const o = s * 3;
       const lt = (t - b.dly[s]) / b.life[s];
       if (lt >= 1) {
-        ca[o] = 0; ca[o + 1] = 0; ca[o + 2] = 0;
-        pa[o] = b.x; pa[o + 1] = b.y; pa[o + 2] = 0.25;
-        const lo0 = s * 6;
-        la[lo0] = b.x; la[lo0 + 1] = b.y; la[lo0 + 3] = b.x; la[lo0 + 4] = b.y;
-        lc[lo0] = 0; lc[lo0 + 1] = 0; lc[lo0 + 2] = 0;
-        lc[lo0 + 3] = 0; lc[lo0 + 4] = 0; lc[lo0 + 5] = 0;
+        // 寿命到了：矩阵缩到 0（等于消失），不写颜色省时间
+        _shQ.set(0, 0, 0, 1);
+        _shV.set(b.x, b.y, 0.26);
+        _shS.set(0, 0, 0);
+        _shM.compose(_shV, _shQ, _shS);
+        b.shards.setMatrixAt(s, _shM);
         continue;
       }
-      // 还没到起飞时刻的粒子压在中心（花心），随着 delay 到点再散开。
+      // 径向位移：阻尼公式 r = v0·(1−e^{−kt})/k；还没到起飞时刻的压在起点。
       const r = lt <= 0 ? 0 : Math.max(0, b.v0[s] * (efT - b.ef0[s]));
-      pa[o] = b.x + b.dirX[s] * r;
-      pa[o + 1] = b.y + b.dirY[s] * r - fall;
-      pa[o + 2] = 0.25;
-      // 亮度先满后收：刚炸开最亮，寿命末段快速暗下去（幂次 1.7 让尾巴收得干脆）
-      const f = Math.pow(1 - lt, 1.7);
-      ca[o] = b.base[o] * f;
-      ca[o + 1] = b.base[o + 1] * f;
-      ca[o + 2] = b.base[o + 2] * f;
-
-      // 同一颗火星的尾巴：外端就是粒子本身，内端退到 55% 半径，颜色更暗，
-      // 于是看上去是「从中心射出来的一道短光」，而不是一颗孤零零的点。
-      const lo = s * 6;
-      const ox = b.x + b.dirX[s] * r, oy = b.y + b.dirY[s] * r - fall;
-      la[lo] = b.x + b.dirX[s] * r * 0.55;
-      la[lo + 1] = b.y + b.dirY[s] * r * 0.55 - fall;
-      la[lo + 2] = 0.24;
-      la[lo + 3] = ox;
-      la[lo + 4] = oy;
-      la[lo + 5] = 0.24;
-      const f2 = f * 0.22;
-      lc[lo] = b.base[o] * f2; lc[lo + 1] = b.base[o + 1] * f2; lc[lo + 2] = b.base[o + 2] * f2;
-      lc[lo + 3] = b.base[o] * f; lc[lo + 4] = b.base[o + 1] * f; lc[lo + 5] = b.base[o + 2] * f;
+      // 撞飞：整团沿撞轴线性前推一段——「被撞飞」和「原地爆炸」的区别就在这一项。
+      const push = SHARD_PUSH * Math.max(0, t - b.dly[s]);
+      const off = b.off[s];
+      _shV.set(
+        b.x + b.ox * off + b.dirX[s] * r + b.ax * push,
+        b.y + b.oy * off + b.dirY[s] * r + b.ay * push,
+        0.26
+      );
+      // 边飞边转：初始朝向偏撞轴，到寿命末段已经翻了好几个身
+      const tt = Math.max(0, t - b.dly[s]);
+      _shQ.setFromAxisAngle(_shZ, b.ang0[s] + b.spin[s] * tt);
+      // 前段几乎不缩、末段快速收掉——碎屑是「散开后收走」，不是「慢慢缩成一点」
+      const shrink = 1 - lt * lt * 0.90;
+      _shS.set(b.sx[s] * shrink, b.sy[s] * shrink, 1);
+      _shM.compose(_shV, _shQ, _shS);
+      b.shards.setMatrixAt(s, _shM);
+      // 颜色：刚撞碎最亮，后段压暗；再叠一层「离撞点越远越淡」——能量是从撞击点散失的，
+      // 这样锥形的根部亮、外沿暗，方向感比一整团同亮度更清楚。
+      const f = Math.pow(1 - lt, 0.75) * (1 - Math.min(0.45, r / 22));
+      ic[o] = b.base[o] * f; ic[o + 1] = b.base[o + 1] * f; ic[o + 2] = b.base[o + 2] * f;
     }
-    b.sparks.geometry.attributes.position.needsUpdate = true;
-    b.sparks.geometry.attributes.color.needsUpdate = true;
-    b.lines.geometry.attributes.position.needsUpdate = true;
-    b.lines.geometry.attributes.color.needsUpdate = true;
-    b.sparks.visible = true;
-    b.lines.visible = true;
+    b.shards.instanceMatrix.needsUpdate = true;
+    b.shards.instanceColor.needsUpdate = true;
+    b.shards.visible = true;
   }
 
   const pT2 = performance.now();
@@ -4157,6 +4238,8 @@ function render(now) {
     $('hRadius').textContent = groupRms.toFixed(1);
     $('hNeigh').textContent = avgNeighbors.toFixed(1);
     $('hSprint').textContent = sprintingCount;
+    $('hSprint').title = '冲刺中 ' + sprintingCount + ' 只（完整 ' + sprintingFull
+      + ' · 恐慌二段 ' + sprintingSecond + '）';
     // 三个速率：把累计量的增量塞进当前 100ms 桶
     rateAdvance(now);
     rateAdd(0, teleportCount - prevTeleports);
@@ -4168,7 +4251,8 @@ function render(now) {
     setStat('hBurst', rateSum(1));
     setStat('hRest', rateSum(2));
     $('hPort').title = '近 1 秒穿墙 ' + rateSum(0) + ' 次（累计 ' + teleportCount + '）';
-    $('hBurst').title = '近 1 秒爆发 ' + rateSum(1) + ' 次（累计 ' + sprintCount + '）';
+    $('hBurst').title = '近 1 秒爆发 ' + rateSum(1) + ' 次（累计 ' + sprintCount
+      + '，其中恐慌二段 ' + secondWindCount + '）';
     $('hRest').title = '近 1 秒落地 ' + rateSum(2) + ' 次（累计 ' + restSessions + '）· 当前 ' + restingCount + ' 只在草上';
     $('hFps').textContent = Math.round(fps) + ' FPS';
     $('hSprintFx').className = 'dot' + (fxOn && fxFlash.sprint > 0.35 ? ' sprint' : '');
@@ -4569,15 +4653,32 @@ window.FlockLab = {
     }
     return out;
   },
+  // 「还没回满」的只数：双格制下 1 格也算没满（那份二段已经被烧掉了）
   get recoveringCount() {
     let c = 0;
-    for (let i = 0; i < activeCount; i++) if (stamina[i] < 1) c++;
+    for (let i = 0; i < activeCount; i++) if (stamina[i] < STAMINA_MAX - 1e-6) c++;
     return c;
   },
+  // 平均体力，归一化到 0~1（0=全群力竭，1=全群满格），便于和 v1.4.18 的曲线对比
   get avgStamina() {
     let s = 0;
     for (let i = 0; i < activeCount; i++) s += stamina[i];
-    return +(s / activeCount).toFixed(3);
+    return +(s / Math.max(1, activeCount * STAMINA_MAX)).toFixed(3);
+  },
+  // 双格体力的分布：满 / 半 / 空 各多少只，以及累计触发过多少次恐慌二段
+  get staminaState() {
+    let full = 0, half = 0, empty = 0, s = 0;
+    for (let i = 0; i < activeCount; i++) {
+      const v = stamina[i];
+      s += v;
+      if (v >= STAMINA_MAX - 1e-6) full++;
+      else if (v >= 1) half++;
+      else empty++;
+    }
+    return {
+      full, half, empty, secondWindTotal: secondWindCount,
+      avg: +(s / Math.max(1, activeCount * STAMINA_MAX)).toFixed(3)
+    };
   },
   get sprintWindowMs() {
     let m = 0;
