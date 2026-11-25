@@ -501,7 +501,9 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 node --input-type=module --check < js/main.js
 
 # 2) 打包（含 README，便于线上对照）
-tar -czf /tmp/flocklab.tgz index.html css js assets README.md DEVELOPMENT.md
+tar -czf /tmp/flocklab.tgz index.html css js assets sw.js manifest.json README.md DEVELOPMENT.md
+# 注意：sw.js 必须一起打进去。它在服务器上解包时不会删除旧文件，漏传会「本地改了版本号、
+# 线上还是旧的」——Service Worker 因此不触发更新，用户永远拿到缓存里的老代码。
 
 # 3) 上传 + 一次性容器解包并修正属主
 #    1Panel 站点目录属主是 33:33（容器内无 www-data 用户名，用数字 UID/GID）
