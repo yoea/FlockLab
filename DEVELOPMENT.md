@@ -55,7 +55,7 @@ flocklab/
 ├── js/grass.js         草地几何、谐波轮廓、面积校准、着色（约 180 行）
 ├── js/backdrop.js      背景地貌（草地斑 / 河流 / 村庄剪影）+ 漂移云层（约 250 行）
 ├── assets/logo.svg     LOGO 与 favicon
-├── assets/icon-*.png   PWA 图标（192 / 512 / maskable 512 / 180）
+├── assets/icon-*.png   PWA 图标（48–512 全尺寸 + maskable 192/512 + 180），另含 favicon.ico
 └── README.md / DEVELOPMENT.md
 ```
 
@@ -404,6 +404,31 @@ v42 给 `arrowMat` 的顶点着色器加了出生涌出后，捕食者**自动�
 ② 每帧改了之后 `needsUpdate = true`（漏了会一直显示第一帧的值）；③ 新建/复用的实例
 （`setCount` 增加、`initBoids`）有没有写初值 —— `growBuf` 初始 fill(1)，否则老个体会突然隐身。
 
+### 6.10 PWA 图标必须带 alpha 通道，否则 Windows 开始菜单的瓦片图会被裁成残片
+
+现象：装成应用后固定到开始菜单，瓦片图标只显示原图的一个**局部**（一小块深色方块加一道斜线），
+不是完整图标。本机同版本 Edge 装的另外两个 PWA 瓦片图都正常 —— 差别只在图标文件本身。
+
+根因：Edge 在 Windows 上会把 PWA 装成 **MSIX 包**（`%ProgramFiles%\WindowsApps\<host>-<hash>_*`，
+`uap10:HostId="PWA"`），包里的 `Images/Square150x150Logo.png`、`Square44x44Logo.targetsize-*.png`
+由 Edge 在安装时**从 manifest 图标重新生成**。这一步会先按 alpha 通道找「内容框」再缩放；
+如果源 PNG 是**全幅不透明、连 alpha 通道都没有**（PNG color type 2 = RGB），内容框算成了
+一个错的 1/3 窗口，于是每个尺寸都变成原图的一块残片。
+
+判据（不用装就能查）：
+```bash
+python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.unpack('>IIBB',d[16:26]))"
+# 末位 color type：2 = RGB（无 alpha，危险）  6 = RGBA（正常）
+```
+或直接翻 `C://Program Files\WindowsApps\<包名>\Images\`：`Square150x150Logo.png`
+如果是一小块残片而不是完整图标，就是这个坑。
+
+修法：**"any" 图标一律输出 RGBA（color type 6），并留透明边**——本项目用「圆角方块 + 4 角透明」，
+既保住品牌底色，又有真实透明像素供内容框计算；`maskable` 才是全幅不透明（规范要求铺满）。
+另外把常用瓦片尺寸（48 / 71 / 150）也按真实像素各出一张，Edge 能直接取用、少一次重采样。
+
+改完必须**先卸载再重装**：瓦片图是安装时生成并写进 MSIX 包的，覆盖线上文件不会更新已装的包。
+
 ---
 
 ## 7. 参数与存档
@@ -437,6 +462,7 @@ v42 给 `arrowMat` 的顶点着色器加了出生涌出后，捕食者**自动�
 | v41a | 修「草地上的红鸟左右闪」：① 休息间隔改为按「鸟数 / 草地总容量」自适应（原来固定 20–53 秒，800 只时需求是容量的 4 倍，队列从第一秒就清不空）；② 排队 20 秒进不去就认输褪红、隔一大段再来（不再永久红鸟）；③ 到点速度随距离收敛到 0.35（原来下限 1.1，会冲过落点再掉头，渲染朝向跟着 180° 翻）；④ 绕草地的切向力改连续值，停住时不再每帧翻向 |
 | v41 | 去掉注意力上限（恢复视野内全邻域）+ `sepCap` 安全阀 + 网格 `视野/1.4`；边缘穿越默认关闭 + 实体墙提前避让；捕食者加速音重做；HUD 传送/爆发/休憩改近 1 秒速率；背景改斜向光带（去闪烁星点）；声音默认开 |
 | v40 | 捕食者加速音效 `predDash`（边沿触发 + 400ms/只限流）、草地落地/起飞改轻快双音；动态背景（fbm 星云 + 星点 + 浮尘，`bgMat.uTime` / `dustMat.uTime` 原来没更新）；`wrapEdges` 开关（关=实体墙反弹）；修「不变紫」：色阶改用 `localDen`（原读 `neighbors/24`，被 7 只注意力上限钉死在 0.29）+ 重定 `LOCAL_DEN_K`；修「散成一坨坨」：穿墙不再镜像、质心/半径改最小映像、加弱长程群体归拢；音量滑块移除、固定满刻度 |
+| v43 | 修「装成应用后开始菜单图标不对」：图标全部改 RGBA + 圆角透明边（原来是无 alpha 的全幅方图，Edge 生成 MSIX 瓦片图时把内容框算错、裁成残片）；补齐 48/71/96/128/150/256/384 各尺寸 + maskable 192 + `favicon.ico`；SW 缓存版本 v2 |
 | v42 | **PWA**：`manifest.json` + `sw.js`（壳 SWR / CDN 缓存优先 / 导航网络优先）+ 五张图标（**不自建安装按钮、不拦 `beforeinstallprompt`**，交给浏览器地址栏提示）；**出生涌出动画**：`aGrow` 实例属性（`mix(1, aGrow, uGrow)`，微光→展开过冲→自转→淡入）+ `hatchAt` 错峰 + 重生绿丝 `birthWisp`；**背景地貌层** `js/backdrop.js`（canvas 纹理 + `GAIN` 换算 + 加法混合 + 22% 视差 + 世界坐标避让草地 + 可平铺云层）；删「山坡」横带；新增 `FlockLab.backdrop` / `hatchPending` / `respawn(n)` 调试口；修「捕食者变成一个点」（`predMat` 克隆 arrowMat 却没有 `aGrow`） |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。

@@ -2,6 +2,7 @@
   "name": "FlockLab · 涌现模拟",
   "short_name": "FlockLab",
   "description": "俯视的二维鸟群涌现模拟：每只鸟只守分离、对齐、聚合三条局部规则，整群的转向与聚散却自发涌现。",
+  "id": "./",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
@@ -12,23 +13,16 @@
   "theme_color": "#05070f",
   "categories": ["education", "entertainment", "simulation"],
   "icons": [
-    {
-      "src": "./assets/icon-192.png",
-      "sizes": "192x192",
-      "type": "image/png",
-      "purpose": "any"
-    },
-    {
-      "src": "./assets/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "any"
-    },
-    {
-      "src": "./assets/icon-maskable-512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "maskable"
-    }
+    { "src": "./assets/icon-48.png", "sizes": "48x48", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-71.png", "sizes": "71x71", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-96.png", "sizes": "96x96", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-128.png", "sizes": "128x128", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-150.png", "sizes": "150x150", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-256.png", "sizes": "256x256", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-384.png", "sizes": "384x384", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./assets/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "./assets/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
