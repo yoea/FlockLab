@@ -326,6 +326,7 @@
   .hud-ver #hBuild::after { content: '，'; }
   .hud-ver #hCommit {
     margin-right: 6px;
+    pointer-events: auto;   /* .card-body 整体 pointer-events:none（让拖拽穿透去转视角），链接要单独放行 */
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color: #8fb4e8; cursor: pointer;
     -webkit-user-select: text; user-select: text;   /* 允许选中复制哈希 */
