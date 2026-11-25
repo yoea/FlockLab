@@ -443,7 +443,7 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **捕食者**：`predatorCount` / `predatorPositions` / `predatorSpeeds` / `predatorCaps` / `predatorCooling` / `predatorTargets` / `catches` / `deadCount` / `respawnDelays` / `catchRadius` / `predShape` / `reaction` / `ringState` / `mouseHunter` / `mousePredator` / `mouseDrawCount`
 
-**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时 / `cooling`(吃饱冷却中) / `givingUp`(扑空拉起中)）、`predatorLocks`（锁定目标索引 + 聚焦框的 alpha / 世界半宽 `half` / **屏幕半宽 `px`** / 是否可见）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 7 rad/s² 限制（撞墙反弹那一帧除外）。排查「捕食者在空处打转」看 `cooling`/`givingUp` 两个布尔：冷却期的巡逻点是以鸟群质心为圆心的切向环带（半径 10~26），不该出现「朝一个方向直线飞出几十单位」；`px` 应稳定在 26 以上（低于 20 说明屏幕恒定尺寸那段没生效，框会看不见）。
+**猛禽动力学 / 锁定**：`predatorDynamics`（每只的档位 `mode`(0 滑翔 / 1 巡航 / 2 追击 / 3 俯冲) / 航向 / 角速度 / 档位速度 / 实际速度 / 能量消耗 / 已追秒数 / 放弃倒计时 / `cooling`(吃饱冷却中) / `givingUp`(扑空拉起中)）、`predatorLocks`（锁定目标索引 `target` + 该鸟当前的描边粗细倍数 `thick`，1 = 正常、被锁定约 2.0~2.35 + 已锁定秒数 `locked`）、`project(x, y)`（世界坐标 → 画布像素，定位特效在屏幕上的落点用）。验证「有惯性」看三条：速度直方图应是连续分布而非几个峰；捕获后 `speed` 应逐帧滑落（不是阶跃）；`turnRate` 的每秒变化应受 7 rad/s² 限制（撞墙反弹那一帧除外）。排查「捕食者在空处打转」看 `cooling`/`givingUp` 两个布尔：冷却期的巡逻点是以鸟群质心为圆心的切向环带（半径 10~26），不该出现「朝一个方向直线飞出几十单位」；被锁定的鸟在 `predatorLocks.thick` 上应读到 >2（1 就是没高亮），并在画面上表现为**变红 + 描边加粗**——锁定标记直接画在箭头自己身上，不再有单独的聚焦框。`FlockLab.respawnOn` / `setRespawnOn(bool)` 控制「被吃后是否补一只」：关掉后 `deadCount` 只增不减、HUD 元素数量显示 `存活/设定`。
 
 **尾迹**：`trailCount` / `trailStats` → `{live, oldestAge, spanX, spanY, capacity}` / `trailSample`（最近 4 颗的 `pos/dir/age/len/wid`，可验证位置冻结与航向各异）
 
@@ -609,7 +609,8 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 ## 7. 参数与存档
 
 - 滑块范围见 `js/main.js` 顶部 `RANGES`；数量上限是 `MAX_N = 10000`。
-- 存档键 `flocklab.params.v6`；**出厂默认值变更时提升版本号**，让老用户拿到新默认值。
+- 存档键 `flocklab.params.v7`（v6 存档读取时整份继承，只让新键走默认值）；**出厂默认值变更时提升版本号**，让老用户拿到新默认值。
+- 新增一个可调参数要动两处：`DEFAULTS` 与 `PERSIST_KEYS`。布尔开关不用进 `RANGES` / `PARAM_RANGE`；老存档里没有这个键会自动走默认，不必升存档版本号。刚加的 `respawnOn`（被吃后重生，默认开）就是这样进来的。
 - 静音偏好单独存 `localStorage['flocklab.audio.muted.v2']`（v2：v1.4.0 那个 key 存过实验状态，会让老用户「刷新后一直静音」）；状态卡图钉存 `flocklab.hud.pinned`。
 - **音量（`musicLevel` / `fxLevel`）不再持久化、不上面板**：固定满刻度 1.5（v1.4.0 起）。它们从 `PERSIST_KEYS` 里移除了，所以老存档里的 0.4 不会被读回来；`FlockLab.music.setLevel()` 仍可临时改（调试用）。
 - 脏存档（超过当前 `MAX_N` 的数量）在读取时夹紧，不必迁移。

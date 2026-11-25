@@ -113,6 +113,9 @@ const DEFAULTS = {
   predSpeed: 25,
   lockTime: 1.0,
   feedCooldown: 8.0,
+  // 被捕食者吃掉后是否补一只新鸟。关掉 → 队伍只减不增，能一直看到「被捕食压力
+  // 慢慢清空」的过程；再打开会把已经死掉的那些补回来（见 GUI 里的回调）。
+  respawnOn: true,
   infoCascade: true,
   // 逃逸爆发：白肌式短时冲刺，体力耗尽后必须恢复，不能连续多次爆发
   sprintFactor: 1.7,
@@ -144,7 +147,7 @@ const PERSIST_KEYS = [
   'count', 'separation', 'alignment', 'cohesion', 'perception', 'separationRange',
   'flow', 'maxSpeed', 'minSpeed', 'arrowSize',
   'predatorOn', 'predatorCount', 'fleeWeight', 'fleeRange', 'predict',
-  'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'infoCascade',
+  'chaseWeight', 'predSpeed', 'lockTime', 'feedCooldown', 'respawnOn', 'infoCascade',
   'sprintFactor', 'sprintDuration', 'sprintRecovery',
   'grassOn', 'wrapEdges', 'multiCore', 'viewShake'
 ];
@@ -230,6 +233,10 @@ const rVel = new Float32Array(MAX_N * 3);
 const acc = new Float32Array(MAX_N * 3);
 const col = new Float32Array(MAX_N * 3);
 const siz = new Float32Array(MAX_N);
+// 描边粗细倍数：1 = 正常，>1 = 加粗（被 AI 捕食者锁定的那只用，见渲染段）。
+// 单独走一个实例属性而不是揉进尺寸里：尺寸放大会同时拉长箭头，
+// 而「被瞄准」要的是同一条更粗的线，长度不该跟着变。
+const thick = new Float32Array(MAX_N);
 const neighbors = new Uint16Array(MAX_N);
 // 局部密度（3×3 格的活跃鸟数，归一化到 0~1）：和「注意力只取 7 只」解耦。
 // 用邻居数当色阶时分不清「稀疏」和「采样上限已满」，万只以上会整片卡在同一色。
@@ -740,8 +747,35 @@ function setCount(v) {
   activeCount = next;
   params.count = next;
   arrowGeo.instanceCount = next;
-  document.getElementById('hCount').textContent = next;
+  updateHCount();
   syncCtrl('count');
+}
+
+// HUD 上的「元素数量」：平时就是设定值；关掉「被吃后重生」后有阵亡时显示「存活/设定」。
+// 不这么写的话，面板上那个固定数字会让人以为开关没生效（实际队伍已经在变少）。
+function updateHCount() {
+  const el = document.getElementById('hCount');
+  if (!el) return;
+  let dead = 0;
+  for (let i = 0; i < activeCount; i++) if (caught[i]) dead++;
+  const txt = dead > 0 ? (activeCount - dead) + '/' + activeCount : String(activeCount);
+  if (el.textContent !== txt) el.textContent = txt;
+  el.title = dead > 0
+    ? `存活 ${activeCount - dead} / 设定 ${activeCount}（被吃掉 ${dead} 只，未重生）`
+    : `场上 ${activeCount} 只`;
+}
+
+// 切换「被吃后重生」时同步已经死掉的那些：
+//   打开 → 把它们排进出生队列（错开几十毫秒，别在同一帧齐刷刷涌出来）；
+//   关闭 → 把排队中的重生取消掉（respawnAt 改成 Infinity 就再也不会触发）。
+function syncRespawnQueue(on) {
+  const now = performance.now();
+  let k = 0;
+  for (let i = 0; i < activeCount; i++) {
+    if (!caught[i]) continue;
+    respawnAt[i] = on ? now + 120 + (k++ % 20) * 45 : Infinity;
+  }
+  updateHCount();
 }
 
 // ---------------------------------------------------------------- 场景
@@ -1351,6 +1385,8 @@ const aPos = new THREE.InstancedBufferAttribute(pos, 3).setUsage(THREE.DynamicDr
 const aVel = new THREE.InstancedBufferAttribute(rVel, 3).setUsage(THREE.DynamicDrawUsage);
 const aCol = new THREE.InstancedBufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage);
 const aSiz = new THREE.InstancedBufferAttribute(siz, 1).setUsage(THREE.DynamicDrawUsage);
+// 描边粗细倍数（1 = 正常）：只有被锁定的那只不是 1，见渲染段的锁定高亮
+const aThick = new THREE.InstancedBufferAttribute(thick, 1).setUsage(THREE.DynamicDrawUsage);
 // 出生涌出进度 0~1（见上方「出生动画」）：CPU 只写进度，缓动与自转在顶点着色器里算
 const aGrow = new THREE.InstancedBufferAttribute(growBuf, 1).setUsage(THREE.DynamicDrawUsage);
 // 渲染抖动 vec4（尺寸系数 / 朝向偏置 / 位置偏移 xy），每只鸟固定，见 rollTraits
@@ -1359,6 +1395,7 @@ arrowGeo.setAttribute('aPosition', aPos);
 arrowGeo.setAttribute('aVelocity', aVel);
 arrowGeo.setAttribute('aColor', aCol);
 arrowGeo.setAttribute('aSize', aSiz);
+arrowGeo.setAttribute('aThick', aThick);
 arrowGeo.setAttribute('aGrow', aGrow);
 arrowGeo.setAttribute('aJit', aJit);
 arrowGeo.instanceCount = activeCount;
@@ -1367,27 +1404,33 @@ const arrowMat = new THREE.ShaderMaterial({
   // uGrow：出生涌出总开关。鸟 = 1，捕食者 = 0。
   // 捕食者的材质是 arrowMat.clone()，共用这段顶点着色器；它没有 aGrow 属性，
   // 而缺失的顶点属性在 GLSL 里恒为 0 —— 不关掉的话整只猛禽会被缩成 8% 大小（一个点）。
-  uniforms: { uMaxSpeed: { value: params.maxSpeed }, uGrow: { value: 1 }, uJit: { value: 1 } },
+  uniforms: { uMaxSpeed: { value: params.maxSpeed }, uGrow: { value: 1 }, uJit: { value: 1 }, uThick: { value: 1 } },
   vertexShader: `
     attribute vec2 aLocal;
     attribute vec3 aPosition;
     attribute vec3 aVelocity;
     attribute vec3 aColor;
     attribute float aSize;
+    attribute float aThick;
     attribute float aGrow;
     attribute vec4 aJit;
     uniform float uMaxSpeed;
     uniform float uGrow;
     uniform float uJit;
+    uniform float uThick;
     varying vec2 vLocal;
     varying vec3 vColor;
     varying float vSpeed;
     varying float vFade;
     varying float vGrow;
+    varying float vThick;
     void main() {
       vLocal = aLocal;
       vColor = aColor;
       vSpeed = clamp(length(aVelocity) / uMaxSpeed, 0.0, 1.0);
+      // 描边粗细：uThick=0 时恒为 1（捕食者的 predGeo 没有 aThick 属性，
+      // 缺失属性在 GLSL 里恒为 0，不 mix 掉就会把猛禽的线宽变成 0 而整只消失）。
+      vThick = mix(1.0, aThick, uThick);
 
       // ---- 出生涌出：一点微光 → 由小到大展开 + 起手快速自转 + 淡入 ----
       // aGrow 从 0 走到 1，走完就是普通个体（此时 sK=1、spin=0、vGrow=1，和老行为完全一致）。
@@ -1420,6 +1463,7 @@ const arrowMat = new THREE.ShaderMaterial({
     varying float vSpeed;
     varying float vFade;
     varying float vGrow;
+    varying float vThick;
     float sdSegment(vec2 p, vec2 a, vec2 b) {
       vec2 pa = p - a, ba = b - a;
       float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
@@ -1431,7 +1475,9 @@ const arrowMat = new THREE.ShaderMaterial({
         sdSegment(p, vec2(0.90, 0.0), vec2(-0.42, 0.86)),
         sdSegment(p, vec2(0.90, 0.0), vec2(-0.42, -0.86))
       );
-      float core = 1.0 - smoothstep(0.10, 0.17, d);
+      // 描边宽度按 vThick 放大：被锁定的箭头是「同一支更粗的笔」画的，
+      // 长度与位置都不变，只是线本身变粗（尺寸放大只负责让它更大，两者分开）。
+      float core = 1.0 - smoothstep(0.10 * vThick, 0.17 * vThick, d);
       float halo = exp(-d * 3.6) * 0.34;
       float a = clamp(core + halo, 0.0, 1.0) * vFade * vGrow;
       if (a < 0.004) discard;
@@ -1602,6 +1648,8 @@ predMat.uniforms.uMaxSpeed.value = params.predSpeed;
 predMat.uniforms.uGrow.value = 0;
 // 同样的道理：predGeo 没有 aJit 属性，缺失属性恒为 0 会把猛禽缩成 0 大小，必须关掉。
 predMat.uniforms.uJit.value = 0;
+// predGeo 也没有 aThick：同样关掉，否则线宽会按 0 算，猛禽直接消失。
+predMat.uniforms.uThick.value = 0;
 // 锐角等腰三角形：腰长 1、底 0.5（即「腰 1.4 : 底 0.7」的比例），方向即运动方向。
 // 顶点 (2h/3, 0)、(-h/3, ±0.25)，h = √(1 - 0.25²) → 重心落在原点。
 // 实际尺寸由 predSiz = 腰长 控制，所以只改一处就能整体缩放。
@@ -1701,68 +1749,12 @@ for (let p = 0; p < MAX_SLOT; p++) {
   predSiz[p] = predLeg();
 }
 
-// ---------------------------------------------------------------- 锁定聚焦框
-// 被 AI 捕食者锁定的鸟，会在外面套一个极细的四角括号框（正十字形的角线 + 一圈
-// 几乎看不见的整框）。索敌本身是有时效的（lockTime 续期、追不到就放弃），
-// 所以框用一段 0.2 秒的「收拢」动画表达「它刚刚盯上了这只」，丢失目标时再淡出：
-// 一眼就能看出场上现在有没有人在被瞄。
-const lockGeo = new THREE.PlaneGeometry(2, 2);
-const lockFrames = [];
-for (let p = 0; p < MAX_SLOT; p++) {
-  const mat = new THREE.ShaderMaterial({
-    uniforms: { uAlpha: { value: 0 }, uPx: { value: 22 }, uLine: { value: 1.6 } },
-    vertexShader: `
-      varying vec2 vLocal;
-      void main() {
-        vLocal = position.xy;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      varying vec2 vLocal;
-      uniform float uAlpha;
-      uniform float uPx;      // 框半宽对应的屏幕像素数
-      uniform float uLine;    // 线宽（屏幕像素）
-      void main() {
-        vec2 a = abs(vLocal);
-        // 线宽按「屏幕像素」折算，而不是按世界比例。框的世界尺寸会随相机缩放变化，
-        // 但线本身必须始终是同样粗的 1~2 像素——否则缩远了细成一缕、缩近了糊成一片。
-        float w = uLine / max(uPx, 1.0);
-        float al = w * 0.6;                     // 抗锯齿过渡，避免硬边闪烁
-        float lineX = smoothstep(1.0 - w - al, 1.0 - w, a.x);
-        float lineY = smoothstep(1.0 - w - al, 1.0 - w, a.y);
-        float len = 0.32;                       // 角线长度（相对半宽）
-        float segX = lineX * smoothstep(1.0 - len - al, 1.0 - len, a.y);
-        float segY = lineY * smoothstep(1.0 - len - al, 1.0 - len, a.x);
-        // 四角括号实、整框三成亮度：一眼能看出「有人在瞄这只」，又不至于盖住鸟。
-        float m = max(max(segX, segY), max(lineX, lineY) * 0.30);
-        float a2 = m * uAlpha;
-        if (a2 < 0.004) discard;
-        gl_FragColor = vec4(0.88, 0.98, 1.0, a2);
-        #include <colorspace_fragment>
-      }
-    `,
-    transparent: true,
-    depthWrite: false,
-    depthTest: false,
-    blending: THREE.AdditiveBlending,
-    side: THREE.DoubleSide
-  });
-  const fr = new THREE.Mesh(lockGeo, mat);
-  fr.visible = false;
-  fr.frustumCulled = false;
-  fr.renderOrder = 8;                 // 画在鸟与尾迹之上
-  lockFrames.push(fr);
-  scene.add(fr);
-}
-// 淡入淡出用的包络与「最后位置」：目标被抓走的瞬间框不会跳到捕食者身上，
-// 而是停在原地淡掉。
-const lockAlpha = new Float32Array(MAX_SLOT);
-const lockPosX = new Float32Array(MAX_SLOT);
-const lockPosY = new Float32Array(MAX_SLOT);
-const lockHalf = new Float32Array(MAX_SLOT);   // 世界坐标下的半宽
-const lockPx = new Float32Array(MAX_SLOT);     // 同一时刻的屏幕半宽（像素），着色器换线宽用
-const lockIdx = new Int32Array(MAX_SLOT);   // 本帧被锁定的鸟索引，鸟着色循环里用
+// ---------------------------------------------------------------- 锁定高亮
+// 被 AI 捕食者锁定的鸟直接在鸟本身身上做标记：整支箭头转成高饱和的红、描边加粗
+// 两倍多，再配原有的轻微放大与呼吸。不再另画聚焦框——框在密集群里要么太小看不见，
+// 要么大到盖住邻居；把「正在被瞄准」写在箭头自己身上最省事也最醒目。
+// 索敌本身有时效（lockTime 续期、追不到就放弃），高亮随之出现/消失。
+const lockIdx = new Int32Array(MAX_SLOT);   // 本帧被锁定的鸟索引，鸟着色/描边循环里用
 let lockIdxN = 0;
 
 // ---------------------------------------------------------------- 鼠标即是捕食者
@@ -2266,6 +2258,9 @@ bindNum(fPred, 'predict', 0, 1.5, 0.05, '预判系数',
   '预判系数｜捕食者追的是鸟的「未来位置」而不是当前位置。调大：更难甩掉；太大像未卜先知。');
 bindNum(fPred, 'feedCooldown', 0.3, 60, 0.1, '进食冷却(秒)',
   '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
+bindBool(fPred, 'respawnOn', '被吃后重生新鸟',
+  '被吃后重生｜开启（默认）：每被吃掉一只，1 秒后在场里离捕食者最远的空处补一只，总数保持不变。关闭：死一只少一只，队伍会被慢慢吃空，状态卡左上角的数量变成「存活/设定」——适合观察捕食压力对整群的影响。再打开时，这段时间里阵亡的会一起补回来（错开几十毫秒依次出生，不会同时涌出一大团）。',
+  (v) => syncRespawnQueue(v));
 fPred.open();
 
 const fFlee = gui.addFolder('逃逸');
@@ -2624,7 +2619,7 @@ function frameBegin(dt, time) {
             hdgWant = Math.atan2(rsY - ppy, rsX - ppx);
           }
         } else {
-          if (predTarget[p] !== best) predLockFrom[p] = time;   // 换了目标 → 聚焦框重新收拢一次
+          if (predTarget[p] !== best) predLockFrom[p] = time;   // 换了目标 → 高亮/调试计时重新起算
           predTarget[p] = best;
           predLockUntil[p] = time + params.lockTime * 1000;   // 有效期间持续续期
           if (predChaseFrom[p] === 0) predChaseFrom[p] = time;
@@ -3192,7 +3187,9 @@ function frameFinish(F, res, dt, time) {
         predTarget[p] = -1;
         predCatches++;
         caught[i] = 1;
-        respawnAt[i] = time + 1000;   // 1 秒后重新出生
+        // 「被吃后重生」关掉时排 Infinity：这只就真的从场上消失了，
+        // 数量只减不增，直到用户把开关拨回来（回调里会给它们补一次出生）。
+        respawnAt[i] = params.respawnOn ? time + 1000 : Infinity;
         birthAt[i] = -Infinity;
         stamina[i] = 0; sprintUntil[i] = 0;
         // 被吃掉 → 不再产生新尾迹（已有的粒子会按寿命自己淡出）
@@ -3726,6 +3723,7 @@ function render(now) {
     rVel[k] += (vel[k] - rVel[k]) * SMOOTH;
     rVel[k + 1] += (vel[k + 1] - rVel[k + 1]) * SMOOTH;
     if (caught[i]) { siz[i] = 0; continue; }   // 等待重生的 1 秒完全隐藏
+    thick[i] = 1;                              // 默认线宽；下面被锁定的那只再改
     // 出生涌出进度（0~1）：算好进度丢给 GPU，缓动/自转/淡入全在顶点着色器里做。
     // 已经成形的个体 hatchAt 是 -Infinity，这里一步比较就出去，几乎不花钱。
     const hg = (now - hatchAt[i]) / HATCH_MS;
@@ -3795,15 +3793,18 @@ function render(now) {
       col[k + 2] = col[k + 2] * (1 - w) + sprintPal[so + 2] * w;
       size *= 1.22 + 0.24 * surge;
     }
-    // 被锁定的鸟：去饱和推向冷白 + 轻微放大并呼吸。放在所有配色之后，
-    // 优先级最高——新生、爆发、争地盘都盖不住它，因为「正在被瞄准」是最该被读到的事。
+    // 被锁定的鸟：整支箭头转成高饱和的红 + 描边加粗到两倍多，观感像「被瞄准镜咬住」。
+    // 放在所有配色之后，优先级最高——新生、爆发、争地盘都盖不住它，
+    // 因为「正在被瞄准」是场上最该被读到的事。放大与呼吸保持原样。
     for (let li = 0; li < lockIdxN; li++) {
       if (lockIdx[li] !== i) continue;
-      const w = 0.86;
-      col[k] = col[k] * (1 - w) + 0.95 * w;
-      col[k + 1] = col[k + 1] * (1 - w) + 0.98 * w;
-      col[k + 2] = col[k + 2] * (1 - w) + 1.00 * w;
-      size *= 1.26 + 0.07 * Math.sin(now * 0.011);
+      const w = 0.94;
+      col[k] = col[k] * (1 - w) + 0.92 * w;
+      col[k + 1] = col[k + 1] * (1 - w) + 0.07 * w;
+      col[k + 2] = col[k + 2] * (1 - w) + 0.05 * w;
+      const breath = 0.5 + 0.5 * Math.sin(now * 0.011);
+      size *= 1.26 + 0.07 * Math.sin(now * 0.011);   // 轻微放大 + 呼吸（与原样一致）
+      thick[i] = 2.05 + 0.30 * breath;               // 线宽同相起伏，像心跳
       break;
     }
     siz[i] = size;
@@ -3813,6 +3814,7 @@ function render(now) {
   aVel.needsUpdate = true;
   aCol.needsUpdate = true;
   aSiz.needsUpdate = true;
+  aThick.needsUpdate = true;
   aGrow.needsUpdate = true;
   // 抖动只在抽签（出生/重生）后变过，不必每帧重传 160KB
   if (aJitDirty) { aJit.needsUpdate = true; aJitDirty = false; }
@@ -3961,47 +3963,7 @@ function render(now) {
     for (const ring of threatRings) ring.visible = false;
   }
 
-  // ---- 锁定聚焦框：跟着被锁定的鸟走 ----
-  // 亮起快（0.10s 时间常数）、消失慢（0.20s）：锁定是瞬间事件，放弃要留一点余韵。
-  // 目标被抓走时框停在原地淡掉，不会跳到捕食者身上。
-  {
-    const bp = predBaseCount();
-    // 世界坐标 → 屏幕像素的换算（正交相机 + 当前缩放 + 相机摇动都要算进去）。
-    // 框按「屏幕像素」定尺寸，所以缩放、切窗口大小都不会让它小到看不见。
-    const rectPx = cv.getBoundingClientRect();
-    const halfHNow = view2DFitHalfH() / Math.max(0.05, view2D.zoom * SHAKE.zoom);
-    const worldPerPx = (2 * halfHNow) / Math.max(1, rectPx.height);
-    for (let p = 0; p < MAX_SLOT; p++) {
-      const fr = lockFrames[p];
-      const tg = p < bp ? predTarget[p] : -1;
-      const on = tg >= 0 && tg < n && !caught[tg] && siz[tg] > 0.001;
-      lockAlpha[p] += ((on ? 1.0 : 0) - lockAlpha[p]) * (1 - Math.exp(-dt / (on ? 0.09 : 0.22)));
-      let ease = 1;
-      if (on) {
-        const m = tg * 3;
-        const age = Math.max(0, now - predLockFrom[p]);
-        // 收拢：刚锁定时框比鸟大一圈，0.19 秒收到贴合，像镜头对焦。
-        ease = 1 - Math.pow(1 - Math.min(1, age / 190), 3);
-        // 半宽按屏幕像素给：至少 26px（原来只有 4.7px，细线一成亮度 → 等于没画）。
-        // 鸟特别大（arrowSize 拉高）时跟着放大一点，但夹在 26~56px 之间。
-        const pxHalf = clampNum(siz[tg] * worldPerPx * 2.4, 22, 52) * (1.34 - 0.34 * ease);
-        lockHalf[p] = pxHalf * worldPerPx;
-        lockPx[p] = pxHalf;
-        lockPosX[p] = pos[m];
-        lockPosY[p] = pos[m + 1];
-      }
-      if (lockAlpha[p] < 0.012) { fr.visible = false; continue; }
-      fr.visible = true;
-      fr.position.set(lockPosX[p], lockPosY[p], 0);
-      // 朝向跟相机走（和警戒圈同一套）：框是「准星」而不是世界里的物体，
-      // 相机摇晃带来的滚转不该让它跟着歪。位置仍用世界坐标，所以不会脱靶。
-      fr.quaternion.copy(camera.quaternion);
-      fr.scale.set(lockHalf[p], lockHalf[p], 1);
-      fr.material.uniforms.uPx.value = lockPx[p];
-      // 刚咬住的那 0.2 秒额外亮一档（收拢时「咔哒」一下），随后回落到常态。
-      fr.material.uniforms.uAlpha.value = Math.min(1.5, lockAlpha[p] * (1 + 0.5 * (1 - ease)));
-    }
-  }
+  // 锁定高亮直接写在箭头自己身上（见上面的鸟着色循环），这里不再有独立的框需要更新。
 
   // 捕杀三段动画，节拍与 predate() 的三段音一致
   for (const b of killBursts) {
@@ -4070,6 +4032,8 @@ function render(now) {
     hudTimer = 0;
     const $ = (id) => document.getElementById(id);
     const fxOn = audio.enabled && !audio.muted;
+    // 数量：关掉「被吃后重生」时队伍会真的变少，这里刷新「存活/设定」。
+    updateHCount();
 
     // 主导状态徽标：一眼看出「现在整群在干什么」，比九个静态数字有看点
     let st = '自由巡航', cls = 'st-cruise';
@@ -4164,7 +4128,7 @@ addEventListener('resize', () => {
 });
 
 // 存档恢复后同步 HUD 上的初始数量
-document.getElementById('hCount').textContent = activeCount;
+updateHCount();
 document.getElementById('hPred').textContent = params.predatorOn ? activeP : '0';
 requestAnimationFrame(render);
 
@@ -4280,6 +4244,15 @@ window.FlockLab = {
     if (on) { initPredators(0, activeP); predTarget.fill(-1); predLockUntil.fill(0); }
     syncPredDraw();
     return params.predatorOn;
+  },
+  // 「被吃后重生」开关：调试时可以直接拨，行为和面板上的开关完全一致。
+  get respawnOn() { return params.respawnOn; },
+  setRespawnOn(on) {
+    params.respawnOn = !!on;
+    syncCtrl('respawnOn');
+    syncRespawnQueue(params.respawnOn);
+    saveParamsNow();
+    return params.respawnOn;
   },
   toWorld: (cx, cy) => screenToWorld(cx, cy),
   get mousePredator() {
@@ -4661,15 +4634,17 @@ window.FlockLab = {
       givingUp: performance.now() < predGiveUpUntil[p],
     }));
   },
-  // 锁定聚焦框的状态：哪只鸟被锁、框的透明度与半宽、是否可见。
+  // 锁定高亮的状态：哪只鸟被锁、它现在的描边粗细倍数、已经被瞄了多久（秒）。
   get predatorLocks() {
-    return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => ({
-      target: predTarget[p],
-      alpha: +lockAlpha[p].toFixed(2),
-      half: +lockHalf[p].toFixed(2),
-      px: +lockPx[p].toFixed(1),          // 屏幕上的半宽（像素）：验证「看得见」用
-      visible: !!(lockFrames[p] && lockFrames[p].visible),
-    }));
+    return Array.from({ length: params.predatorOn ? activeP : 0 }, (_, p) => {
+      const tg = predTarget[p];
+      const hit = tg >= 0 && tg < MAX_N;
+      return {
+        target: tg,
+        thick: hit ? +thick[tg].toFixed(2) : 0,       // 1 = 正常，被锁定约 2.0~2.3
+        locked: hit ? +(Math.max(0, performance.now() - predLockFrom[p]) / 1000).toFixed(2) : 0,
+      };
+    });
   },
   // 世界坐标 → 画布像素坐标。调试用：定位某个特效在屏幕上到底落在哪儿
   // （正交相机 + 相机摇晃/缩放都要算进去，直接用 camera.project）。
