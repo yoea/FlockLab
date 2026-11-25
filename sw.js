@@ -6,7 +6,9 @@
 // 缓存策略刻意选「stale-while-revalidate」而不是「cache-first」：
 // 前者最多落后一个版本（第二次打开就是新的），后者会让改了代码的页面一直发不出去。
 
-const VER = 'v5';
+// 缓存代次：跟产品版本走。每次发版改这一行，旧缓存在新 SW 激活时整批清掉，
+// 装成应用的用户重开一次就能拿到新代码（不依赖 stale-while-revalidate 的第二次刷新）。
+const VER = 'v1.4.8';
 const CACHE = `flocklab-${VER}`;
 
 // 应用壳：离线也必须能起来
