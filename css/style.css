@@ -309,6 +309,38 @@
   .hud-foot .dots { display: inline-flex; gap: 1px; }
   .hud-foot #hFps { color: var(--dim); font-weight: 500; }
 
+  /* 运行模式 + CPU/GPU 压力：一行三条，压力条只是缩小的 .bar */
+  .hud-perf {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 4px 9px;
+    margin: 0 0 8px; font-size: 10px; color: var(--dim);
+  }
+  .pc-mode {
+    flex: 0 0 auto; font-size: 9.5px; font-weight: 650; letter-spacing: .06em;
+    padding: 2px 7px; border-radius: 999px; white-space: nowrap;
+    color: #ffb36b; border: 1px solid rgba(255, 179, 107, .38); background: rgba(255, 179, 107, .09);
+    transition: color .3s, border-color .3s, background .3s;
+  }
+  .pc-mode.mc { color: #8fe6a8; border-color: rgba(143, 230, 168, .38); background: rgba(143, 230, 168, .09); }
+  .pc { display: inline-flex; align-items: center; gap: 4px; }
+  .pc .k { font-size: 9px; letter-spacing: .06em; }
+  .pc .pv {
+    font-size: 9.5px; color: var(--ink); font-weight: 600;
+    min-width: 27px; text-align: right; font-variant-numeric: tabular-nums;
+  }
+  .bar.mini { width: 30px; height: 3px; }
+
+  /* 版本行：版本 · commit · 构建时间 · 作者，字号最小，视觉上退到最底层 */
+  .hud-ver {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+    margin-top: 7px; padding-top: 6px;
+    border-top: 1px solid rgba(126, 170, 235, .08);
+    font-size: 9px; color: #5d7090; letter-spacing: .05em;
+    font-variant-numeric: tabular-nums;
+  }
+  .hud-ver i { font-style: normal; color: #3d4c63; }
+  .hud-ver #hVer { color: #7e93b5; }
+  .hud-ver #hCommit { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
   .bar {
     position: relative; width: 92px; height: 4px; border-radius: 4px;
     background: rgba(150, 180, 230, 0.16); overflow: hidden;
@@ -318,6 +350,9 @@
     background: linear-gradient(90deg, #4fd8ff, #a78bfa, #ff77b5);
     transition: width .12s linear;
   }
+  /* 压力分级：同特异性、写在后面才会覆盖上面的渐变 */
+  .bar > i.warn { background: linear-gradient(90deg, #ffd166, #ffb36b); }
+  .bar > i.hot  { background: linear-gradient(90deg, #ff9a6b, #ff5c7a); }
   .dot {
     display: inline-block; width: 7px; height: 7px; margin-right: 6px;
     border-radius: 50%; background: #4a5c78; transition: background .12s, box-shadow .12s;
@@ -468,6 +503,10 @@
     #hud .event-line { font-size: 10px; gap: 6px; }
     #hud .hud-foot { font-size: 10px; }
     #hud .bar { width: 74px; }
+    /* 上面的 #hud .bar 特异性比 .bar.mini 高，压力条要单独收窄回来 */
+    #hud .bar.mini { width: 26px; }
+    #hud .pc .pv { min-width: 24px; }
+    #hud .hud-perf { gap: 3px 7px; }
 
     /* 控制台：贴底整宽，限高 52vh，内部滚动 */
     .lil-gui.root {

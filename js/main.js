@@ -3,6 +3,7 @@ import { FlockAudio, FlockMusic } from './audio.js';
 import { createGrass } from './grass.js';
 import { createBackdrop } from './backdrop.js';
 import { computeForces, MAX_FORCE } from './forces.js';
+import { VERSION, COMMIT, BUILD_TIME, AUTHOR } from './version.js';
 
 const fail = (msg) => {
   const el = document.getElementById('error');
@@ -66,6 +67,8 @@ const MC = {
   epoch: 0,         // 数组被重置过就 +1，旧结果直接丢弃
   serial: 0,
   lastWall: 0,      // 上一帧 dispatch→收齐的墙钟时间（ms）
+  warm: 0,          // 成功跑完的帧数：前几帧要等 worker 首次加载/JIT 编译 forces.js，
+                    // 和后面的稳态耗时不是一个量级，超时判定必须给首帧更宽的预算
   minN: 320,        // 小群体并行反而更慢（消息开销 > 计算）
   timeoutMs: 800
 };
@@ -99,9 +102,7 @@ const DEFAULTS = {
   flow: 2.05,
   maxSpeed: 15,
   minSpeed: 0.5,
-  boundary: BOUND,
   arrowSize: 0.25,
-  master: 0.38,
   // 捕食者：标准 Reynolds pursuit + 预测逃逸模型
   predatorOn: true,
   predatorCount: 1,
@@ -171,7 +172,11 @@ function loadParams() {
       const old = JSON.parse(localStorage.getItem(STORE_KEY_PREV) || 'null');
       if (old && typeof old === 'object') {
         saved = old;
-        localStorage.setItem(STORE_KEY, JSON.stringify(old));
+        // 只搬 PERSIST_KEYS 里的键：老版本可能还存着 musicLevel / boundary 这些
+        // 现在已经不读的字段，原样搬会一直在存档里躺着，让人以为它们还生效。
+        const clean = {};
+        for (const key of PERSIST_KEYS) if (old[key] !== undefined) clean[key] = old[key];
+        localStorage.setItem(STORE_KEY, JSON.stringify(clean));
       }
     } catch (_) { /* 读不到就算了 */ }
   }
@@ -192,16 +197,23 @@ function loadParams() {
 loadParams();
 
 let saveTimer = 0;
+function saveParamsNow() {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  try {
+    const out = {};
+    for (const key of PERSIST_KEYS) out[key] = params[key];
+    localStorage.setItem(STORE_KEY, JSON.stringify(out));
+  } catch (_) { /* 隐私模式写不进去时静默忽略 */ }
+}
 function saveParams() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      const out = {};
-      for (const key of PERSIST_KEYS) out[key] = params[key];
-      localStorage.setItem(STORE_KEY, JSON.stringify(out));
-    } catch (_) { /* 隐私模式写不进去时静默忽略 */ }
-  }, 120);
+  saveTimer = setTimeout(saveParamsNow, 120);
 }
+// 拖完滑杆立刻关页面 / 切到后台时，120ms 的防抖窗口会把最后一次改动丢掉。
+// 这两个事件一定在页面被挂起前跑到，所以在这里强制落盘。
+addEventListener('pagehide', saveParamsNow);
+addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveParamsNow(); });
 
 // 存档里可能存着一个超过当前 MAX_N 的数量（例如旧版本允许更大的上限）：
 // 直接拿来用会让所有定长 TypedArray 越界读写（读到 undefined 变成 NaN），
@@ -659,6 +671,13 @@ function setPredCount(v) {
   // 现在统一走 syncPredDraw()：数量一变，鼠标捕食者的槽位也跟着挪到队尾。
   syncPredDraw();
   document.getElementById('hPred').textContent = params.predatorOn ? next : '0';
+  syncCtrl('predatorCount');
+}
+// 调试接口（FlockLab.setCount 等）绕过 GUI 直接改 params，lil-gui 不会自己重绘，
+// 于是面板上显示的还是旧数字。这里按 key 找到控件刷一次显示。
+// guiCtrls 定义在后面，但这两个函数的调用都在面板建好之后，运行时安全。
+function syncCtrl(key) {
+  for (const [k, c] of guiCtrls) if (k === key) { c.updateDisplay(); return; }
 }
 function setCount(v) {
   MC.epoch++;
@@ -668,6 +687,7 @@ function setCount(v) {
   params.count = next;
   arrowGeo.instanceCount = next;
   document.getElementById('hCount').textContent = next;
+  syncCtrl('count');
 }
 
 // ---------------------------------------------------------------- 场景
@@ -710,6 +730,47 @@ renderer.setPixelRatio(Math.min(devicePixelRatio || 1, isTouch ? 1.5 : 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.getElementById('scene').appendChild(renderer.domElement);
+
+// ---------------------------------------------------------------- GPU 计时
+// 状态卡上的 GPU 压力要有真实来源：用 EXT_disjoint_timer_query_webgl2 异步测
+// 「渲染这一帧显卡花了多久」。一个 query 对象就够——上一帧结果还没就绪时本帧
+// 不发新查询，所以是隔一两帧采一次；读取只在 QUERY_RESULT_AVAILABLE 为真时发生，
+// 不会像 gl.finish() 那样把管线卡住。
+// 浏览器不给这个扩展（Safari / 部分移动端）时 gpuTimer 为 null，HUD 退回
+// 「渲染提交耗时」估算，并在数字前加 ~ 标明是估算值。
+const gpuTimer = (() => {
+  try {
+    const gl = renderer.getContext();
+    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    if (!ext) return null;
+    const q = gl.createQuery();
+    if (!q) return null;
+    return { gl, ext, q, busy: false, pending: false, ms: 0, ok: false };
+  } catch (_) { return null; }
+})();
+function gpuQueryBegin() {
+  if (!gpuTimer || gpuTimer.busy) return;
+  gpuTimer.gl.beginQuery(gpuTimer.ext.TIME_ELAPSED_EXT, gpuTimer.q);
+  gpuTimer.busy = true;
+}
+function gpuQueryEnd() {
+  if (!gpuTimer || !gpuTimer.busy) return;
+  gpuTimer.gl.endQuery(gpuTimer.ext.TIME_ELAPSED_EXT);
+  gpuTimer.pending = true;
+}
+function gpuQueryPoll() {
+  if (!gpuTimer || !gpuTimer.pending) return;
+  const { gl, ext, q } = gpuTimer;
+  // 显卡中途换过频 / 被别的进程抢过，这批计时不可信，直接丢掉重来
+  if (gl.getParameter(ext.GPU_DISJOINT_EXT)) {
+    gpuTimer.busy = false; gpuTimer.pending = false; return;
+  }
+  if (gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) {
+    const ns = gl.getQueryParameter(q, gl.QUERY_RESULT);
+    if (ns > 0) { gpuTimer.ms = ns / 1e6; gpuTimer.ok = true; }
+    gpuTimer.busy = false; gpuTimer.pending = false;
+  }
+}
 
 // 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
 let bgMesh = null;   // 背景渐变稍后才创建，先声明避免「用到未定义变量」
@@ -1960,37 +2021,37 @@ function bindBool(folder, key, label, hint, after) {
   return ctrl;
 }
 
-const fRules = gui.addFolder('鸟群规则');
-bindNum(fRules, 'separation', 0, 4, 0.01, '分离力度',
-  '分离｜调大：鸟会把贴得太近的同伴用力推开，群体更松散、不重叠。调小：彼此贴得很近甚至挤成一团。');
-bindNum(fRules, 'alignment', 0, 4, 0.01, '对齐力度',
-  '对齐｜调大：鸟更倾向和周围同伴同向飞，队伍更整齐。调小：各飞各的，方向散乱。');
-bindNum(fRules, 'cohesion', 0, 4, 0.01, '聚合力度',
-  '聚合｜调大：鸟更想靠近同伴中心，容易抱团。调小：群体更分散。');
-bindNum(fRules, 'perception', 1, 14, 0.1, '视野范围',
-  '视野半径｜调大：每只鸟能看到更远的同伴，队伍更连贯（计算量也更大）。调小：只看身边几只，队形容易断裂。');
-bindNum(fRules, 'separationRange', 0.2, 6, 0.1, '安全距离',
-  '安全距离｜两只鸟比这更近时才开始互躲。调大：队伍稀疏、空隙大。调小：能挤得很紧密。它和“分离力度”不同：这里管多近才躲，分离力度管躲得多用力。');
-fRules.open();
-
-const fMotion = gui.addFolder('飞行与视野');
-bindNum(fMotion, 'count', 10, MAX_N, 10, '元素数量',
+// 分组按「看什么 → 怎么飞 → 谁吃谁 → 画面与性能」排，最常动的放最上面；
+// 默认只展开前两组与捕食者，其余收起——一次全展开会把面板拉到屏幕外。
+const fFlock = gui.addFolder('鸟群');
+bindNum(fFlock, 'count', 10, MAX_N, 10, '元素数量',
   '元素总数（默认 800，范围 10~10000）｜调多：画面更壮观、群体感更强，但帧率会下降（每只鸟都要算物理、每帧上传实例数据，主线程最吃紧）。每只鸟只注意最近的 7 个同伴，所以配对量是固定的 7×数量，不会因为密度翻倍而爆炸；1 万只时单帧仿真约 6~10ms，绘制仍不到 1ms。调少：更容易看清单只的行为。',
   (v) => setCount(v));
-bindNum(fMotion, 'maxSpeed', 2, 18, 0.1, '巡航速度',
+bindNum(fFlock, 'separation', 0, 4, 0.01, '分离力度',
+  '分离｜调大：鸟会把贴得太近的同伴用力推开，群体更松散、不重叠。调小：彼此贴得很近甚至挤成一团。');
+bindNum(fFlock, 'alignment', 0, 4, 0.01, '对齐力度',
+  '对齐｜调大：鸟更倾向和周围同伴同向飞，队伍更整齐。调小：各飞各的，方向散乱。');
+bindNum(fFlock, 'cohesion', 0, 4, 0.01, '聚合力度',
+  '聚合｜调大：鸟更想靠近同伴中心，容易抱团。调小：群体更分散。');
+bindNum(fFlock, 'perception', 1, 14, 0.1, '视野范围',
+  '视野半径｜调大：每只鸟能看到更远的同伴，队伍更连贯（计算量也更大）。调小：只看身边几只，队形容易断裂。');
+bindNum(fFlock, 'separationRange', 0.2, 6, 0.1, '安全距离',
+  '安全距离｜两只鸟比这更近时才开始互躲。调大：队伍稀疏、空隙大。调小：能挤得很紧密。它和“分离力度”不同：这里管多近才躲，分离力度管躲得多用力。');
+fFlock.open();
+
+const fFly = gui.addFolder('飞行');
+bindNum(fFly, 'maxSpeed', 2, 18, 0.1, '巡航速度',
   '巡航速度｜鸟平时最快能飞多快。调大：整体飞得更快、更容易拉开距离，但转弯会变迟钝。逃逸爆发是在这个速度上再乘倍率。',
   (v) => { arrowMat.uniforms.uMaxSpeed.value = v; });
-bindNum(fMotion, 'flow', 0, 4, 0.05, '气流扰动',
+bindNum(fFly, 'minSpeed', 0.5, 8, 0.1, '最低速度',
+  '最低速度｜鸟再慢也不会低于这个值，避免悬停不动。一般不用调。');
+bindNum(fFly, 'flow', 0, 4, 0.05, '气流扰动',
   '气流扰动｜调大：鸟更容易被随机气流带偏，运动更自然，但队形更松散。调 0：完全按三规则飞行。');
-bindNum(fMotion, 'arrowSize', 0.18, 0.9, 0.01, '元素大小',
-  '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍，再整体 ×2），所以它只影响外观，不影响运动规则。');
-bindBool(fMotion, 'wrapEdges', '屏幕边缘穿越',
+bindBool(fFly, 'wrapEdges', '屏幕边缘穿越',
   '屏幕边缘穿越｜开启：墙不存在，鸟和猛禽飞出画面后从对侧同一高度飞回来（等价环面，群体能完整地穿过去再聚回来）。关闭：墙变成实体，撞到边缘就弹开（速度损失 8%），捕食者也会被弹回来。');
-bindNum(fMotion, 'viewShake', 0, 2.5, 0.05, '视野摇晃',
-  '视野摇晃｜模拟人扛着摄影机：缓慢左右上下漂移 + 轻微倾斜 + 轻微拉近拉远，只影响画面、不动物理。0 = 完全静止（做前后截图对比时用它）｜调大：更像手持机，但看久了可能有点晕。');
-fMotion.open();
+fFly.close();
 
-const fPred = gui.addFolder('捕食与逃逸');
+const fPred = gui.addFolder('捕食者');
 bindBool(fPred, 'predatorOn', '开启捕食者',
   '开启捕食者｜打开后出现橙红色锐角三角形，接触即捕获；鸟会逃逸，危险时会短时爆发加速。',
   (v) => {
@@ -2010,39 +2071,44 @@ bindNum(fPred, 'predSpeed', 2, 36, 0.1, '捕食者速度',
   (v) => { predMat.uniforms.uMaxSpeed.value = v; });
 bindNum(fPred, 'chaseWeight', 0, 4, 0.05, '追击力度',
   '追击力度｜调大：捕食者拐弯追得更凶、咬得更紧；太大急转会不自然。');
-bindNum(fPred, 'fleeRange', 3, 24, 0.5, '危险感知距离',
-  '危险感知距离｜鱼群在多远开始察觉捕食者。调大：整群提前绕开，几乎不会被逼近。调小：捕食者贴脸才逃，容易被抓。注意察觉后还要经过反应延迟（贴身约 45ms、圈边缘约 260ms）才会爆发冲刺。');
-bindNum(fPred, 'fleeWeight', 0, 6, 0.05, '逃跑力度',
-  '逃跑力度｜调大：个体和整群都逃得更拼命，鱼群会更整齐地绕开捕食者。太大会盖过群聚，队形散掉。');
-bindNum(fPred, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
-  '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
-bindNum(fPred, 'sprintDuration', 0.2, 3, 0.1, '爆发持续(秒)',
-  '爆发持续时间｜一次逃命冲刺能维持几秒。调长：逃得更远、拖尾更长。调短：更像瞬间闪避。结束后速度回到巡航上限。');
-bindNum(fPred, 'sprintRecovery', 1, 12, 0.5, '体力恢复(秒)',
-  '体力恢复时间｜爆发后要几秒才能再次爆发。调大：几乎不能连续爆发，鸟更容易被抓。调小：可以频繁逃生。');
-bindBool(fPred, 'infoCascade', '警报传递',
-  '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
+bindNum(fPred, 'lockTime', 0, 5, 0.1, '锁定目标(秒)',
+  '锁定目标｜捕食者专注追同一只鸟的秒数。调大：不容易被鸟群晃动骗到，追击更稳定。');
+bindNum(fPred, 'predict', 0, 1.5, 0.05, '预判系数',
+  '预判系数｜捕食者追的是鸟的「未来位置」而不是当前位置。调大：更难甩掉；太大像未卜先知。');
+bindNum(fPred, 'feedCooldown', 0.3, 60, 0.1, '进食冷却(秒)',
+  '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
 fPred.open();
 
-const fAdv = gui.addFolder('高级参数（很少用）');
-bindBool(fAdv, 'multiCore', '多核加速',
-  '多核加速｜把最耗时的邻域受力计算按个体区间切给几个后台线程并行（本机最多 6 个，长年不变的那部分仍在主线程）。关掉立刻回到单核，可以和打开时对比右下角的 FPS——鸟越多差距越大。检测不到 Worker 或某次计算超时会自动退回单核，不会卡住。',
-  (v) => { setMultiCore(v); saveParams(); });
-bindNum(fAdv, 'minSpeed', 0.5, 8, 0.1, '最低速度',
-  '最低速度｜鸟再慢也不会低于这个值，避免悬停不动。一般不用调。');
-bindNum(fAdv, 'predict', 0, 1.5, 0.05, '预判系数',
-  '预判系数｜鸟逃跑时会朝捕食者未来位置躲。调大：躲得更提前；太大像未卜先知。');
-bindNum(fAdv, 'lockTime', 0, 5, 0.1, '锁定目标(秒)',
-  '锁定目标｜捕食者专注追同一只鸟的秒数。调大：不容易被鸟群晃动骗到，追击更稳定。');
-bindNum(fAdv, 'feedCooldown', 0.3, 60, 0.1, '进食冷却(秒)',
-  '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
-fAdv.close();
+const fFlee = gui.addFolder('逃逸');
+bindNum(fFlee, 'fleeRange', 3, 24, 0.5, '危险感知距离',
+  '危险感知距离｜鱼群在多远开始察觉捕食者。调大：整群提前绕开，几乎不会被逼近。调小：捕食者贴脸才逃，容易被抓。注意察觉后还要经过反应延迟（贴身约 45ms、圈边缘约 260ms）才会爆发冲刺。');
+bindNum(fFlee, 'fleeWeight', 0, 6, 0.05, '逃跑力度',
+  '逃跑力度｜调大：个体和整群都逃得更拼命，鱼群会更整齐地绕开捕食者。太大会盖过群聚，队形散掉。');
+bindNum(fFlee, 'sprintFactor', 1, 2.5, 0.05, '爆发速度倍率',
+  '爆发倍率｜体力满时短时最高速度 = 巡航速度 × 此值。调大：瞬间甩开捕食者，但爆发结束后更容易被追上。');
+bindNum(fFlee, 'sprintDuration', 0.2, 3, 0.1, '爆发持续(秒)',
+  '爆发持续时间｜一次逃命冲刺能维持几秒。调长：逃得更远、拖尾更长。调短：更像瞬间闪避。结束后速度回到巡航上限。');
+bindNum(fFlee, 'sprintRecovery', 1, 12, 0.5, '体力恢复(秒)',
+  '体力恢复时间｜爆发后要几秒才能再次爆发。调大：几乎不能连续爆发，鸟更容易被抓。调小：可以频繁逃生。');
+bindBool(fFlee, 'infoCascade', '警报传递',
+  '警报传递｜开启后受惊的鸟会把逃跑方向告诉邻居，惊吓像波纹一样扩散。关闭则各逃各的。');
+fFlee.close();
 
 const fGrass = gui.addFolder('草地');
 bindBool(fGrass, 'grassOn', '长草地（定期降落休息）',
   '草地｜开启后场地里会长出 2~3 片草地（总面积约占屏幕 15%，可以压到边界上）。每只鸟每隔二三十秒必须去一次，挑一片最近、没满的降落，只要没有危险就一直待着（最长 28~60 秒，逐只错开）；被惊到会立刻飞走并重新计时，没待够 5 秒的下次很快会再来。草地上的个体会保持间距、各朝各的方向；有新鸟落下时，已经休息 5~60 秒的老住客有 10% 概率往旁边挪（每只最多挪 2 次）。掠过草地的鸟还有 5%~13%（按个体浮动）概率顺势落下来。不休息的鸟会主动绕开草地。关掉后草地隐藏，正在休息的鸟马上起飞。',
   (v) => { syncGrassVisibility(); if (!v) liftAllResting(); });
-fGrass.open();
+fGrass.close();
+
+const fView = gui.addFolder('画面与性能');
+bindNum(fView, 'arrowSize', 0.18, 0.9, 0.01, '元素大小',
+  '元素大小｜一只鸟的整体尺寸。捕食者的腰长与底边按这个值等比推导（腰长 1.4 倍、底 0.7 倍，再整体 ×2），所以它只影响外观，不影响运动规则。');
+bindNum(fView, 'viewShake', 0, 2.5, 0.05, '视野摇晃',
+  '视野摇晃｜模拟人扛着摄影机：缓慢左右上下漂移 + 轻微倾斜 + 轻微拉近拉远，只影响画面、不动物理。0 = 完全静止（做前后截图对比时用它）｜调大：更像手持机，但看久了可能有点晕。');
+bindBool(fView, 'multiCore', '多核加速',
+  '多核加速｜把最耗时的邻域受力计算按个体区间切给几个后台线程并行（本机最多 6 个，长年不变的那部分仍在主线程）。关掉立刻回到单核，可以和打开时对比状态卡上的 CPU 占用与 FPS——鸟越多差距越大。检测不到 Worker 或某次计算超时会自动退回单核，不会卡住。',
+  (v) => setMultiCore(v));
+fView.close();
 
 // 恢复出厂参数：点右下角「重新初始化」才会走到这里，平时刷新都沿用存档。
 function applyDefaults() {
@@ -2060,6 +2126,9 @@ function applyDefaults() {
   liftAllResting();
   music.setLevel(params.musicLevel);
   if (audio.fxBus) audio.fxBus.gain.setTargetAtTime(params.fxLevel, audio.ctx.currentTime, 0.08);
+  // multiCore 不是「读 params 就生效」的参数：必须真的建 / 拆 worker 池。
+  // 少了这一句，重置后面板显示「开」但实际还在单核跑，要刷新才恢复。
+  setMultiCore(params.multiCore);
   for (const [, ctrl] of guiCtrls) ctrl.updateDisplay();
   saveParams();
   resetBoids();
@@ -2976,6 +3045,7 @@ function initMultiCore() {
   }
   MC.enabled = MC.workers.length > 0;
   MC.reason = MC.enabled ? 'on' : 'empty';
+  MC.warm = 0;
 }
 
 function abortMultiCore(reason) {
@@ -2983,6 +3053,11 @@ function abortMultiCore(reason) {
   MC.enabled = false;
   MC.reason = reason;
   MC.job = null;
+  // 已经决定不用了就把线程池收掉：否则这几个 worker 会一直挂在后台占内存。
+  // 用户想再试一次走 setMultiCore(true)，那条路径会重建。
+  for (const s of MC.workers) { try { s.w.terminate(); } catch (_) {} }
+  MC.workers = [];
+  MC.warm = 0;
   toast('多核加速不可用，已切回单核');
 }
 
@@ -3036,7 +3111,10 @@ function dispatchMulti(F, dt, time) {
   const job = MC.job = {
     F, dt, time, left: k, ready: false, epoch: MC.epoch,
     sumN: 0, cx: 0, cy: 0, minPair2: Infinity, impact: 0,
-    t0: performance.now(), ms: 0
+    t0: performance.now(), ms: 0,
+    // 首帧宽限 4 倍：6 个 worker 要各自下载并编译 forces.js，冷启动那一次能到几百毫秒，
+    // 按稳态的 800ms 判超时会把一个本来正常的多核在开局就误杀掉。
+    budget: MC.warm === 0 ? MC.timeoutMs * 4 : MC.timeoutMs
   };
   // 按「上一帧邻居数」的累计量切连续区间，而不是等分个体数：
   // 群体是一团，等分会让正好覆盖密团的那些 worker 承担几倍的工作量，整帧被最慢的拖住。
@@ -3096,6 +3174,7 @@ function onWorkerDone(slot, m) {
   job.ms += m.res.ms;
   if (--job.left === 0) {
     job.ready = true;
+    MC.warm++;
     // 真正的并行耗时：dispatch → 最后一个 worker 返回（不含等下一帧 rAF）。
     MC.lastWall = performance.now() - job.t0;
   }
@@ -3205,7 +3284,28 @@ function setStat(id, v) {
 
 let last = performance.now();
 let fps = 60, fpsAcc = 0, fpsFrames = 0, hudTimer = 0;
-const perf = { step: 0, prep: 0, draw: 0 };
+const perf = { step: 0, prep: 0, draw: 0, cpu: 0, gpu: 0 };
+
+// 压力条以 60fps 的单帧预算为 100%：掉到 30fps 时 CPU 会显示约「实际耗时 / 16.7ms」，
+// 不会因为帧间隔本身变长就把数字稀释掉（那样越卡反而越像「不忙」）。
+const FRAME_BUDGET = 1000 / 60;
+function setMeter(barId, valId, pct, est) {
+  const p = Math.max(0, Math.min(999, pct || 0));
+  const bar = document.getElementById(barId);
+  if (!bar) return;
+  bar.style.width = Math.min(100, p).toFixed(1) + '%';
+  bar.className = p >= 75 ? 'hot' : p >= 45 ? 'warn' : '';
+  document.getElementById(valId).textContent = (est ? '~' : '') + Math.round(p) + '%';
+}
+
+// 版本行与关于弹窗里的版本号：只在启动时写一次（构建元数据是常量）。
+(function fillVersion() {
+  const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  set('hVer', VERSION); set('hCommit', COMMIT); set('hBuild', BUILD_TIME); set('hAuthor', AUTHOR);
+  set('aVer', VERSION);
+  const line = document.getElementById('hVerLine');
+  if (line) line.title = `FlockLab ${VERSION}｜commit ${COMMIT}｜构建 ${BUILD_TIME}｜作者 ${AUTHOR}`;
+})();
 
 const mcWeights = new Float64Array(MAX_N + 1);   // 负载切分用的权重前缀和
 const mcCuts = new Int32Array(64);                // 切分点（worker 数上限 62）
@@ -3232,7 +3332,7 @@ function render(now) {
   if (!params.paused) {
     if (MC.enabled) {
       if (MC.job && MC.job.ready) finishMulti();
-      if (MC.job && !MC.job.ready && performance.now() - MC.job.t0 > MC.timeoutMs) {
+      if (MC.job && !MC.job.ready && performance.now() - MC.job.t0 > MC.job.budget) {
         abortMultiCore('timeout');
       }
       if (!MC.enabled) { step(dt, now); simAcc = 0; }          // 本帧刚回退：立刻补一步
@@ -3578,7 +3678,11 @@ function render(now) {
   }
 
   const pT2 = performance.now();
+  // GPU 计时：先收上一次的（就绪才读），再给这一帧包一层。
+  gpuQueryPoll();
+  gpuQueryBegin();
   renderer.render(scene, camera);
+  gpuQueryEnd();
   const pT3 = performance.now();
 
   fxFlash.sprint = Math.max(0, fxFlash.sprint - dt * 2.6);
@@ -3638,6 +3742,23 @@ function render(now) {
     $('hSprintFx').className = 'dot' + (fxOn && fxFlash.sprint > 0.35 ? ' sprint' : '');
     $('hPredFx').className = 'dot' + (fxOn && fxFlash.predate > 0.35 ? ' pred' : '');
     $('hBirthFx').className = 'dot' + (fxOn && fxFlash.birth > 0.35 ? ' birth' : '');
+
+    // 运行模式：以「这一帧到底有没有真的在用 Worker」为准，而不是只看开关——
+    // 个体数低于并行阈值、或已经超时回退时，开关是开的但实际在跑单核。
+    const mcLive = MC.enabled && MC.workers.length > 0 && activeCount >= MC.minN;
+    const modeEl = $('hMode');
+    const modeText = mcLive ? '多核 ×' + MC.workers.length : '单核';
+    if (modeEl.textContent !== modeText) modeEl.textContent = modeText;
+    modeEl.className = 'pc-mode' + (mcLive ? ' mc' : '');
+    modeEl.title = mcLive
+      ? `多核：${MC.workers.length} 个后台线程并行算邻域受力｜各线程合计 ${perfParts.force.toFixed(1)}ms，真实并行墙钟 ${MC.lastWall.toFixed(1)}ms`
+      : (MC.enabled
+        ? `单核：当前 ${activeCount} 只，低于并行阈值 ${MC.minN} 只`
+        : '单核：多核加速已关闭，或当前环境不支持 Worker');
+    // CPU = 主线程整帧耗时 / 60fps 预算；GPU = 显卡渲染耗时 / 同一预算。
+    // 没有 GPU 计时扩展时用「渲染提交耗时」兜底，数字前加 ~ 标明是估算。
+    setMeter('hCpuBar', 'hCpu', perf.cpu / FRAME_BUDGET * 100, false);
+    setMeter('hGpuBar', 'hGpu', perf.gpu / FRAME_BUDGET * 100, !(gpuTimer && gpuTimer.ok));
   }
   // 帧内分段耗时（EMA 平滑）：step=Boids 仿真、prep=着色/平滑与实例数据上传、draw=渲染提交。
   // 两个 performance.now() 每段的开销在微秒级，不影响帧率；FlockLab.perf 可读。
@@ -3645,6 +3766,10 @@ function render(now) {
   perf.step += ((pT1 - pT0) - perf.step) * w;
   perf.prep += ((pT2 - pT1) - perf.prep) * w;
   perf.draw += ((pT3 - pT2) - perf.draw) * w;
+  // 状态卡上的两根条：CPU 取主线程整帧耗时，GPU 取计时查询（没有扩展时用提交耗时兜底）。
+  // GPU 采样本来就是隔帧的，收敛放慢一点免得数字乱跳。
+  perf.cpu += ((pT3 - pT0) - perf.cpu) * w;
+  perf.gpu += ((gpuTimer ? gpuTimer.ms : (pT3 - pT2)) - perf.gpu) * (gpuTimer ? 0.14 : w);
 }
 
 addEventListener('resize', () => {
@@ -3735,11 +3860,15 @@ window.FlockLab = {
   get multiCore() {
     return {
       enabled: MC.enabled, workers: MC.workers.length, reason: MC.reason,
+      // live：这一帧实际走的是不是 Worker 路径（个体数低于阈值时开关开着也是单核）
+      live: MC.enabled && MC.workers.length > 0 && activeCount >= MC.minN,
+      minN: MC.minN, count: activeCount,
       cores: navigator.hardwareConcurrency || 0,
       lastWall: +MC.lastWall.toFixed(2), budget: MC.timeoutMs
     };
   },
   setMultiCore(on) { return setMultiCore(on); },
+  get version() { return { version: VERSION, commit: COMMIT, buildTime: BUILD_TIME, author: AUTHOR }; },
   get paused() { return !!params.paused; },
   get sepCap() { return sepCapFor(activeCount); },
   set sepCap(v) { dbgSepCap = Math.max(0, Math.round(v)); return sepCapFor(activeCount); },
@@ -4020,6 +4149,10 @@ window.FlockLab = {
   get perf() {
     return {
       step: +perf.step.toFixed(2), prep: +perf.prep.toFixed(2), draw: +perf.draw.toFixed(2),
+      cpu: +perf.cpu.toFixed(2), gpu: +perf.gpu.toFixed(2),
+      // 压力条用的百分比：以 60fps 帧预算为 100%
+      cpuPct: Math.round(perf.cpu / FRAME_BUDGET * 100), gpuPct: Math.round(perf.gpu / FRAME_BUDGET * 100),
+      gpuMeasured: !!(gpuTimer && gpuTimer.ok),
       total: +(perf.step + perf.prep + perf.draw).toFixed(2),
       grid: +perfParts.grid.toFixed(2), force: +perfParts.force.toFixed(2), loop: +perfParts.loop.toFixed(2),
       stats: +perfParts.stats.toFixed(2), color: +perfParts.color.toFixed(2),

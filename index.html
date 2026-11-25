@@ -75,32 +75,14 @@
     <div class="about-card glass" role="dialog" aria-modal="true" aria-labelledby="aboutLead">
       <button class="about-close" type="button" aria-label="关闭">×</button>
       <p class="about-logo">FLOCKLAB</p>
-      <p class="about-lead" id="aboutLead">俯视的二维平面里，小元素是鸟群，大元素是大型猛禽。每只鸟只遵循分离、对齐、聚合三条局部规则，整群的转向、聚散与逃命却自发涌现——没有任何一只鸟知道全局队形。</p>
+      <p class="about-lead" id="aboutLead">小元素是鸟群，大元素是猛禽。每只鸟只遵循分离、对齐、聚合三条局部规则，整群的转向、聚散与逃命却自发涌现——没有一只鸟知道全局队形。</p>
 
-      <p class="about-sec">怎么看出「涌现」</p>
-      <ol>
-        <li><b>先关掉猛禽</b>，把「聚合力度」从 1.16 拉到 0，鸟群散成一片；再拉到 3 以上，会迅速收成几个紧团。只改一条局部权重，全局形态就变了。</li>
-        <li><b>只盯一只鸟</b>：暂停逐帧看，它永远只对视野半径内的邻居起反应，从没「照着队形飞」。</li>
-        <li><b>等一次捕食</b>：猛禽逼近时爆发不是整群同时亮，而是一圈从它身边向外扩散的涟漪（反应延迟随距离变长）。</li>
-        <li><b>盯着警戒圈</b>：刚吃饱是暗红圈，饿了转成亮红圈，体色同步由浅橙黄渐变回深橙——圈和体色就是它的「饥饿指示灯」。</li>
-        <li><b>看草地</b>：每只鸟隔一阵必须落地停稳 ≥5 秒才算休息；落地的鸟变苔绿、彼此留间距，新鸟落下时老住客偶尔换位。</li>
-        <li><b>盯状态卡</b>：有序度 Φ = |Σvᵢ|/Σ|vᵢ|，散乱时接近 0、整群同向时接近 1；配合 ρ 的 9 秒曲线，能亲眼看到「相变」而不是只靠感觉。</li>
-      </ol>
-
-      <p class="about-sec">机制一览</p>
       <ul>
-        <li><b>随机性</b>每只鸟各有速度系数与缓慢游走；撞墙会随机散射，猛禽也会摆尾。</li>
-        <li><b>贴边掉头 + 10% 传送门</b>鸟和猛禽都能一路冲到边界旁，只在最后两三个单位才把朝外的速度转成沿墙切向并拐回场内，不会离墙一大截就停住（那等于又造了一条边界）；每次靠近另有 10% 概率判定为可穿墙，可穿者当墙不存在、按中心对称从对侧穿出。</li>
-        <li><b>大型猛禽</b>锐角等腰三角形，带扫掠碰撞，接触即捕食；吃到后进入冷却巡游。警戒圈永远在：饱食是暗色圈，捕食阶段是亮色圈。</li>
-        <li><b>爆发</b>只有被猛禽逼近时才冲刺逃命（洋红发光 + 渐隐拖尾 + 一串清脆振翅声）；体力耗尽后必须恢复，不能连续爆发。</li>
-        <li><b>反应延迟</b>看到猛禽不会立刻爆发：贴身约 45ms 起爆，感知圈边缘要约 260ms，所以爆发像涟漪从捕食者身边扩散开。</li>
-        <li><b>草地</b>2~3 片云朵状草地（约占屏幕 15%），鸟每隔二三十秒必须去一次，没危险就一直待着（最长 1 分钟）；落地变苔绿色、彼此保持间距，飞行中的鸟会绕开草地，并有轻微的起降音效。</li>
-        <li><b>音乐</b>六层生成式音景随聚集度变化：散开时几乎无声，抱团后和声变厚、节拍渐起；另有一层若隐若现的低音，和一层跟着猛禽位置缓慢左右游走的盘旋声，都很轻，细听才辨得出。</li>
-        <li><b>自己下场抓一次</b>：在画面上双击左键，光标就变成一只「鼠标捕食者」，完全跟着手走（没有速度上限，箭头朝向就是移动方向），鸟群会像躲猛禽一样散开；划得快会留下尾迹。移出窗口再回来它还在，期间点击、拖拽、滚轮都照常可用；点一下右键恢复成普通箭头。</li>
-        <li><b>操作</b>进入页面先显示完整界面，约 1 秒后带动画自动收起、只留小眼睛；任意操作让小眼睛显现，点它再展开完整界面。拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。左下角状态卡可折叠，点右上角图钉「钉住」后，一键隐藏界面时它会继续留在屏幕上。</li>
-        <li><b>装成应用</b>用 Chrome 或 Edge 打开，等浏览器在地址栏右侧提示「安装」时点一下，就能把 FlockLab 装成本机应用：独立窗口、没有地址栏，之后从桌面 / 开始菜单直接打开，断网也能跑。</li>
+        <li><b>看涌现</b>关掉猛禽，把「聚合力度」拉到 0 再拉到 3：只改一条局部权重，整群形态就变了。</li>
+        <li><b>自己下场</b>在画面上双击左键，光标变成捕食者，鸟群会像躲猛禽一样散开；右键恢复。</li>
+        <li><b>调参</b>控制台每项都有说明，拖动即时生效，刷新后保留。</li>
       </ul>
-      <p class="about-foot">Three.js · WebGL · HTML / CSS / JS / SVG 模块化</p>
+      <p class="about-foot">Three.js · WebGL · <span id="aVer">v47</span></p>
     </div>
   </div>
 
@@ -143,10 +125,20 @@
         <span class="ev ev-rest"><i>❋</i>休憩 <b id="hRest">0</b></span>
       </div>
 
+      <div class="hud-perf" title="CPU：主线程每帧计算耗时占帧预算的比例（多核时 Worker 的耗时不计入）。GPU：显卡渲染一帧的耗时占帧预算的比例，由 WebGL 计时查询实测；浏览器不开放计时时显示提交耗时估算值（带 ~）。">
+        <span class="pc-mode" id="hMode">单核</span>
+        <span class="pc"><span class="k">CPU</span><span class="bar mini"><i id="hCpuBar"></i></span><span class="pv" id="hCpu">0%</span></span>
+        <span class="pc"><span class="k">GPU</span><span class="bar mini"><i id="hGpuBar"></i></span><span class="pv" id="hGpu">0%</span></span>
+      </div>
+
       <div class="hud-foot">
         <span class="v"><span id="hCount">800</span> <span class="pred-n">◆<span id="hPred">1</span></span></span>
         <span class="dots"><span class="dot" id="hSprintFx"></span><span class="dot" id="hPredFx"></span><span class="dot" id="hBirthFx"></span></span>
         <span class="v" id="hFps">— FPS</span>
+      </div>
+
+      <div class="hud-ver" id="hVerLine">
+        <span id="hVer">v47</span><i>·</i><span id="hCommit">—</span><i>·</i><span id="hBuild">—</span><i>·</i><span id="hAuthor">—</span>
       </div>
     </div>
   </div>

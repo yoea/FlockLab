@@ -56,6 +56,8 @@ flocklab/
 ├── js/audio.js         Web Audio 事件音效 + 六层生成式音乐（约 730 行）
 ├── js/grass.js         草地几何、谐波轮廓、面积校准、着色（约 180 行）
 ├── js/backdrop.js      背景地貌（草地斑 / 河流 / 村庄剪影）+ 漂移云层（约 250 行）
+├── js/version.js       **生成的**构建元数据（版本 / commit / 构建时间 / 作者），勿手改
+├── tools/build-meta.mjs 生成器：node tools/build-meta.mjs（发布前跑一次）
 ├── assets/logo.svg     LOGO 与 favicon
 ├── assets/icon-*.png   PWA 图标（48–512 全尺寸 + maskable 192/512 + 180），另含 favicon.ico
 └── README.md / DEVELOPMENT.md
@@ -306,6 +308,37 @@ requestAnimationFrame(render)
   但强度调到 0 仍会立刻回正，因为 `s <= 0` 分支直接清零。
 - 截图逐像素对比前先把 `viewShake` 设 0，否则前后两张永远对不上。
 
+### 3.9c 状态卡：运行模式 / CPU·GPU 压力 / 版本（v47）
+
+**模式标识必须看「这一帧真的在并行吗」，不能看开关。** `params.multiCore` 为 true 但个体数低于 `MC.minN`（320）时走的是单核，超时回退后 `enabled` 也会变 false。所以状态取自 `MC.enabled && MC.workers.length > 0 && activeCount >= MC.minN`，开关只用来解释「为什么现在是单核」。
+
+**两根压力条的含义**（都以 60fps 的 16.7ms 为 100%）：
+
+| 指标 | 取法 | 注意 |
+| --- | --- | --- |
+| CPU | 主线程 `pT3 - pT0`（仿真 + 上传 + 提交） | **不含 Worker**。多核时它很小是正常的，worker 合计与真实墙钟写在 chip 的 title 里 |
+| GPU | `EXT_disjoint_timer_query_webgl2` 测 `renderer.render()` | 浏览器不给扩展时退回 `pT3 - pT2`（提交耗时）并显示 `~x%` |
+
+为什么不用「实测帧间隔」当分母：掉帧时帧间隔本身会变大，压力百分比会被稀释，越卡反而越像「不忙」。固定 16.7ms 基准在 60Hz 上就是真实占用率，在 144Hz 上是个偏保守的参考值。
+
+GPU 查询的写法（漏一步就会读到 0 或卡住）：
+
+```js
+beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
+// 下一帧：getParameter(ext.GPU_DISJOINT_EXT) 为真 → 这批数据不可信，整批丢掉
+//        getQueryParameter(q, QUERY_RESULT_AVAILABLE) 为真才读 QUERY_RESULT（纳秒）
+```
+
+一个 query 对象轮流用就够：结果没就绪的那一帧干脆不发新查询（`busy` 标志），所以是隔一两帧采一次。**不要用 `gl.finish()`**，那会把管线同步住、帧率直接掉一半。
+
+**版本行**：`js/version.js` 是**生成文件**，由 `node tools/build-meta.mjs` 写入版本（取 README 版本表里最大的 vNN）、commit 短哈希、构建时间、作者。
+
+- 工作区有未提交改动时 commit 后面带 `*`（判断时排除 `version.js` 自身，否则每次构建都带星）。
+- 语义是「构建时的 HEAD」。发布流程是「提交代码 → 生成 → 再提交一次 build 元数据」，所以页面显示的 commit 是**代码那一次提交**，不是元数据那次。
+- 它进了 `sw.js` 的离线壳：**忘了加会导致离线冷启动白屏**（module import 404）。
+
+**控制台分组**：按「看什么 → 怎么飞 → 谁吃谁 → 画面与性能」排，默认只展开「鸟群」「捕食者」。lil-gui 的 folder **默认就是展开的**，想让某组收起必须显式 `folder.close()`——只写 `fA.open()` 不管其他组，结果会是全开、面板直接拉出屏幕。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
@@ -319,7 +352,8 @@ requestAnimationFrame(render)
 - **随机化要带个体相位**：任何「定时/重试/错峰」都要叠 `restPhase[i]`（0–1），否则一批个体会在同一秒同步动作。
 - **软错峰**：每帧放行少量个体（出发 2 只 / 站定 1 只），超出的顺延而不是取消需求。
 - **颜色走调色表**：`palFly`/`palRest`/`sprintPal` 预计算 32×16，运行期不调 `THREE.Color.setHSL`。
-- **存档**：`localStorage['flocklab.params.v6']`；出厂默认值变更时**必须提升版本号**，否则老用户永远拿不到新默认值。
+- **存档**：`localStorage['flocklab.params.v7']`（上一版是 v6）。出厂默认值变更时**必须提升版本号**，否则老用户永远拿不到新默认值；只是新增一个键不用升版本，缺键会走 `DEFAULTS`。
+- **存档三件套**（v47 补齐）：写入走 120ms 防抖，但 `pagehide` / `visibilitychange→hidden` 时**立即落盘**（否则「拖完滑杆马上关页面」会丢最后一次改动）；读取时逐键校验类型 + `clamp` 到 `PARAM_RANGE`（坏 JSON、`"800"` 字符串、越界值都只影响那一项）；`count` / `predatorCount` 额外取整。
 
 ---
 
@@ -370,9 +404,11 @@ requestAnimationFrame(render)
 
 **视野**：`viewShakeNow` → `{x, y, roll, zoom, t}`（当前摇晃的瞬时量，验证幅度用）；`screenToWorld(cx, cy)` / `projectToScreen(x, y)` 互为逆变换，用来验证鼠标与画面是否对准
 
-**性能**：`perf` → `{step, prep, draw, total, fps, count, grid, loop, stats, color, force}`（毫秒，指数平滑；`force` 单核模式是 `computeForces` 的耗时、多核模式是**各 worker 计算时间之和**，可直接和单核对比）
+**性能**：`perf` → `{step, prep, draw, cpu, gpu, cpuPct, gpuPct, gpuMeasured, total, fps, count, grid, loop, stats, color, force}`（毫秒，指数平滑；`force` 单核模式是 `computeForces` 的耗时、多核模式是**各 worker 计算时间之和**，可直接和单核对比；`cpu` 是主线程整帧耗时，`gpu` 是计时查询测到的渲染耗时，`gpuMeasured=false` 时它是提交耗时估算）
 
-**多核**：`multiCore` → `{enabled, workers, reason, cores, lastWall, budget}`（`reason` 为 `on` / `off` / `timeout` / `worker-error` / `no-worker` / `spawn`；`lastWall` 是真实并行墙钟，不含等下一帧的时间）/ `setMultiCore(bool)`
+**多核**：`multiCore` → `{enabled, workers, reason, live, minN, count, cores, lastWall, budget}`（`reason` 为 `on` / `off` / `timeout` / `worker-error` / `no-worker` / `spawn`；**`live` 才是「这一帧实际在并行」**，个体数低于 `minN` 时为 false；`lastWall` 是真实并行墙钟，不含等下一帧的时间）/ `setMultiCore(bool)`
+
+**版本**：`version` → `{version, commit, buildTime, author}`（来自生成的 `js/version.js`）
 
 **邻域扫描配额**：`sepCap`（get/set，只是安全阀；v41 起没有注意力上限）
 
@@ -559,6 +595,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v44 | **多核**：邻域受力抽成 `js/forces.js`（单核直调 / 多核 Worker 共用同一份实现），最多 6 个模块 Worker + `Transferable` 双程零拷贝，按上一帧 `neighbors` 加权切连续区间；`step()` 巨函数拆成 `frameBegin/updateResting/prepareForces/frameFinish`（单核 5~7 倍）；`multiCore` 默认开，存档 v7 |
 | v45 | 密集区「干涉网格」：`aJit`（尺寸 ±12% / 朝向 ±15° / 位置 ±0.18，出生抽一次）+ 取消密集处放大箭头；只碰渲染，见 §3.8b |
 | v46 | **视野摇晃**：模拟人扛摄影机，四通道低频叠加（横/纵漂移、倾斜、轻微缩放），每条 = 主频 + 次频、频率无理比，所以看不出周期；幅度按视口比例算，缩放后屏幕幅度不变；`viewShake` 0~2.5（默认 1，0 = 静止），暂停时相位冻结。同步改了 `screenToWorld`（否则鼠标捕食者偏十几像素）、背景余量 2.06→2.10（倾斜不露边）、视差层跟随相机实际位置。实测横向 ±12px、纵向 ±7px、倾斜 ±0.55°、缩放 ±0.86%，引擎投影往返误差 0px，见 §3.9b |
+| v47 | **信息面整理**：状态卡新增运行模式（单核 / 多核 ×N，按「这一帧真的在并行吗」判定，而不是只看开关）与 CPU / GPU 压力条（都以 60fps 的 16.7ms 为 100%；GPU 用 `EXT_disjoint_timer_query_webgl2` 实测，浏览器不给扩展时退回提交耗时并标 `~`）；卡底新增版本行（**版本 · commit · 构建时间 · 作者**，由 `tools/build-meta.mjs` 生成 `js/version.js`）；关于弹窗从 16 条压到 3 条要点；控制台由「鸟群规则 / 飞行与视野 / 捕食与逃逸 / 高级参数 / 草地」重排为「鸟群 / 飞行 / 捕食者 / 逃逸 / 草地 / 画面与性能」，参数按用途归位、默认只展开前两组。顺带修了四处：存档 120ms 防抖窗口内关页面会丢最后一次改动（`pagehide` 立即落盘）；「恢复默认参数」后多核开关显示为开但实际仍跑单核（漏了重建线程池）；v6→v7 迁移会把 `musicLevel` / `boundary` 这些已废弃的键也搬进新存档；多核首帧冷启动被 800ms 超时误杀（首帧给 4 倍宽限）。见 §3.9c |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
