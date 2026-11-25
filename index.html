@@ -6,6 +6,14 @@
 <meta name="theme-color" content="#05070f" />
 <title>FlockLab · 涌现模拟</title>
 <link rel="icon" href="assets/logo.svg" type="image/svg+xml" />
+<!-- 装成应用（Chrome / Edge：地址栏右侧的安装图标，或右下角的安装按钮） -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="application-name" content="FlockLab" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="FlockLab" />
+<link rel="apple-touch-icon" href="assets/icon-180.png" />
 <link rel="stylesheet" href="css/style.css" />
 </head>
 <!-- 进入页面：先完整显示所有界面，1 秒后由 main.js 带淡出动画自动收起
@@ -71,7 +79,7 @@
       <p class="about-sec">怎么看出「涌现」</p>
       <ol>
         <li><b>先关掉猛禽</b>，把「聚合力度」从 1.16 拉到 0，鸟群散成一片；再拉到 3 以上，会迅速收成几个紧团。只改一条局部权重，全局形态就变了。</li>
-        <li><b>只盯一只鸟</b>：暂停逐帧看，它永远只对最近的 7 个邻居起反应，从没「照着队形飞」。</li>
+        <li><b>只盯一只鸟</b>：暂停逐帧看，它永远只对视野半径内的邻居起反应，从没「照着队形飞」。</li>
         <li><b>等一次捕食</b>：猛禽逼近时爆发不是整群同时亮，而是一圈从它身边向外扩散的涟漪（反应延迟随距离变长）。</li>
         <li><b>盯着警戒圈</b>：刚吃饱是暗红圈，饿了转成亮红圈，体色同步由浅橙黄渐变回深橙——圈和体色就是它的「饥饿指示灯」。</li>
         <li><b>看草地</b>：每只鸟隔一阵必须落地停稳 ≥5 秒才算休息；落地的鸟变苔绿、彼此留间距，新鸟落下时老住客偶尔换位。</li>
@@ -89,6 +97,7 @@
         <li><b>音乐</b>六层生成式音景随聚集度变化：散开时几乎无声，抱团后和声变厚、节拍渐起；另有一层若隐若现的低音，和一层跟着猛禽位置缓慢左右游走的盘旋声，都很轻，细听才辨得出。</li>
         <li><b>自己下场抓一次</b>：在画面上双击左键，光标就变成一只「鼠标捕食者」，完全跟着手走（没有速度上限，箭头朝向就是移动方向），鸟群会像躲猛禽一样散开；划得快会留下尾迹。移出窗口再回来它还在，期间点击、拖拽、滚轮都照常可用；点一下右键恢复成普通箭头。</li>
         <li><b>操作</b>进入页面先显示完整界面，约 1 秒后带动画自动收起、只留小眼睛；任意操作让小眼睛显现，点它再展开完整界面。拖拽平移 · 滚轮或双指缩放；右下角复位视角、恢复默认参数、暂停、隐藏界面与声音。左下角状态卡可折叠，点右上角图钉「钉住」后，一键隐藏界面时它会继续留在屏幕上。</li>
+        <li><b>装成应用</b>用 Chrome 或 Edge 打开，等浏览器在地址栏右侧提示「安装」时点一下，就能把 FlockLab 装成本机应用：独立窗口、没有地址栏，之后从桌面 / 开始菜单直接打开，断网也能跑。</li>
       </ul>
       <p class="about-foot">Three.js · WebGL · HTML / CSS / JS / SVG 模块化</p>
     </div>
@@ -143,6 +152,17 @@
 
   <div id="error"></div>
 
+  <!-- Service Worker：让「装成应用」后的冷启动能离线打开（三个 CDN 依赖也一起缓存）。
+       必须走 http(s)，file:// 下注册会直接失败，所以先判协议。
+       调试时加 ?nosw=1 可跳过注册（改了 CSS/JS 又不想被缓存干扰时用）。 -->
+  <script>
+    if ('serviceWorker' in navigator && location.protocol.indexOf('http') === 0
+        && location.search.indexOf('nosw=1') < 0) {
+      addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () { /* 注册失败不影响使用 */ });
+      });
+    }
+  </script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

@@ -46,16 +46,21 @@ node --input-type=module --check < js/grass.js
 
 ```
 flocklab/
-├── index.html          页面骨架、图标按钮、「关于」弹窗、CDN 引入
+├── index.html          页面骨架、图标按钮、「关于」弹窗、CDN 引入、SW 注册
+├── sw.js               Service Worker：离线壳缓存 + CDN 依赖缓存
+├── manifest.webmanifest PWA 清单（standalone / 图标 / 主题色）
 ├── css/style.css       全部界面样式（含隐藏动画、右下角按钮 / 控制台定位）
-├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 3600 行，核心）
+├── js/main.js          仿真主循环 + GLSL + GUI + 调试接口（约 3900 行，核心）
 ├── js/audio.js         Web Audio 事件音效 + 六层生成式音乐（约 730 行）
 ├── js/grass.js         草地几何、谐波轮廓、面积校准、着色（约 180 行）
+├── js/backdrop.js      背景地貌（草地斑 / 河流 / 村庄剪影）+ 漂移云层（约 250 行）
 ├── assets/logo.svg     LOGO 与 favicon
+├── assets/icon-*.png   PWA 图标（192 / 512 / maskable 512 / 180）
 └── README.md / DEVELOPMENT.md
 ```
 
 `grass.js` 只管「草地长什么样、在哪」；**休憩调度（谁去休息、排队、争夺）全在 `main.js`**。
+`backdrop.js` 只管「背景长什么样」；**它需要草地位置来做避让**，所以 `main.js` 在草地重建后调 `backdrop.setGrass(grass)`。
 
 ### 2.2 `main.js` 内部结构（按文件从上到下）
 
@@ -194,7 +199,33 @@ requestAnimationFrame(render)
 - 世界尺寸（`view2DFitHalfH`）**没有**跟着屏幕比例变：鸟的元素尺寸是世界单位，改视口高度等于改鸟的像素大小。竖屏手机上场地就是一条竖条，这是有意的取舍。
 - 状态卡在 ≤400px 宽时隐藏迷你曲线和四宫格（`.spark-wrap` / `.hud-grid`），否则一张卡吃掉 28% 屏高。
 
-### 3.7 其他约定
+### 3.8 出生动画：`aGrow` 只属于鸟，`uGrow` 是总开关
+
+每只鸟有一个「涌出」进度 `aGrow`（实例属性，0→1），顶点着色器做三件事：前 16% 只留一个极小的点 → 由 8% 尺寸展开到 100%（带过冲）→ 起手自转到成形归零，同时淡入。**走完 g=1 时 `sK=1 / spin=0 / vGrow=1`，与没有这段代码完全一致**，所以老的观感不受影响。
+
+**`predMat` 是 `arrowMat.clone()`，共用同一个顶点着色器**。捕食者几何体没有 `aGrow`，而**缺失的顶点属性在 GLSL 里恒为 0**——不管一下，整只猛禽会被 `sK` 缩到 8%（一个点）。所以顶点着色器里是 `float g = mix(1.0, aGrow, uGrow);`，`predMat.uniforms.uGrow.value = 0`。
+
+它和「新生亮绿」（`birthAt` + `BIRTH_TOTAL_MS`，只在被吃掉后重生时用）是两件事：
+- `hatchAt`（ms）→ 涌出动画；`initBoids` 里随机错峰 0–900ms，重生时 = now。
+- `birthAt`（ms）→ 新生亮绿；开局为 `-Infinity`，否则 800 只一起闪绿。
+
+### 3.9 背景地貌层：canvas 纹理 + 加法混合 + 世界坐标避让
+
+`backdrop.js` 把静态地貌（草地斑 / 河流 / 村庄）用 canvas 2D 一次性画成纹理，云另画一张**可无缝平铺**的小图（每团在 3×3 个偏移位置各画一遍），着色器里只做两次纹理采样 + 漂移。三条约定：
+
+- **亮度靠增益，不靠 canvas 颜色**：canvas 里按 0.05–0.3 的 alpha 画（8 位通道才分得清），着色器乘 `uGain` 回到 0.002–0.01 线性亮度。改亮度只动 `GAIN` 一个数，不要逐层调 alpha。
+- **加法混合 = 没有排序问题**：整层 `AdditiveBlending` + `depthWrite/depthTest: false`，和星云、浮尘谁先谁后都一样。
+- **避让草地必须用世界坐标**：纹理会随窗口重画、还会带 22% 视差，按屏幕坐标擦纹理的话一平移就对不上。现在是在片元着色器里把像素反算成世界点（`wp = (vUv-0.5)*2*uHalf + uView`），再和 `setGrass()` 传进来的 `(x,y,R,a1,p1,a2,p2)` 比，轮廓用和草地完全相同的极坐标谐波 → 河 / 村庄 / 草地斑都会绕开草地，平移缩放零成本。
+- **不要在背景里叠「山坡」横带**：那几条脊线在静态画面里读起来像划痕（v42 已删）。
+
+### 3.10 PWA：缓存策略与部署
+
+- `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
+- 策略：同源静态资源 **stale-while-revalidate**（最多落后一个版本，第二次打开就是新的）；CDN（URL 带版本号、内容不可变）**缓存优先**；导航 **网络优先**，断了退回缓存里的 `index.html`。CDN 两条 module URL 也必须缓存，否则离线时 `import` 直接失败、整页白屏。
+- 调试：`?nosw=1` 跳过注册（但已在控制的页面仍受旧 SW 影响，必要时 `navigator.serviceWorker.getRegistrations()` 清掉）。
+- **部署必须带 `sw.js` / `manifest.webmanifest` / `assets/icon-*.png`**，少一个就装不成应用。
+
+### 3.11 其他约定
 
 - **热路径不新建对象/数组**：`step`/`render` 里禁止 `new`、数组字面量、`Math.hypot`（用 `Math.sqrt`）、闭包。跨趟传数据用模块级 `TypedArray`。
 - **随机化要带个体相位**：任何「定时/重试/错峰」都要叠 `restPhase[i]`（0–1），否则一批个体会在同一秒同步动作。
@@ -256,6 +287,8 @@ requestAnimationFrame(render)
 **群体归拢**：`flockKeep`（`{r, f}`）/ `setFlockKeep(r, f)`——长程归拢的半径与力度，调参用、不持久化
 
 **音频**：`muted` / `musicState` / `soundEvents` / `music.setLevel(0–1.5)` / `music.running`
+
+**出生动画 / 背景**：`hatchPending`（还在涌出中的个体数，加载后应逐渐归 0）/ `respawn(n)`（立刻让 n 只原地重生，验证涌出动画）/ `backdrop`（背景层本体：`uniforms.uGain` 拉高可看清地貌形状，`uniforms.uGN=0` 可 A/B 对比草地避让）
 
 **UI**：`uiHidden` / `eyeFaded` / `hudPinned`
 
@@ -359,6 +392,18 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 同理「颜色不变紫」要同时看两处：`localDenStats` 的分位（是否全体顶格 1.0 或全体趴底），以及**渲染到底读的是不是 `localDen`**（v40 之前读的是被 7 只上限钉死的 `neighbors`，分位再漂亮也不会变紫）。
 判断「群体散成几坨」也不要用 `groupRms` 或状态卡的「群半径」——单个数字分不清「1 坨大群」和「5 坨小群」。用 `FlockLab.positions` 做单链接聚类数连通块（阈值 6–12，只数 ≥20 只的块）。
 
+### 6.9 `mat.clone()` 会连顶点着色器一起克隆（→「捕食者变成一个点」）
+
+`predMat = arrowMat.clone()` 是为了共用「按速度旋转 + 距离淡出」，只覆写片元着色器。
+v42 给 `arrowMat` 的顶点着色器加了出生涌出后，捕食者**自动继承了这段**，而它的几何体
+没有 `aGrow` 属性 —— **缺失的顶点属性恒为 0**，于是 `sK = 0.08`，整只猛禽缩成一个点。
+教训不是「别 clone」，而是：**改共享材质时，先数一遍谁 clone 了它**。
+修法是加一个 `uGrow` 开关（鸟 1 / 捕食者 0），让共享的顶点着色器对不需要它的对象退化成原样。
+
+形如 `aGrow` 这种「新加的实例属性」还要额外确认三件事：① 几何体上 `setAttribute` 了；
+② 每帧改了之后 `needsUpdate = true`（漏了会一直显示第一帧的值）；③ 新建/复用的实例
+（`setCount` 增加、`initBoids`）有没有写初值 —— `growBuf` 初始 fill(1)，否则老个体会突然隐身。
+
 ---
 
 ## 7. 参数与存档
@@ -392,6 +437,7 @@ curl -s -o /dev/null -m 15 --noproxy '*' -w "HTTP %{http_code}\n" https://show.e
 | v41a | 修「草地上的红鸟左右闪」：① 休息间隔改为按「鸟数 / 草地总容量」自适应（原来固定 20–53 秒，800 只时需求是容量的 4 倍，队列从第一秒就清不空）；② 排队 20 秒进不去就认输褪红、隔一大段再来（不再永久红鸟）；③ 到点速度随距离收敛到 0.35（原来下限 1.1，会冲过落点再掉头，渲染朝向跟着 180° 翻）；④ 绕草地的切向力改连续值，停住时不再每帧翻向 |
 | v41 | 去掉注意力上限（恢复视野内全邻域）+ `sepCap` 安全阀 + 网格 `视野/1.4`；边缘穿越默认关闭 + 实体墙提前避让；捕食者加速音重做；HUD 传送/爆发/休憩改近 1 秒速率；背景改斜向光带（去闪烁星点）；声音默认开 |
 | v40 | 捕食者加速音效 `predDash`（边沿触发 + 400ms/只限流）、草地落地/起飞改轻快双音；动态背景（fbm 星云 + 星点 + 浮尘，`bgMat.uTime` / `dustMat.uTime` 原来没更新）；`wrapEdges` 开关（关=实体墙反弹）；修「不变紫」：色阶改用 `localDen`（原读 `neighbors/24`，被 7 只注意力上限钉死在 0.29）+ 重定 `LOCAL_DEN_K`；修「散成一坨坨」：穿墙不再镜像、质心/半径改最小映像、加弱长程群体归拢；音量滑块移除、固定满刻度 |
+| v42 | **PWA**：`manifest.webmanifest` + `sw.js`（壳 SWR / CDN 缓存优先 / 导航网络优先）+ 五张图标（**不自建安装按钮、不拦 `beforeinstallprompt`**，交给浏览器地址栏提示）；**出生涌出动画**：`aGrow` 实例属性（`mix(1, aGrow, uGrow)`，微光→展开过冲→自转→淡入）+ `hatchAt` 错峰 + 重生绿丝 `birthWisp`；**背景地貌层** `js/backdrop.js`（canvas 纹理 + `GAIN` 换算 + 加法混合 + 22% 视差 + 世界坐标避让草地 + 可平铺云层）；删「山坡」横带；新增 `FlockLab.backdrop` / `hatchPending` / `respawn(n)` 调试口；修「捕食者变成一个点」（`predMat` 克隆 arrowMat 却没有 `aGrow`） |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 

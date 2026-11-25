@@ -1,6 +1,7 @@
 
 import { FlockAudio, FlockMusic } from './audio.js';
 import { createGrass } from './grass.js';
+import { createBackdrop } from './backdrop.js';
 
 const fail = (msg) => {
   const el = document.getElementById('error');
@@ -440,6 +441,16 @@ let temperature = 0, pressure = 0, collisionImpulse = 0;
 const fxFlash = { sprint: 0, predate: 0, birth: 0 };   // 音效指示灯状态（由音频模块写入）
 let predCatches = 0;
 
+// ---------------------------------------------------------------- 出生动画
+// 「不凭空出现」：每只鸟有一个 hatchAt（涌出起点），GPU 用 age 算出「由小到大 + 自转 + 淡入」。
+// 与 birthAt（新生标记的亮绿色）是两件事：出生动画每次新个体都有，
+// 亮绿只用于「被吃掉之后重生」，否则开局 800 只全部闪绿会变成一片绿光。
+const HATCH_MS = 700;            // 涌出时长：从一点微光长成你看到的那只鸟
+const hatchAt = new Float64Array(MAX_N);
+hatchAt.fill(-Infinity);
+const growBuf = new Float32Array(MAX_N);   // 0~1 的涌出进度，直接作为 GPU 实例属性
+growBuf.fill(1);
+
 function initBoids(from, to, isBirth = false) {
   const bd = bounds2D();
   for (let i = from; i < to; i++) {
@@ -453,6 +464,8 @@ function initBoids(from, to, isBirth = false) {
     vel[k + 2] = 0;
     rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
     birthAt[i] = isBirth ? performance.now() : -Infinity;
+    // 出生动画错峰 0~900ms：开局 / 改数量时不是「啪」地一次全亮出来，而是一层层涌出来
+    hatchAt[i] = performance.now() + (isBirth ? 0 : Math.random() * 900);
     stamina[i] = 1; sprintUntil[i] = 0; capNow[i] = params.maxSpeed * 0.78;
     alertMs[i] = 0; trailNextAt[i] = 0; birdTrailP[i] = 0;
     resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
@@ -496,6 +509,8 @@ function spawnFar(i, now) {
   vel[k + 2] = 0;
   rVel[k] = vel[k]; rVel[k + 1] = vel[k + 1]; rVel[k + 2] = 0;
   birthAt[i] = now;
+  hatchAt[i] = now;
+  birthWisp(bestX, bestY, now);
   stamina[i] = 1; sprintUntil[i] = 0; fleeing[i] = 0; capNow[i] = params.maxSpeed * 0.78;
   alertMs[i] = 0; trailNextAt[i] = 0;
   resting[i] = 0; settled[i] = 0; restPatch[i] = -1;
@@ -504,6 +519,22 @@ function spawnFar(i, now) {
   rollTraits(i);   // 重生等于换一只新个体：速度脾气、游走相位和作息相位都重新抽
   const gapR = restIntervalMs();
   restDue[i] = now + 4000 + Math.random() * gapR + restPhase[i] * gapR * 0.3;
+}
+
+// 重生时原地散出几道极淡的绿丝，配合 GPU 那边的「由小自转涌出」，
+// 视觉上就是「从一点光里长出来」，而不是凭空出现。复用尾迹粒子，不额外开一套池子。
+// 只在重生时发（每秒最多几只），所以不会把 4800 个环形槽位挤爆。
+const WISP_R = 0.49, WISP_G = 1.0, WISP_B = 0.60;
+function birthWisp(x, y, now) {
+  const n = 5;
+  for (let s = 0; s < n; s++) {
+    const a = (s / n) * Math.PI * 2 + Math.random() * 0.7;
+    const dx = Math.cos(a), dy = Math.sin(a);
+    // 从中心往外 0.2 处起笔，长度 0.42：短、淡、朝四周，像被吹散的一小簇光子
+    emitTrail(x + dx * 0.2, y + dy * 0.2, dx, dy, now,
+      520, 0.42, params.arrowSize * 0.45,
+      WISP_R * 0.55, WISP_G * 0.55, WISP_B * 0.55, 0);
+  }
 }
 
 function initPredators(from, to) {
@@ -607,6 +638,7 @@ document.getElementById('scene').appendChild(renderer.domElement);
 
 // 正交相机：视口按屏幕宽高比铺满，留少量安全边距；zoom 控制缩放。
 let bgMesh = null;   // 背景渐变稍后才创建，先声明避免「用到未定义变量」
+let backdrop = null; // 地貌层同理
 function updateOrthoFrustum() {
   const aspect = innerWidth / innerHeight;
   const halfH = view2DFitHalfH() / view2D.zoom;
@@ -614,10 +646,11 @@ function updateOrthoFrustum() {
   orthoCam.left = -halfW; orthoCam.right = halfW;
   orthoCam.top = halfH; orthoCam.bottom = -halfH;
   orthoCam.updateProjectionMatrix();
-  // 背景渐变挂在相机上，尺寸跟着视锥走，永远铺满视口
+  // 背景渐变挂在与地貌在相机上，尺寸跟着视锥走，永远铺满视口
   if (bgMesh) {
     bgMesh.scale.set(halfW * 2.06, halfH * 2.06, 1);
   }
+  if (backdrop) backdrop.setProjection(halfW, halfH);
 }
 updateOrthoFrustum();
 
@@ -840,6 +873,15 @@ function seedDust() {
 }
 seedDust();
 
+// 地貌层（河流 / 草地 / 村庄剪影 + 漂移的云）：挂在相机上，夹在星云和浮尘之间。
+// 整层是加法混合，只加亮不遮挡，所以和星云、浮尘之间没有排序问题。
+backdrop = createBackdrop(THREE);
+backdrop.mesh.position.set(0, 0, -58);
+backdrop.mesh.renderOrder = -9.5;
+camera.add(backdrop.mesh);
+backdrop.setViewport(innerWidth, innerHeight);
+updateOrthoFrustum();      // 地貌层建好之后补一次投影，平面尺寸才对得上视口
+
 
 // 在草地内取一个点：极坐标均匀采样，再按谐波半径筛一遍，保证落在形状里
 // 在草地上找一个「和已停的鸟保持间距」的落点。找不到就放宽一次再退回中心。
@@ -1054,6 +1096,7 @@ function liftAllResting() {
 }
 function syncGrassVisibility() {
   grassField.setVisible(params.grassOn);
+  backdrop.setGrass(params.grassOn ? grass : []);   // 草地关掉时地貌就该露出来
 }
 function endRest(i, time, scared) {
   if (resting[i]) audio.takeoff();   // 离地
@@ -1078,7 +1121,13 @@ function endRest(i, time, scared) {
 // ---------------------------------------------------------------- 草地
 const grassField = createGrass({ THREE, scene, params, bounds2D });
 const grass = grassField.patches;
-const buildGrass = grassField.build;
+// 重建草地时同步通知背景层：地貌（河 / 村庄 / 草地斑）要绕开草地，不能从草上穿过去。
+// 避让判定在着色器里按世界坐标做，所以这里只传一次数据，平移缩放都不用重算。
+const buildGrass = () => {
+  grassField.build();
+  backdrop.setGrass(params.grassOn ? grass : []);
+};
+backdrop.setGrass(params.grassOn ? grass : []);
 // 草地建好 → 拿到真实总容量 → 把开局用临时值铺的休息时刻按真实节奏重铺一遍。
 // 不这么做的话，开局那一波会在同一分钟里全冲向草地，队列从第一秒就清不空。
 {
@@ -1108,34 +1157,55 @@ const aPos = new THREE.InstancedBufferAttribute(pos, 3).setUsage(THREE.DynamicDr
 const aVel = new THREE.InstancedBufferAttribute(rVel, 3).setUsage(THREE.DynamicDrawUsage);
 const aCol = new THREE.InstancedBufferAttribute(col, 3).setUsage(THREE.DynamicDrawUsage);
 const aSiz = new THREE.InstancedBufferAttribute(siz, 1).setUsage(THREE.DynamicDrawUsage);
+// 出生涌出进度 0~1（见上方「出生动画」）：CPU 只写进度，缓动与自转在顶点着色器里算
+const aGrow = new THREE.InstancedBufferAttribute(growBuf, 1).setUsage(THREE.DynamicDrawUsage);
 arrowGeo.setAttribute('aPosition', aPos);
 arrowGeo.setAttribute('aVelocity', aVel);
 arrowGeo.setAttribute('aColor', aCol);
 arrowGeo.setAttribute('aSize', aSiz);
+arrowGeo.setAttribute('aGrow', aGrow);
 arrowGeo.instanceCount = activeCount;
 
 const arrowMat = new THREE.ShaderMaterial({
-  uniforms: { uMaxSpeed: { value: params.maxSpeed } },
+  // uGrow：出生涌出总开关。鸟 = 1，捕食者 = 0。
+  // 捕食者的材质是 arrowMat.clone()，共用这段顶点着色器；它没有 aGrow 属性，
+  // 而缺失的顶点属性在 GLSL 里恒为 0 —— 不关掉的话整只猛禽会被缩成 8% 大小（一个点）。
+  uniforms: { uMaxSpeed: { value: params.maxSpeed }, uGrow: { value: 1 } },
   vertexShader: `
     attribute vec2 aLocal;
     attribute vec3 aPosition;
     attribute vec3 aVelocity;
     attribute vec3 aColor;
     attribute float aSize;
+    attribute float aGrow;
     uniform float uMaxSpeed;
+    uniform float uGrow;
     varying vec2 vLocal;
     varying vec3 vColor;
     varying float vSpeed;
     varying float vFade;
+    varying float vGrow;
     void main() {
       vLocal = aLocal;
       vColor = aColor;
       vSpeed = clamp(length(aVelocity) / uMaxSpeed, 0.0, 1.0);
+
+      // ---- 出生涌出：一点微光 → 由小到大展开 + 起手快速自转 + 淡入 ----
+      // aGrow 从 0 走到 1，走完就是普通个体（此时 sK=1、spin=0、vGrow=1，和老行为完全一致）。
+      // 前 16% 只留一个极小的点（gr 压在 0），所以看到的顺序是「先亮一点，再展开」，不是「直接放大」。
+      float g = mix(1.0, clamp(aGrow, 0.0, 1.0), uGrow);
+      float gr = clamp((g - 0.16) / 0.84, 0.0, 1.0);
+      float ease = 1.0 - pow(1.0 - gr, 3.0);                // easeOutCubic：先快后慢
+      float pop = 1.0 + 0.30 * sin(3.14159 * min(1.0, gr * 1.7)) * (1.0 - ease * 0.6);
+      float sK = (0.08 + 0.92 * ease) * pop;                // 尺寸：8% 长到 100%，带一点过冲
+      float spin = (1.0 - ease) * (1.0 - ease) * 2.8;       // 刚冒头时转得快，成形后归零
+      vGrow = smoothstep(0.0, 0.30, g);
+
       vec4 mv = modelViewMatrix * vec4(aPosition, 1.0);
       vec3 vv = (modelViewMatrix * vec4(aVelocity, 0.0)).xyz;
-      float ang = atan(vv.y, vv.x);
+      float ang = atan(vv.y, vv.x) + spin;
       float cs = cos(ang), sn = sin(ang);
-      vec2 lp = aLocal * aSize;
+      vec2 lp = aLocal * aSize * sK;
       mv.xy += vec2(lp.x * cs - lp.y * sn, lp.x * sn + lp.y * cs);
       vFade = 1.0 - smoothstep(45.0, 145.0, -mv.z);
       gl_Position = projectionMatrix * mv;
@@ -1146,6 +1216,7 @@ const arrowMat = new THREE.ShaderMaterial({
     varying vec3 vColor;
     varying float vSpeed;
     varying float vFade;
+    varying float vGrow;
     float sdSegment(vec2 p, vec2 a, vec2 b) {
       vec2 pa = p - a, ba = b - a;
       float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
@@ -1159,9 +1230,11 @@ const arrowMat = new THREE.ShaderMaterial({
       );
       float core = 1.0 - smoothstep(0.10, 0.17, d);
       float halo = exp(-d * 3.6) * 0.34;
-      float a = clamp(core + halo, 0.0, 1.0) * vFade;
+      float a = clamp(core + halo, 0.0, 1.0) * vFade * vGrow;
       if (a < 0.004) discard;
       vec3 c = vColor * (0.85 + 0.70 * vSpeed) * (core + halo * 0.55);
+      // 刚涌出的那一瞬整体偏亮，像是「带着光长出来」，成形后回到正常亮度
+      c *= 1.0 + 0.55 * (1.0 - vGrow);
       gl_FragColor = vec4(c, a);
       #include <colorspace_fragment>
     }
@@ -1322,6 +1395,8 @@ predGeo.setAttribute('aSize', pSiz);
 predGeo.instanceCount = activeP;
 const predMat = arrowMat.clone();
 predMat.uniforms.uMaxSpeed.value = params.predSpeed;
+// 猛禽没有出生动画：关掉 uGrow，顶点着色器就退回原来的「尺寸 × 1、不旋转、不淡入」。
+predMat.uniforms.uGrow.value = 0;
 // 锐角等腰三角形：腰长 1、底 0.5（即「腰 1.4 : 底 0.7」的比例），方向即运动方向。
 // 顶点 (2h/3, 0)、(-h/3, ±0.25)，h = √(1 - 0.25²) → 重心落在原点。
 // 实际尺寸由 predSiz = 腰长 控制，所以只改一处就能整体缩放。
@@ -3087,6 +3162,10 @@ function render(now) {
     rVel[k] += (vel[k] - rVel[k]) * SMOOTH;
     rVel[k + 1] += (vel[k + 1] - rVel[k + 1]) * SMOOTH;
     if (caught[i]) { siz[i] = 0; continue; }   // 等待重生的 1 秒完全隐藏
+    // 出生涌出进度（0~1）：算好进度丢给 GPU，缓动/自转/淡入全在顶点着色器里做。
+    // 已经成形的个体 hatchAt 是 -Infinity，这里一步比较就出去，几乎不花钱。
+    const hg = (now - hatchAt[i]) / HATCH_MS;
+    growBuf[i] = hg >= 1 ? 1 : (hg > 0 ? hg : 0);
     // 色阶用局部密度（3×3 格里的活跃个体数），**不是** neighbors[i]。
     // neighbors[i] 是「注意力邻居数」，v31 把它固定成最多 7 只，所以它最多只能到
     // 7/24 = 0.29 → 色相永远停在青蓝端，用户看到的「再怎么聚也不变紫」就是这条：
@@ -3155,6 +3234,7 @@ function render(now) {
   aVel.needsUpdate = true;
   aCol.needsUpdate = true;
   aSiz.needsUpdate = true;
+  aGrow.needsUpdate = true;
 
   // ---- 加速尾迹：沿实际航迹撒独立粒子（见文件上方「加速尾迹」的说明）----
   // 鸟与捕食者共用 emitTrail，只有「怎么判定在加速」不同：
@@ -3223,6 +3303,7 @@ function render(now) {
   const bgT = now * 0.001;
   bgMat.uniforms.uTime.value = bgT;
   dustMat.uniforms.uTime.value = bgT;
+  backdrop.update(bgT, view2D.x, view2D.y);
   trailGeo.instanceCount = MAX_TRAILS;      // 恒定：过期粒子在顶点着色器里被裁掉
   if (trailDirty) {
     aTrPos.needsUpdate = true; aTrDir.needsUpdate = true; aTrCol.needsUpdate = true;
@@ -3423,6 +3504,7 @@ addEventListener('resize', () => {
   updateOrthoFrustum();
   renderer.setSize(innerWidth, innerHeight);
   bgMat.uniforms.uHalf.value.set(innerWidth, innerHeight);
+  backdrop.setViewport(innerWidth, innerHeight);   // 窗口变了就重画地貌纹理
   dustMat.uniforms.uPR.value = Math.min(2, devicePixelRatio || 1);
   const bdDust = bounds2D();
   dustMat.uniforms.uHalf.value.set(bdDust.hx, bdDust.hy);
@@ -3440,6 +3522,7 @@ requestAnimationFrame(render);
 window.FlockLab = {
   params, defaults: DEFAULTS, resetBoids, resetAll: applyDefaults, setCount, setPredCount, spawnBurst,
   saveParams,
+  backdrop,   // 背景地貌层（调试时可改 uniforms.uGain 看形状）
   // 穿墙概率恒为 1：墙不存在，越界一律从关于中心对称的位置出现（v38 起无概率、无反射）
   get portalChance() { return 1; },
   get teleports() { return teleportCount; },
@@ -3805,6 +3888,17 @@ window.FlockLab = {
   },
   // 近 1 秒的传送 / 爆发 / 休憩次数（HUD 上显示的就是这三个）
   get rates() { return { teleport: rateSum(0), sprint: rateSum(1), rest: rateSum(2) }; },
+  // 出生动画：还在「涌出」过程中的个体数（0 表示全部成形）
+  get hatchPending() { let c = 0; for (let i = 0; i < activeCount; i++) if (growBuf[i] < 1) c++; return c; },
+  // 调试 / 验证用：立刻让 n 只鸟原地重生（等价于被吃掉 1 秒后的补位），用来看出生动画
+  respawn(n = 1) {
+    const t = performance.now();
+    for (let i = 0, k = 0; i < activeCount && k < n; i++) {
+      if (caught[i]) continue;
+      spawnFar(i, t); k++;
+    }
+    return n;
+  },
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
   get cursorHidden() { return document.body.classList.contains('cursor-idle'); },
   get eyeFaded() { return uiBtn.classList.contains('faded'); },
