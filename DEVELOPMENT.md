@@ -258,7 +258,7 @@ requestAnimationFrame(render)
 
 > 别把这三样当「多余的抖动」删掉。它解决的是看得见的摩尔纹，不是手感；删了也不会崩，只是密集群会重新变成一张点阵图。
 
-
+### 3.9 背景地貌层：canvas 纹理 + 加法混合 + 世界坐标避让
 
 `backdrop.js` 把静态地貌（草地斑 / 河流 / 村庄）用 canvas 2D 一次性画成纹理，云另画一张**可无缝平铺**的小图（每团在 3×3 个偏移位置各画一遍），着色器里只做两次纹理采样 + 漂移。三条约定：
 
@@ -515,6 +515,8 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v40 | 捕食者加速音效 `predDash`（边沿触发 + 400ms/只限流）、草地落地/起飞改轻快双音；动态背景（fbm 星云 + 星点 + 浮尘，`bgMat.uTime` / `dustMat.uTime` 原来没更新）；`wrapEdges` 开关（关=实体墙反弹）；修「不变紫」：色阶改用 `localDen`（原读 `neighbors/24`，被 7 只注意力上限钉死在 0.29）+ 重定 `LOCAL_DEN_K`；修「散成一坨坨」：穿墙不再镜像、质心/半径改最小映像、加弱长程群体归拢；音量滑块移除、固定满刻度 |
 | v43 | 修「装成应用后开始菜单图标不对」：图标全部改 RGBA + 圆角透明边（原来是无 alpha 的全幅方图，Edge 生成 MSIX 瓦片图时把内容框算错、裁成残片）；补齐 48/71/96/128/150/256/384 各尺寸 + maskable 192 + `favicon.ico`；SW 缓存版本 v2 |
 | v42 | **PWA**：`manifest.json` + `sw.js`（壳 SWR / CDN 缓存优先 / 导航网络优先）+ 五张图标（**不自建安装按钮、不拦 `beforeinstallprompt`**，交给浏览器地址栏提示）；**出生涌出动画**：`aGrow` 实例属性（`mix(1, aGrow, uGrow)`，微光→展开过冲→自转→淡入）+ `hatchAt` 错峰 + 重生绿丝 `birthWisp`；**背景地貌层** `js/backdrop.js`（canvas 纹理 + `GAIN` 换算 + 加法混合 + 22% 视差 + 世界坐标避让草地 + 可平铺云层）；删「山坡」横带；新增 `FlockLab.backdrop` / `hatchPending` / `respawn(n)` 调试口；修「捕食者变成一个点」（`predMat` 克隆 arrowMat 却没有 `aGrow`） |
+| v44 | **多核**：邻域受力抽成 `js/forces.js`（单核直调 / 多核 Worker 共用同一份实现），最多 6 个模块 Worker + `Transferable` 双程零拷贝，按上一帧 `neighbors` 加权切连续区间；`step()` 巨函数拆成 `frameBegin/updateResting/prepareForces/frameFinish`（单核 5~7 倍）；`multiCore` 默认开，存档 v7 |
+| v45 | 密集区「干涉网格」：`aJit`（尺寸 ±12% / 朝向 ±15° / 位置 ±0.18，出生抽一次）+ 取消密集处放大箭头；只碰渲染，见 §3.8b |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
