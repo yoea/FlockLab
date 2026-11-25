@@ -125,16 +125,37 @@
   #brand, #hud, #topbar, .lil-gui.root {
     transition: opacity .45s ease, visibility 0s linear 0s;
   }
-  /* 闲置自动隐藏：5 秒无操作后控制台、状态卡、角落按钮一起淡出，只留纯画面。
-     定住的状态卡不参与（:not(.pinned)），可以边跑边盯数据；
-     任意鼠标动作 / 按键 / 触摸都会立即恢复全部界面并重新计时。 */
+  /* 界面收起（闲置自动隐藏 / 手动锁定隐藏，两者共用 body.ui-hidden）：
+     控制台、状态卡、角落按钮一起淡出，只留纯画面。
+     · 定住的状态卡不参与（:not(.pinned)）
+     · 眼睛按钮是唯一的恢复入口，不跟着淡出——它只在闲置 5 秒后单独 faded */
   body.ui-hidden #brand,
   body.ui-hidden #hud:not(.pinned),
-  body.ui-hidden #topbar,
+  body.ui-hidden #topbar .ico:not(#uiBtn),
+  body.ui-hidden #topbar .sep,
   body.ui-hidden .lil-gui.root {
     opacity: 0; visibility: hidden; pointer-events: none;
     transition: opacity .45s ease, visibility 0s linear .45s;
   }
+  /* 眼睛自身闲置 5 秒后也淡出；鼠标一动立刻回来（界面仍保持收起）。
+     用 #topbar #uiBtn.faded 的双 ID 特异性压过上面那条通用规则。 */
+  #topbar #uiBtn.faded { opacity: 0; visibility: hidden; pointer-events: none; }
+  /* 锁定隐藏中：眼睛常亮一点，提示「界面是被人为收起的」 */
+  body.manual-hidden #uiBtn { border-color: rgba(99, 230, 255, 0.6); }
+
+  /* 隐藏界面按钮：睁眼 = 界面可见，闭眼（斜线）= 界面已收起 */
+  #uiBtn svg { width: 18px; height: 18px; }
+  #uiBtn .eye, #uiBtn .pupil {
+    fill: none; stroke: currentColor; stroke-width: 1.7;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  #uiBtn .pupil { fill: currentColor; stroke: none; }
+  #uiBtn .slash {
+    fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round;
+    display: none;
+  }
+  #uiBtn.off .eye, #uiBtn.off .pupil { opacity: 0.35; }
+  #uiBtn.off .slash { display: block; }
 
   /* 暂停时按钮改为高亮，明确当前处于冻结状态 */
   #pauseBtn.on { border-color: rgba(255, 211, 110, 0.6); box-shadow: 0 0 16px rgba(255, 211, 110, 0.16); }

@@ -1909,6 +1909,11 @@ const fsDoc = document.documentElement;
 function fsElement() {
   return document.fullscreenElement || document.webkitFullscreenElement || null;
 }
+// 全屏与界面收起的联动：**进全屏默认收起全部界面**（把画面整个让出来），
+// 退出全屏自动恢复（否则退出后一片空白，找不到控制台）。
+// 用 lastFs 记住上一次的真实状态，只在「真的变了」时动作；
+// 初值 null 表示还没同步过，此时只换图标不动界面。
+let lastFs = null;
 function syncFsBtn() {
   const on = !!fsElement();
   fsBtn.classList.toggle('on', on);
@@ -1917,6 +1922,13 @@ function syncFsBtn() {
   const label = on ? '退出全屏' : '全屏';
   fsBtn.title = label;
   fsBtn.setAttribute('aria-label', label);
+
+  if (lastFs === null) { lastFs = on; return; }
+  if (on === lastFs) return;
+  lastFs = on;
+  manualHidden = on;
+  idleHidden = on;
+  wake();
 }
 fsBtn.addEventListener('click', () => {
   wake();
@@ -1965,36 +1977,71 @@ about.addEventListener('click', (e) => { if (e.target === about) closeAbout(); }
 about.querySelector('.about-close').addEventListener('click', closeAbout);
 addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAbout(); });
 
-// ---------------------------------------------------------------- 闲置自动隐藏
-// 5 秒无操作 → 控制台、实时状态卡、右下角按钮一起淡出，光标也藏起来，只留纯画面。
-// 任意鼠标动作 / 按键 / 滚轮 / 触摸立刻全部恢复并重置计时。
-// 原「小眼睛」按钮连同它的演示模式一并删除：恢复界面靠移动鼠标，不再需要按钮。
+// ---------------------------------------------------------------- 界面收起（两种来源）
+// A 闲置自动隐藏：5 秒无操作 → 界面淡出、光标藏起；任意鼠标动作 / 按键 / 触摸立刻恢复并重新计时。
+// B 手动锁定隐藏：点右下角眼睛（或进全屏）→ 界面收起后**鼠标乱动也不恢复**，
+//   只有再点一次眼睛才展开。做这个是为了「看画面时不小心碰一下鼠标，面板就糊一脸」。
+// 两者共用 body.ui-hidden，额外用 body.manual-hidden 标记锁定态（眼睛常亮、不被鼠标唤醒）。
 // 例外：状态卡点了「定住」就不参与隐藏（CSS 用 #hud:not(.pinned) 排除），
 // 卡片里的按钮（定住 / 折叠）跟着常驻，可以边跑边盯数据。
 const IDLE_MS = 5000;
 let idleTimer = 0;
 let idleDeadline = 0;      // 只在调试接口里读，用来报「还有多少毫秒收起」
+let idleHidden = false;    // 闲置自动隐藏（可被鼠标动作解除）
+let manualHidden = false;  // 手动锁定隐藏（只能点眼睛解除）
 
+const uiBtn = document.getElementById('uiBtn');
+
+function applyHidden() {
+  const hidden = manualHidden || idleHidden;
+  document.body.classList.toggle('ui-hidden', hidden);
+  document.body.classList.toggle('manual-hidden', manualHidden);
+  uiBtn.classList.toggle('off', hidden);
+  const label = hidden ? '显示所有界面' : '隐藏所有界面';
+  uiBtn.title = label;
+  uiBtn.setAttribute('aria-label', label);
+}
+
+// 调试接口 / 「关于」弹窗用：强制收起或展开（展开等于解除锁定）
 function setIdle(on) {
-  document.body.classList.toggle('ui-hidden', on);
-  document.body.classList.toggle('cursor-idle', on);   // 闲置时连光标一起藏
+  idleHidden = !!on;
+  applyHidden();
+  if (!idleHidden) document.body.classList.remove('cursor-idle');
 }
 
 function wake() {
-  if (document.body.classList.contains('ui-hidden')) setIdle(false);
   clearTimeout(idleTimer);
   idleDeadline = 0;
+  document.body.classList.remove('cursor-idle');
+  uiBtn.classList.remove('faded');
+  // 锁定隐藏时不解除——这正是「误触鼠标」场景要的：动鼠标只会让眼睛回来，界面不动
+  if (!manualHidden) idleHidden = false;
+  applyHidden();
   // 「关于」开着不算闲置：用户正在读，别把背后的界面抽走
   if (about.classList.contains('open')) return;
   idleDeadline = performance.now() + IDLE_MS;
-  idleTimer = setTimeout(() => setIdle(true), IDLE_MS);
+  idleTimer = setTimeout(() => {
+    idleHidden = true;
+    applyHidden();
+    document.body.classList.add('cursor-idle');   // 闲置时连光标一起藏
+    uiBtn.classList.add('faded');                 // 眼睛自身也淡出，鼠标一动就回来
+  }, IDLE_MS);
 }
+
+// 眼睛：切换锁定隐藏。收起时立刻生效（不等 5 秒），展开时立刻恢复。
+uiBtn.addEventListener('click', () => {
+  manualHidden = !manualHidden;
+  if (manualHidden) idleHidden = true;   // 手动收起要马上藏
+  wake();
+  if (manualHidden) toast('已隐藏界面，点击右下角图标恢复');
+});
 
 // 每种输入都算「有操作」；pointerdown / mousedown / touchstart 与 mousemove 可能同时到，
 // 重复调用 wake() 只是重置同一个定时器，没有副作用。
 for (const ev of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart', 'pointerdown']) {
   addEventListener(ev, wake, { passive: true });
 }
+applyHidden();
 wake();
 
 // 状态卡「定住」：定住后闲置自动隐藏时它仍留在屏幕上（CSS 用 :not(.pinned) 排除），
@@ -4267,14 +4314,18 @@ window.FlockLab = {
     }
     return n;
   },
-  // 闲置自动隐藏：uiIdle 表示界面已收起；idleLeft 是距离自动收起的毫秒数（鼠标一动就回到 5000）
+  // 界面收起：uiHidden 表示界面已收起；manualHidden 表示是「锁定隐藏」（鼠标动也不恢复）；
+  // idleLeft 是距离自动收起的毫秒数（鼠标一动就回到 5000）
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
+  get manualHidden() { return manualHidden; },
   get cursorHidden() { return document.body.classList.contains('cursor-idle'); },
   get idleLeft() { return Math.max(0, Math.round(idleDeadline - performance.now())); },
   get hudPinned() { return hudPinned; },
   get fullscreen() { return !!fsElement(); },
   // 调试用：立刻进入 / 退出闲置隐藏，不用等 5 秒
   forceIdle(on) { setIdle(!!on); return true; },
+  // 调试用：锁定隐藏（等价于点一次眼睛），鼠标动也不会恢复
+  hideAll(on) { manualHidden = !!on; idleHidden = !!on; wake(); return true; },
   get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },
   get groupCenter() { return { x: +groupX.toFixed(2), y: +groupY.toFixed(2), z: +groupZ.toFixed(2) }; },
   get avgPredDist() {

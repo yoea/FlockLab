@@ -346,17 +346,31 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 
 **控制台分组**：按「看什么 → 怎么飞 → 谁吃谁 → 画面与性能」排，默认只展开「鸟群」「捕食者」。lil-gui 的 folder **默认就是展开的**，想让某组收起必须显式 `folder.close()`——只写 `fA.open()` 不管其他组，结果会是全开、面板直接拉出屏幕。
 
-### 3.9d 界面闲置自动隐藏与全屏（v1.4.9）
+### 3.9d 界面收起：闲置自动隐藏、手动锁定隐藏与全屏（v1.4.9 / v1.4.14）
 
-**一套状态，两个 body 类**：`ui-hidden`（界面收起）+ `cursor-idle`（光标收起）由同一个 `setIdle(on)` 同时开关，定时器只有一个 `idleTimer`。
+**一个视觉结果，两个来源**：`body.ui-hidden` 决定界面是否收起，`body.manual-hidden` 标记「锁定」。
+`idleHidden`（闲置自动，可被输入解除）与 `manualHidden`（手动锁定，只能点眼睛解除）两个布尔，
+任一为真就加 `ui-hidden`，两者的并集由 `applyHidden()` 落到 DOM。
 
-- `IDLE_MS = 5000`。首次载入时 `wake()` 跑一次就开始计时，所以「不碰鼠标」也会在 5 秒后收起，不需要单独的启动定时器。
-- 任何输入都调 `wake()`：`mousemove / mousedown / keydown / wheel / touchstart / pointerdown`。它做两件事——把两个类去掉、把定时器重置到 5 秒后。
-- **原来那套「载入 1 秒后自动收起 + 小眼睛按钮」已经删掉**：1 秒收起太快（用户还没看清控制台），小眼睛又在闲置时自己淡出，恢复界面要靠猜。现在统一成「闲置才收起、动一下就回来」，不需要恢复按钮。
-- **定住的状态卡是唯一例外**：CSS 写成 `body.ui-hidden #hud:not(.pinned)`，所以 `#hud.pinned` 不参与淡出；定住 / 折叠按钮都在卡片内部，于是自动跟着常驻。
-- 「关于」弹窗开着时 `wake()` 直接 return（不计时、不收起），关闭时再 `wake()` 重新起算——否则用户正在读文案，背后的界面会被抽走。
+- `IDLE_MS = 5000`。首次载入时 `wake()` 跑一次就开始计时，所以「不碰鼠标」也会在 5 秒后收起。
+- `wake()`：清定时器 → 去 `cursor-idle`、去眼睛 `faded` → **`manualHidden` 为真时不动 `idleHidden`**（这是「误触鼠标」不弹界面的关键）→ 重设 5 秒定时器。
+- 5 秒到：`idleHidden = true` + `applyHidden()` + `cursor-idle`，并给眼睛加 `faded`。
+  所以闲置收起后**先回来的是眼睛**，界面要再点一次——这正是「手动隐藏」那条路径要的行为。
+- 眼睛点击 = 切换 `manualHidden`；收起时立刻 `idleHidden = true`（不等 5 秒），展开走 `wake()`。
+- CSS：`body.ui-hidden` 隐藏 `#brand` / `#hud:not(.pinned)` / `.lil-gui.root` /
+  `#topbar .ico:not(#uiBtn)` / `#topbar .sep`——**眼睛要单独排除**，它是唯一恢复入口。
+  它的淡出用 `#topbar #uiBtn.faded`（双 ID 压过上面那条通用规则）。
+- **定住的状态卡是唯一例外**：`#hud:not(.pinned)`，定住 / 折叠按钮都在卡片内，自动跟着常驻。
+- 「关于」弹窗开着时 `wake()` 直接 return（不计时、不收起），关闭时再 `wake()` 重新起算。
 
-**全屏**只做 `requestFullscreen()` / `exitFullscreen()`（带 `webkit` 前缀回退），**不碰任何参数**。`fullscreenchange` + `webkitfullscreenchange` 两个事件都听（老内核只派发自己的），据此切换图标（展开 / 收拢箭头）与 `.on` 高亮。iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
+**全屏**只做 `requestFullscreen()` / `exitFullscreen()`（带 `webkit` 前缀回退），**不碰任何参数**。
+`fullscreenchange` + `webkitfullscreenchange` 两个事件都听（老内核只派发自己的），据此切换图标与 `.on` 高亮。
+进 / 出全屏用 `lastFs` 记住上一次真实状态，**只在真的变化时**联动界面：
+
+- **进全屏 → `manualHidden = idleHidden = true`**（默认收起全部界面，把画面让出来）；
+- **退出全屏 → 两者清零**（否则退出后一片空白，用户找不到控制台）。
+- `lastFs` 初值 `null`：初次 `syncFsBtn()` 只同步图标不碰界面——此时 `manualHidden` 还在 `let` 的 TDZ 里，碰了就抛。
+iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **「重新初始化」已下线**：那条按钮改成了全屏，恢复出厂参数的入口只剩调试接口 `FlockLab.resetAll()`（内部就是 `applyDefaults()`），函数本身保留。
 
@@ -449,7 +463,7 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 
 **出生动画 / 背景**：`hatchPending`（还在涌出中的个体数，加载后应逐渐归 0）/ `respawn(n)`（立刻让 n 只原地重生，验证涌出动画）/ `backdrop`（背景层本体：`uniforms.uGain` 拉高可看清地貌形状，`uniforms.uGN=0` 可 A/B 对比草地避让）
 
-**UI**：`uiHidden`（界面是否已闲置收起）/ `cursorHidden` / `idleLeft`（距离自动收起的毫秒数，鼠标一动回到 5000）/ `hudPinned`（状态卡是否定住）/ `fullscreen`（是否处于全屏）/ `forceIdle(on)`（立刻进入 / 退出闲置隐藏，验证用，不用等 5 秒）
+**UI**：`uiHidden`（界面当前是否收起，自动与手动两种来源的并集）/ `manualHidden`（是否为手动锁定隐藏，即鼠标动也不恢复）/ `cursorHidden` / `idleLeft`（距离自动收起的毫秒数，鼠标一动回到 5000；锁定隐藏时无意义）/ `hudPinned`（状态卡是否定住）/ `fullscreen`（是否处于全屏）/ `forceIdle(on)`（立刻进入 / 退出闲置隐藏，验证用，不用等 5 秒）/ `hideAll(on)`（等价于点一次眼睛：锁定收起 / 展开）
 
 **个体差异**：`teleportCount`（同 `teleports`）/ `overGrass` 相关在内部
 
@@ -633,6 +647,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v1.4.11 | **版本行排版**：`vX.Y.Z <commit> build: 202611251530，©作者.` 连排。commit 改 `<a target="_blank" rel="noopener noreferrer">` 指向 GitHub commit 页，href 先剥掉脏构建的 `*` 再拼；构建时间压成 12 位纯数字，长度不对时退回原样（避免兜底 `—` 被压成空串）。间距从 flex `gap` 改成 `margin-right`，让 build 与 ©作者 之间的中文逗号紧贴（由 `#hBuild::after` 输出）。见 §3.9c |
 | v1.4.12 | **版本行分隔符统一成 `·`**：`vX.Y.Z · <commit> · build: 202611251541 · ©作者.`。上一版误把需求原文里的中文逗号当成排版要求保留下来，导致「三处 `·` + 一处 `，`」混排；现在 `<i>·</i>` 插在四个字段之间，间距靠 `.hud-ver i { margin: 0 5px }`，不再需要 `#hBuild::after` 与 `margin-right` |
 | v1.4.13 | **修多核下停稳的鸟持续漂移**。链路：`forces.js` 第 74 行 `if (caught[i] \|\| resting[i]) continue;` → worker 不回写这些鸟的任何输出 → `oAcc` / `oFlee` / `oNb` / `oFl` 里它们的位置保持**上一轮的旧值** → `onWorkerDone` 用 `acc.set(slot.oAcc.subarray(a3, b3), a3)` **整段覆盖**主线程 → `updateResting` 在积分前清掉的 0 又被写回非零 → `frameFinish` 的停稳分支 `vel = (vel + acc*dt) * damp` 把静止鸟推到 acc 对应的平衡速度（实测约 10.6 单位/秒），方向由残留力决定，于是「左飘 / 右飘 / 倒退飘，能飘出草地」。修法两层：① 积分前对 `resting` / `caught` 个体统一清 `acc`、`fleeDir`、`neighbors`、`fleeing`（`localDen` 不清，颜色要用）；② 停稳分支直接 `vel = 0`，不再积分力——语义上停稳就是一动不动，从根上不依赖 `acc` 是否干净。**这是个通用的多核陷阱**：worker 跳过某只鸟 ≠ 主线程看到 0，凡「跳过即保留旧值」的输出，主线程都必须自己兜底 |
+| v1.4.14 | **手动锁定隐藏 + 全屏联动**：`idleHidden`（自动，输入可解除）与 `manualHidden`（锁定，只能点眼睛解除）取并集落到 `body.ui-hidden`，`body.manual-hidden` 标记锁定态；`wake()` 在锁定态下不解除 `idleHidden`，所以鼠标动只让眼睛回来（去 `faded`）。CSS 改为逐项隐藏 `#topbar .ico:not(#uiBtn)`，眼睛单独排除并用 `#topbar #uiBtn.faded` 双 ID 压特异性。全屏用 `lastFs` 记住上次真实状态，进全屏 `manualHidden = idleHidden = true`、退出清零；初值 `null` 避开 `let` 的 TDZ。见 §3.9d |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
