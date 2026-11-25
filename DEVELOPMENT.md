@@ -631,6 +631,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v1.4.9 | **界面交互重做**：右下角「重新初始化」→ **全屏**（`requestFullscreen` / `exitFullscreen` 带 webkit 回退，只切全屏不动参数，`fullscreenchange` + `webkitfullscreenchange` 双事件同步图标与高亮）；**闲置 5 秒自动隐藏**控制台 / 状态卡 / 右下角按钮，光标同时隐藏，任意输入调 `wake()` 恢复并重置计时；`#hud.pinned` 靠 CSS `:not(.pinned)` 排除在隐藏之外，卡内按钮跟着常驻；「关于」弹窗打开期间不计时；删除小眼睛按钮、`autoHideUi` 的载入 1 秒收起与 `eyeTimer` 那套淡出；`applyDefaults()` 保留给调试接口 `resetAll()`。见 §3.9d |
 | v1.4.10 | **暂停 = 画面 + 音乐**：`setPaused(on)` 只在状态边沿调 `music.pauseForSim()` / `resumeFromSim()`（不进每帧循环——每帧写 AudioParam 正是 v1.4.8 定格事故的成因）；停法是音乐总线渐隐 0 + 停 25ms 调度器，恢复时 `nextTime = now + 0.06` 不补排欠下的音符，振荡器不重建。新增 `simPaused` 标志，被 `start` / `mute` / `resumeScheduler` 三处引用，防止暂停期间被静音开关或后台恢复偷偷放声；`applyDefaults()` 改走 `setPaused(false)`。见 §3.9e |
 | v1.4.11 | **版本行排版**：`vX.Y.Z <commit> build: 202611251530，©作者.` 连排。commit 改 `<a target="_blank" rel="noopener noreferrer">` 指向 GitHub commit 页，href 先剥掉脏构建的 `*` 再拼；构建时间压成 12 位纯数字，长度不对时退回原样（避免兜底 `—` 被压成空串）。间距从 flex `gap` 改成 `margin-right`，让 build 与 ©作者 之间的中文逗号紧贴（由 `#hBuild::after` 输出）。见 §3.9c |
+| v1.4.12 | **版本行分隔符统一成 `·`**：`vX.Y.Z · <commit> · build: 202611251541 · ©作者.`。上一版误把需求原文里的中文逗号当成排版要求保留下来，导致「三处 `·` + 一处 `，`」混排；现在 `<i>·</i>` 插在四个字段之间，间距靠 `.hud-ver i { margin: 0 5px }`，不再需要 `#hBuild::after` 与 `margin-right` |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 

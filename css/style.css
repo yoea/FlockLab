@@ -311,9 +311,8 @@
   }
   .bar.mini { width: 30px; height: 3px; }
 
-  /* 版本行：v1.4.11 cde0632 build: 202611251530，©yoea.
-     commit 是直达 GitHub 的链接；构建时间压成 12 位数字，窄条里省一半宽度。
-     间距用 margin（不用 gap），这样 build 与 ©作者 之间的中文逗号能紧贴。 */
+  /* 版本行：v1.4.12 · 8f5e842 · build: 202611251541 · ©yoea.
+     commit 是直达 GitHub 的链接；构建时间压成 12 位数字，窄条里省一半宽度。 */
   .hud-ver {
     display: flex; flex-wrap: wrap; align-items: center;
     margin-top: 7px; padding-top: 6px;
@@ -322,10 +321,9 @@
     font-variant-numeric: tabular-nums;
   }
   .hud-ver > span, .hud-ver > a { flex: 0 0 auto; }
-  .hud-ver #hVer { color: #7e93b5; margin-right: 6px; }
-  .hud-ver #hBuild::after { content: '，'; }
+  .hud-ver i { font-style: normal; color: #3d4c63; margin: 0 5px; }
+  .hud-ver #hVer { color: #7e93b5; }
   .hud-ver #hCommit {
-    margin-right: 6px;
     pointer-events: auto;   /* .card-body 整体 pointer-events:none（让拖拽穿透去转视角），链接要单独放行 */
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color: #8fb4e8; cursor: pointer;
