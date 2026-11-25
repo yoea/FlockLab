@@ -1,5 +1,6 @@
 // ---------------------------------------------------------------- 声音
-// 事件音共五类：加速逃逸 / 被吃掉 / 新生 / 草地降落 / 草地起飞；另有四层生成式音乐。
+// 事件音共九类（含 v1.4.21 补的三个罕见事件）；另有六层生成式音乐。
+// v1.4.23 去掉了「整群振翅」的密度纹理层：那层嘶声会盖住音乐的拍子与事件的方位。
 // 没有碰撞与琶音；静音时断开输出并挂起 AudioContext。
 // 总线预留余量：音效总线（fxBus）与音乐 bus 都汇进 master 再进 destination。
 // 这个值原来是 params.master，v1.4.7 把音量定死成「面板满刻度」后从 DEFAULTS 删掉了它，
@@ -18,9 +19,10 @@ const BUCKETS = 4;           // 限流分桶数：左 / 中左 / 中右 / 右
 // 只有音乐层带空间感，两者听着像不在同一个场地里。不引入卷积（不必载 IR）。
 const REV_WET = 0.20;
 const REV_D1 = 0.037, REV_D2 = 0.053, REV_FB = 0.40, REV_LP = 2600;
-// 密度纹理层（P3）：一条常驻的循环噪声，代替「每只鸟每次振翅都发一个音」。
-const TEX_LOOP_SEC = 3.7;    // 循环长度取质数秒，配合接缝交叉淡化，听不出周期
-const TEX_LFO_HZ = 0.63;     // 极慢的振幅摆动：像整群在「呼吸」，而不是一段嘶声
+// v1.4.23：整群振翅的「密度纹理层」（一条随速度/密度变化的循环噪声）整个去掉。
+// 它本来是「逐鸟振翅 5000+ 次/秒」的替代品，但那层嘶声在安静段落里更像噪声地毯，
+// 压住音乐、也压住事件的方位感；而少了它，鸟的动作仍然看得见、事件音仍然听得见。
+// 与其反复调电平，不如不要这一层。
 
 export class FlockAudio {
   // flash：与外部共享的「音效指示灯」状态（HUD 上的三个小圆点）
@@ -46,8 +48,6 @@ export class FlockAudio {
     this.ctr = {};           // 限流诊断计数（try / gap / cap / pass / b0..b3）
     this.lastPan = 0;
     this.total = { sprint: 0, predate: 0, birth: 0, land: 0, takeoff: 0, dash: 0, lock: 0, dive: 0, alarm: 0 };
-    this.tex = null;         // 密度纹理层（P3），在 enable() 里建
-    this.texApplied = -1;
     this.music = null;   // 由构造函数末尾创建（音乐与音效共用同一套音频上下文）
     // 切到后台 / 页面被隐藏：主动断开并挂起。浏览器标签页静音由浏览器负责，
     // 但 AudioContext 自己仍在 running、音乐调度器仍每 25ms 排音符——一旦静音
@@ -236,9 +236,8 @@ export class FlockAudio {
         data[i] = data[i] * k + data[len - fade + i] * (1 - k);
       }
 
-      // 空间感与密度层都挂在 fxBus 之后，一起受「音效音量」与总开关控制
+      // 空间感挂在 fxBus 之后，一起受「音效音量」与总开关控制
       this.buildReverb();
-      this.buildTexture();
     }
     // 先把「允许发声 / 静音」的状态定下来，再尝试 resume。
     // 关键：resume() 在没有用户手势时会被浏览器拒绝（抛出 NotAllowedError）。
@@ -279,62 +278,7 @@ export class FlockAudio {
     this.revSend = send;
   }
 
-  // 密度纹理层（P3）：一条常驻循环噪声，代替「每只鸟每次振翅各发一个音」。
-  // 800 只鸟按 0.15s 振翅一次是 5000+ 次/秒，逐鸟发事件根本不可能；
-  // 而「整群在动」这个感觉，用一条随速度/密度变化的噪声层就够了。
-  buildTexture() {
-    const ctx = this.ctx;
-    const len = Math.floor(ctx.sampleRate * TEX_LOOP_SEC);
-    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-    // 接缝交叉淡化：噪声直接循环会在接缝处「嗒」一下。
-    const fade = Math.floor(ctx.sampleRate * 0.06);
-    for (let i = 0; i < fade; i++) {
-      const k = i / fade;
-      d[i] = d[i] * k + d[len - fade + i] * (1 - k);
-    }
-    const src = ctx.createBufferSource();
-    src.buffer = buf; src.loop = true;
-
-    const bp = ctx.createBiquadFilter();
-    bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.7;
-    const lp = ctx.createBiquadFilter();
-    lp.type = 'lowpass'; lp.frequency.value = 5200; lp.Q.value = 0.4;
-    // 极慢的振幅摆动（0.63Hz，深度 25%）：一片振翅的「涌」，不是一段稳定嘶声。
-    const trem = ctx.createGain(); trem.gain.value = 0.75;
-    const lfo = ctx.createOscillator();
-    lfo.type = 'sine'; lfo.frequency.value = TEX_LFO_HZ;
-    const lfoG = ctx.createGain(); lfoG.gain.value = 0.25;
-    lfo.connect(lfoG); lfoG.connect(trem.gain);
-    const gain = ctx.createGain(); gain.gain.value = 0;
-    src.connect(bp); bp.connect(lp); lp.connect(trem); trem.connect(gain);
-    gain.connect(this.fxBus);
-    src.start(); lfo.start();
-    this.tex = { src, bp, lp, trem, gain };
-    this.texAt = 0;
-  }
-
-  // 每帧喂三个 0~1 的标量（速度、密度、冲刺比例）+ 是否暂停。
-  // 参数写入节流到 ~11Hz：逐帧写 AudioParam 得到的是抖动，不是呼吸。
-  setDensity(speedNorm, densNorm, sprintNorm, paused) {
-    if (!this.tex) return;
-    const now = performance.now();
-    if (now - this.texAt < 90) return;
-    this.texAt = now;
-    const t = this.ctx.currentTime;
-    const s = Math.max(0, Math.min(1, speedNorm || 0));
-    const dn = Math.max(0, Math.min(1, densNorm || 0));
-    const sp = Math.max(0, Math.min(1, sprintNorm || 0));
-    // 电平压得极低：它是底噪式的「整群在动」，绝不能盖住任何一个事件音
-    const lvl = (paused || this.muted || this.suspendedByVisibility || document.hidden)
-      ? 0
-      : 0.0026 + 0.0130 * (0.45 * s + 0.55 * dn) * (1 + 0.75 * sp);
-    this.tex.gain.gain.setTargetAtTime(lvl, t, 0.35);
-    // 中心频率跟着速度和冲刺走：飞得越快、越多人拼命，那层「唰」越亮越高。
-    this.tex.bp.frequency.setTargetAtTime(620 + 1250 * s + 950 * sp, t, 0.45);
-    this.texApplied = lvl;
-  }
+  // v1.4.23：buildTexture() / setDensity() 已删除，见文件顶部关于「密度纹理层」的说明。
 
   refreshButton() {
     const btn = document.getElementById('audioBtn');
@@ -847,11 +791,14 @@ export class FlockAudio {
   }
 }
 // ---------------------------------------------------------------- 音乐
-// 四层生成式音景，全部由「聚集度」C 驱动（0 = 铺满全屏，1 = 紧密成团）：
-//   ① drone   低频嗡鸣：基音 + 五度 + 低八度，低通截止随 C 慢慢打开
+// 六层生成式音景，全部由「聚集度」C 驱动（0 = 铺满全屏，1 = 紧密成团）：
+//   ① drone   低频嗡鸣：基音 + 五度，低通截止随 C 慢慢打开（v1.4.22 起压到 −6dB 当底色）
 //   ② pad     和声：开放五度 → 小三和弦 → 加九度音簇，每两小节换一次
-//   ③ pulse   低频心跳：C 越高越密，散开时几乎不出声
+//   ③ 鼓点    kick + 反拍闭镲，拍点固定、力度随 C（v1.4.23 由原来的「随机低频短击」改造）
+//   ③b 贝斯   跟 kick 走的短拨音（A1 / 五度），v1.4.23 新增，压得很轻
 //   ④ shimmer 高频泛音点：只有抱团到一定程度才零星出现
+//   ⑤ bass    常驻低音长音：0.043Hz 呼吸 + 浮现门，二十来秒浮一次（有节奏贝斯后压得更低）
+//   ⑥ orbit   捕食者盘旋声：随饥饿度与远近变化，声像极慢左右游走
 // 全部程序化合成，没有采样文件；音高固定锁在五声音阶里，所以怎么随机都不会跑调。
 // 调度用 25ms lookahead 提前排未来一小段，和鸟的数量完全无关（一万只也不多花 CPU）。
 const PENTA = [0, 3, 5, 7, 10];        // A 小调五声音阶（相对根音的半音数）
@@ -882,7 +829,7 @@ export class FlockMusic {
     // 模拟（画面）是否被暂停：暂停时音乐要停，但「静音」是用户意图、两件事不能混。
     // 这个标志同时管住 start / mute / resumeScheduler，避免暂停期间被它们偷偷复活。
     this.simPaused = false;
-    this.counts = { chord: 0, pulse: 0, shimmer: 0, bass: 0 };
+    this.counts = { chord: 0, kick: 0, hat: 0, bassNote: 0, shimmer: 0, bass: 0 };
     // 捕食者状态（由 main.js 每帧喂标量，音频参数的平滑与写入只在 25ms 调度器里做）
     this.pred = { active: false, x: 0, heat: 0, dist: 100 };
   }
@@ -934,9 +881,16 @@ export class FlockMusic {
     padLp.type = 'lowpass'; padLp.frequency.value = 900; padLp.Q.value = 0.6;
     padLp.connect(padGain); padGain.connect(bus);
 
-    // ③ pulse：低频短击，唯一有节拍的层
+    // ③ 鼓点（v1.4.23 由原来的「低频短击」改造）：kick 与反拍闭镲共用这条总线。
+    //    改之前是「按聚集度随机撒低频短击」，拍点不稳定，听感像心跳而不是鼓；
+    //    现在固定每小节第 1 拍落 kick、第 3 拍一记弱 kick，反拍镲才随聚集度加入。
     const pulseGain = ctx.createGain(); pulseGain.gain.value = 0;
     pulseGain.connect(bus);
+
+    // ③b 贝斯拨音（v1.4.23）：跟着 kick 走的短低音，独立增益以便与下面的
+    //     「⑤ 常驻低音长音」分开调——两者都在低频，挂在同一条总线上就没法分别压。
+    const bassPluckGain = ctx.createGain(); bassPluckGain.gain.value = 0;
+    bassPluckGain.connect(bus);
 
     // ④ shimmer：高音泛音点
     const shimmerGain = ctx.createGain(); shimmerGain.gain.value = 0;
@@ -989,8 +943,8 @@ export class FlockMusic {
     air.connect(airBp); airBp.connect(airGain); airGain.connect(orbitGain);
     air.start();
 
-    this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, shimmerGain,
-                   bassGain, bassGate, orbitGain, orbitLp, orbitPan };
+    this.nodes = { bus, send, droneGain, droneLp, padGain, padLp, pulseGain, bassPluckGain,
+                   shimmerGain, bassGain, bassGate, orbitGain, orbitLp, orbitPan };
   }
 
   start() {
@@ -1123,9 +1077,14 @@ export class FlockMusic {
     n.droneLp.frequency.setTargetAtTime(220 + 700 * c * c, t, 0.45);
     n.padGain.gain.setTargetAtTime(0.004 + 0.012 * c, t, 0.5);
     n.padLp.frequency.setTargetAtTime(760 + 2400 * c, t, 0.5);
-    n.pulseGain.gain.setTargetAtTime(0.003 + 0.010 * c, t, 0.4);
+    // 鼓点与贝斯都很轻：kick 峰值约 0.022、镲约 0.006，都低于和声层的总和，
+    // 作用是把拍子垫出来，不是当主角。聚集度只在这个范围内微调，不会突然变响。
+    n.pulseGain.gain.setTargetAtTime(0.010 + 0.018 * c, t, 0.4);
+    n.bassPluckGain.gain.setTargetAtTime(0.010 + 0.016 * c, t, 0.6);
     n.shimmerGain.gain.setTargetAtTime(0.0012 + 0.012 * Math.max(0, c - 0.28), t, 0.6);
-    n.bassGain.gain.setTargetAtTime(0.0011 + 0.0028 * c, t, 0.9);
+    // 常驻低音长音再压一点：有了节奏贝斯之后，这条「二十秒浮一次」的底音
+    // 只需要一点点空气感，压不下来的话两层低频会互相糊住。
+    n.bassGain.gain.setTargetAtTime(0.0007 + 0.0016 * c, t, 0.9);
   }
 
   tick() {
@@ -1162,10 +1121,19 @@ export class FlockMusic {
       // 低音的「若隐若现」：每个双小节节点掷一次骰子，群体越抱团越容易出现
       if (Math.random() < 0.22 + 0.30 * c) this.bassFlicker(t);
     }
-    // 节奏：八分音符按聚集度稀疏化。散开时 dens≈0，几乎完全静音
+    // 节奏组（v1.4.23）：鼓点与贝斯共用同一组拍点，力度再由聚集度决定。
+    // 与以前「按概率撒低频短击」的区别是拍点是**固定**的——固定的骨架才叫鼓点，
+    // 随机撒点听起来是心跳。散开时只剩每小节第 1 拍（dens≈0 时其余全不出现），
+    // 抱团后才补上第 3 拍、贝斯第二音与反拍镲，所以「节奏密度」也成了群体状态的读数。
     const dens = Math.max(0, Math.min(1, (c - 0.1) / 0.62));
-    const accent = pos === 0 || pos === 4;
-    if (Math.random() < dens * (accent ? 0.85 : 0.4)) this.pulse(t, accent);
+    if (pos === 0) {
+      this.kick(t, false);
+      this.bassNote(t, 0);
+    } else if (pos === 4) {
+      this.kick(t, true);
+      if (Math.random() < 0.30 + 0.55 * dens) this.bassNote(t, 1);
+    }
+    if ((pos === 2 || pos === 6) && Math.random() < 0.10 + 0.55 * dens) this.hat(t);
     // 泛音点：只在抱团到一定程度后才出现，密度限幅，避免过于叮当
     if (c > 0.28) {
       const p = Math.min(0.32, (c - 0.28) * 1.4);
@@ -1197,20 +1165,60 @@ export class FlockMusic {
     }
   }
 
-  pulse(t, accent) {
+  // 鼓点（v1.4.23）：一记很轻的「咚」。sine 从 92Hz 快速落到 44Hz，
+  // 12ms 起音、强弱只差峰值与尾巴长度——音高不变（变音高听起来像走音，不像力度）。
+  // 刻意不加点击噪声和失真：那会让它变成「电子鼓」，在一片环境声里非常扎眼。
+  kick(t, weak) {
     const ctx = this.a.ctx, n = this.nodes;
     const o = ctx.createOscillator();
     o.type = 'sine';
-    const f0 = accent ? 88 : 146;
-    o.frequency.setValueAtTime(f0, t);
-    o.frequency.exponentialRampToValueAtTime(f0 * 0.5, t + (accent ? 0.26 : 0.16));
+    o.frequency.setValueAtTime(92, t);
+    o.frequency.exponentialRampToValueAtTime(44, t + (weak ? 0.15 : 0.22));
     const g = ctx.createGain();
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(accent ? 0.95 : 0.5, t + 0.01);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + (accent ? 0.36 : 0.22));
+    g.gain.exponentialRampToValueAtTime(weak ? 0.58 : 0.92, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + (weak ? 0.26 : 0.36));
     o.connect(g); g.connect(n.pulseGain);
-    o.start(t); o.stop(t + 0.45);
-    this.counts.pulse++;
+    o.start(t); o.stop(t + 0.4);
+    this.counts.kick++;
+  }
+
+  // 反拍闭镲：6.2kHz 以上的一小撮噪声，45ms 就收掉。
+  // 峰值只有 kick 的 1/5 左右——它的作用只是「让反拍有个落点」，不是打节奏。
+  hat(t) {
+    const ctx = this.a.ctx, n = this.nodes;
+    const src = ctx.createBufferSource();
+    src.buffer = this.a.noise;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 6200; hp.Q.value = 0.7;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.18 + Math.random() * 0.07, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    src.connect(hp); hp.connect(g); g.connect(n.pulseGain);
+    src.start(t, Math.random() * 0.9, 0.07);
+    this.counts.hat++;
+  }
+
+  // 贝斯（v1.4.23）：跟着 kick 走的短音，不是持续低音。
+  // 以 A1(55Hz) 为主，第二音偶尔跳五度（73.4Hz）——都在五声音阶里，怎么跳都不跑调。
+  // 过 320Hz 低通把谐波磨掉，只剩「闷闷的一下」，所以是垫在底下而不是顶出来；
+  // 起音比 kick 晚 18ms：同拍同起会互相掩蔽，错开一点两个都听得见。
+  bassNote(t, fifth) {
+    const ctx = this.a.ctx, n = this.nodes;
+    const tt = t + 0.018;
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.value = pentaFreq(fifth ? 3 : 0, -1);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 320; lp.Q.value = 0.7;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, tt);
+    g.gain.exponentialRampToValueAtTime(0.7, tt + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, tt + 0.42);
+    o.connect(lp); lp.connect(g); g.connect(n.bassPluckGain);
+    o.start(tt); o.stop(tt + 0.46);
+    this.counts.bassNote++;
   }
 
   shimmer(t) {

@@ -3910,11 +3910,8 @@ function render(now) {
     }
   }
 
-  // 密度纹理层（P3）：整群振翅的「底噪」，代替逐鸟逐次振翅发事件——
-  // 800 只按每秒约 7 次振翅就是 5000+ 次/秒，那是三个数量级的超标。
-  // 三个输入：飞得多快、群体多密、多少比例在拼命 → 决定电平与中心频率。
-  audio.setDensity(avgSpeed / Math.max(1, params.maxSpeed), density,
-    sprintingCount / Math.max(1, activeCount), params.paused);
+  // v1.4.23：整群振翅的密度纹理层已去掉（audio.setDensity 不再存在），
+  // 这里不再每帧喂速度/密度/冲刺比例。
 
   view2D.zoom += (view2D.tZoom - view2D.zoom) * 0.12;
   // 手持摇晃：暂停时 dt 传 0 —— 相位冻结、画面定格，但把强度调到 0 仍会立刻回正。
@@ -4802,6 +4799,12 @@ window.FlockLab = {
       // drone 是唯一「持续低频嗡声」的层，最容易在安静段落里被注意到；
       // 把它单独列出来，调音时不用再进 nodes 里翻。
       drone: music.nodes ? +music.nodes.droneGain.gain.value.toFixed(5) : null,
+      // 鼓点 / 贝斯两条总线的实际增益（v1.4.23）：两者都要求「很轻」，
+      // 调调音时直接看这两个数比听感判断更稳。
+      beat: music.nodes ? {
+        kickBus: +music.nodes.pulseGain.gain.value.toFixed(5),
+        bassBus: +music.nodes.bassPluckGain.gain.value.toFixed(5)
+      } : null,
       bassLayer: music.nodes ? {
         gate: +music.nodes.bassGate.gain.value.toFixed(3),
         gain: +music.nodes.bassGain.gain.value.toFixed(5)
@@ -4823,12 +4826,7 @@ window.FlockLab = {
     return {
       view: { x: +audio.view.x.toFixed(2), y: +audio.view.y.toFixed(2), halfW: +audio.view.halfW.toFixed(2) },
       lastPan: +audio.lastPan.toFixed(3),
-      reverb: audio.revSend ? 'on' : 'off',
-      texture: audio.tex ? {
-        gain: +audio.tex.gain.gain.value.toFixed(5),
-        freq: Math.round(audio.tex.bp.frequency.value),
-        applied: +(audio.texApplied || 0).toFixed(5)
-      } : null
+      reverb: audio.revSend ? 'on' : 'off'
     };
   },
   // 世界坐标 → 声像，用来核对「左边的鸟在不在左边」。
