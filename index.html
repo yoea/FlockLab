@@ -17,9 +17,9 @@
 <link rel="apple-touch-icon" href="assets/icon-180.png" />
 <link rel="stylesheet" href="css/style.css" />
 </head>
-<!-- 进入页面：先完整显示所有界面，1 秒后由 main.js 带淡出动画自动收起
-     （等同自动点一次「隐藏所有界面」）；此后任意操作只显现小眼睛，
-     点眼睛才展开完整界面。每次刷新都会重演一遍。 -->
+<!-- 进入页面：先完整显示所有界面，鼠标无操作 5 秒后由 main.js 带淡出动画自动收起；
+     之后任意鼠标动作 / 按键 / 触摸都会立刻重新显示并重新计时。
+     实时状态卡点「定住」后不参与自动隐藏，可以边跑边盯数据。 -->
 <body>
   <noscript><div style="position:fixed;inset:0;z-index:40;display:grid;place-items:center;background:#05070f;color:#dce9ff;font:14px/1.8 sans-serif;text-align:center">需要启用 JavaScript 才能运行 FlockLab 模拟并显示界面。</div></noscript>
   <div id="scene"></div>
@@ -45,22 +45,19 @@
         <circle class="st" cx="12" cy="12" r="2.6" />
       </svg>
     </button>
-    <button id="resetBtn" class="ico scene-btn" type="button" title="重新初始化（恢复默认参数）" aria-label="重新初始化">
+    <button id="fullscreenBtn" class="ico scene-btn" type="button" title="全屏" aria-label="全屏">
       <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path class="st" d="M20 12a8 8 0 1 1-2.4-5.7" />
-        <path class="st" d="M20 4v4.2h-4.2" />
+        <rect class="st" x="3.2" y="6.2" width="17.6" height="11.6" rx="2.2" />
+        <g class="expandIcon">
+          <path class="st" d="M8.2 12h7.6M8.2 12l2.2-2.2M8.2 12l2.2 2.2M15.8 12l-2.2-2.2M15.8 12l-2.2 2.2" />
+        </g>
+        <g class="shrinkIcon" style="display:none">
+          <path class="st" d="M8.6 12h6.8M8.6 12l1.5-1.5M8.6 12l1.5 1.5M15.4 12l-1.5-1.5M15.4 12l-1.5 1.5" />
+        </g>
       </svg>
     </button>
 
     <span class="sep" aria-hidden="true"></span>
-
-    <button id="uiBtn" class="ico" type="button" title="隐藏所有界面" aria-label="隐藏所有界面">
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path class="eye" d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6S2 12 2 12z" />
-        <circle class="pupil" cx="12" cy="12" r="2.4" />
-        <path class="slash" d="M4.5 4.5l15 15" />
-      </svg>
-    </button>
 
     <button id="audioBtn" class="ico muted" type="button" title="开启声音与音乐" aria-label="开启声音与音乐">
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -82,13 +79,13 @@
         <li><b>自己下场</b>在画面上双击左键，光标变成捕食者，鸟群会像躲猛禽一样散开；右键恢复。</li>
         <li><b>调参</b>控制台每项都有说明，拖动即时生效，刷新后保留。</li>
       </ul>
-      <p class="about-foot">Three.js · WebGL · <span id="aVer">v1.4.8</span></p>
+      <p class="about-foot">Three.js · WebGL · <span id="aVer">v1.4.9</span></p>
     </div>
   </div>
 
   <div id="hud" class="glass card">
-    <button id="pinBtn" class="pin" type="button" title="钉住状态卡（隐藏界面时仍保留）"
-            aria-label="钉住状态卡" aria-pressed="false">
+    <button id="pinBtn" class="pin" type="button" title="定住状态卡（自动隐藏时仍保留）"
+            aria-label="定住状态卡" aria-pressed="false">
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path class="pin-head" d="M8.4 3.2h7.2l-.8 6.4 3.0 3.0H6.2l3.0-3.0z" />
         <path class="pin-stem" d="M12 12.6V20.4" />
@@ -138,7 +135,7 @@
       </div>
 
       <div class="hud-ver" id="hVerLine">
-        <span id="hVer">v1.4.8</span><i>·</i><span id="hCommit">—</span><i>·</i><span id="hBuild">—</span><i>·</i><span id="hAuthor">—</span>
+        <span id="hVer">v1.4.9</span><i>·</i><span id="hCommit">—</span><i>·</i><span id="hBuild">—</span><i>·</i><span id="hAuthor">—</span>
       </div>
     </div>
   </div>

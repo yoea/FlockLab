@@ -1890,15 +1890,51 @@ pauseBtn.addEventListener('click', () => {
   syncPauseBtn();
   wake();
 });
-document.getElementById('resetBtn').addEventListener('click', () => {
-  applyDefaults();          // 恢复默认参数 + 重新初始化群体
+// 全屏：只做浏览器全屏切换，不碰模拟状态。原来的「重新初始化」已下线，
+// 恢复出厂参数仍可通过调试接口 FlockLab.resetAll() 使用。
+const fsBtn = document.getElementById('fullscreenBtn');
+const fsExpand = fsBtn.querySelector('.expandIcon');
+const fsShrink = fsBtn.querySelector('.shrinkIcon');
+const fsDoc = document.documentElement;
+function fsElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+function syncFsBtn() {
+  const on = !!fsElement();
+  fsBtn.classList.toggle('on', on);
+  if (fsExpand) fsExpand.style.display = on ? 'none' : '';
+  if (fsShrink) fsShrink.style.display = on ? '' : 'none';
+  const label = on ? '退出全屏' : '全屏';
+  fsBtn.title = label;
+  fsBtn.setAttribute('aria-label', label);
+}
+fsBtn.addEventListener('click', () => {
   wake();
+  try {
+    if (fsElement()) {
+      const exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit) exit.call(document);
+    } else {
+      const req = fsDoc.requestFullscreen || fsDoc.webkitRequestFullscreen;
+      if (!req) { toast('当前浏览器不支持全屏（iPhone 可用「添加到主屏幕」）'); return; }
+      const p = req.call(fsDoc);
+      // 被浏览器策略拒绝时别静默失败（iOS 内嵌页、iframe 里很常见）
+      if (p && typeof p.catch === 'function') p.catch(() => toast('全屏被浏览器拒绝'));
+    }
+  } catch (e) {
+    toast('全屏切换失败：' + e.message);
+  }
 });
+// webkit 前缀的旧内核只会派发自己的事件，两个都听
+for (const evName of ['fullscreenchange', 'webkitfullscreenchange']) {
+  document.addEventListener(evName, syncFsBtn);
+}
 document.getElementById('viewBtn').addEventListener('click', () => {
   resetView2D();
   wake();
 });
 syncPauseBtn();
+syncFsBtn();
 
 // ---------------------------------------------------------------- 关于
 const about = document.getElementById('about');
@@ -1906,76 +1942,54 @@ const brandBtn = document.getElementById('brand');
 function openAbout() {
   about.classList.add('open');
   about.setAttribute('aria-hidden', 'false');
+  setIdle(false);          // 读关于页时界面别自己淡出
+  clearTimeout(idleTimer);
 }
 function closeAbout() {
   about.classList.remove('open');
   about.setAttribute('aria-hidden', 'true');
+  wake();                  // 关掉后重新开始 5 秒闲置计时
 }
 brandBtn.addEventListener('click', openAbout);
 about.addEventListener('click', (e) => { if (e.target === about) closeAbout(); });
 about.querySelector('.about-close').addEventListener('click', closeAbout);
 addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAbout(); });
 
-// 演示模式：一次点击隐藏控制台、卡片、提示等所有 UI，只留这个图标用于恢复。
-const uiBtn = document.getElementById('uiBtn');
-function syncUiBtn() {
-  const hidden = document.body.classList.contains('ui-hidden');
-  uiBtn.classList.toggle('off', hidden);
-  const label = hidden ? '显示所有界面' : '隐藏所有界面';
-  uiBtn.title = label;
-  uiBtn.setAttribute('aria-label', label);
-}
-uiBtn.addEventListener('click', () => {
-  document.body.classList.toggle('ui-hidden');
-  syncUiBtn();
-  if (document.body.classList.contains('ui-hidden')) scheduleEyeFade();
-  else { clearTimeout(eyeTimer); uiBtn.classList.remove('faded'); }
-});
-syncUiBtn();
+// ---------------------------------------------------------------- 闲置自动隐藏
+// 5 秒无操作 → 控制台、实时状态卡、右下角按钮一起淡出，光标也藏起来，只留纯画面。
+// 任意鼠标动作 / 按键 / 滚轮 / 触摸立刻全部恢复并重置计时。
+// 原「小眼睛」按钮连同它的演示模式一并删除：恢复界面靠移动鼠标，不再需要按钮。
+// 例外：状态卡点了「定住」就不参与隐藏（CSS 用 #hud:not(.pinned) 排除），
+// 卡片里的按钮（定住 / 折叠）跟着常驻，可以边跑边盯数据。
+const IDLE_MS = 5000;
+let idleTimer = 0;
+let idleDeadline = 0;      // 只在调试接口里读，用来报「还有多少毫秒收起」
 
-// 进入页面：先完整显示所有界面，1 秒后带淡出动画自动收起——
-// 等同于自动替用户点一次「隐藏所有界面」按钮，走的是同一套 ui-hidden 逻辑：
-// 收起后任意操作只把小眼睛显现出来（3 秒闲置再淡出），点眼睛才展开完整界面。
-// 每次打开 / 刷新都会重演。若这 1 秒里用户已手动隐藏，或「关于」弹窗开着，就不抢动作。
-function autoHideUi() {
-  if (document.body.classList.contains('ui-hidden')) return;
-  if (about.classList.contains('open')) { setTimeout(autoHideUi, 800); return; }
-  document.body.classList.add('ui-hidden');
-  syncUiBtn();
-  scheduleEyeFade();
+function setIdle(on) {
+  document.body.classList.toggle('ui-hidden', on);
+  document.body.classList.toggle('cursor-idle', on);   // 闲置时连光标一起藏
 }
-setTimeout(autoHideUi, 1000);
 
-// 闲置自动隐藏：光标 3 秒无操作后消失；演示模式里小眼睛也一样淡出。
-// 晃动鼠标、按键、触摸或滚轮都会立刻恢复，并重新计时。
-const IDLE_MS = 3000;
-let idleTimer = 0, eyeTimer = 0;
-function scheduleEyeFade() {
-  clearTimeout(eyeTimer);
-  if (!document.body.classList.contains('ui-hidden')) return;
-  eyeTimer = setTimeout(() => uiBtn.classList.add('faded'), IDLE_MS);
-}
 function wake() {
-  document.body.classList.remove('cursor-idle');
+  if (document.body.classList.contains('ui-hidden')) setIdle(false);
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => document.body.classList.add('cursor-idle'), IDLE_MS);
-  if (document.body.classList.contains('ui-hidden')) {
-    uiBtn.classList.remove('faded');
-    scheduleEyeFade();
-  }
+  idleDeadline = 0;
+  // 「关于」开着不算闲置：用户正在读，别把背后的界面抽走
+  if (about.classList.contains('open')) return;
+  idleDeadline = performance.now() + IDLE_MS;
+  idleTimer = setTimeout(() => setIdle(true), IDLE_MS);
 }
-// 任意操作只负责「把眼睛叫醒 + 重置光标闲置计时」，不再直接展开完整界面。
-// 展开必须点右下角眼睛按钮（常规逻辑）。
-addEventListener('mousemove', wake, { passive: true });
-addEventListener('mousedown', wake, { passive: true });
-addEventListener('keydown', wake, { passive: true });
-addEventListener('wheel', wake, { passive: true });
-addEventListener('touchstart', wake, { passive: true });
-addEventListener('pointerdown', wake, { passive: true });
+
+// 每种输入都算「有操作」；pointerdown / mousedown / touchstart 与 mousemove 可能同时到，
+// 重复调用 wake() 只是重置同一个定时器，没有副作用。
+for (const ev of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart', 'pointerdown']) {
+  addEventListener(ev, wake, { passive: true });
+}
 wake();
 
-// 状态卡「钉住」：钉住后一键隐藏界面时它仍留在屏幕上（CSS 用 :not(.pinned) 排除）。
-// 单独存一个 key，不进参数存档，所以与 v6 参数版本无关；刷新后保持上次选择。
+// 状态卡「定住」：定住后闲置自动隐藏时它仍留在屏幕上（CSS 用 :not(.pinned) 排除），
+// 卡内的定住 / 折叠按钮于是也跟着常驻，可以边跑边盯数据。
+// 单独存一个 key，不进参数存档，所以与存档版本号无关；刷新后保持上次选择。
 const hudEl = document.getElementById('hud');
 const pinBtn = document.getElementById('pinBtn');
 const PIN_KEY = 'flocklab.hud.pinned';
@@ -1986,8 +2000,8 @@ function syncPin() {
   pinBtn.classList.toggle('on', hudPinned);
   pinBtn.setAttribute('aria-pressed', String(hudPinned));
   const label = hudPinned
-    ? '取消钉住（隐藏界面时状态卡一起隐藏）'
-    : '钉住状态卡（隐藏所有界面时仍保留）';
+    ? '取消定住（闲置时状态卡跟着一起隐藏）'
+    : '定住状态卡（闲置 5 秒时仍保留）';
   pinBtn.title = label;
   pinBtn.setAttribute('aria-label', label);
 }
@@ -2110,7 +2124,8 @@ bindBool(fView, 'multiCore', '多核加速',
   (v) => setMultiCore(v));
 fView.close();
 
-// 恢复出厂参数：点右下角「重新初始化」才会走到这里，平时刷新都沿用存档。
+// 恢复出厂参数：界面上的「重新初始化」按钮已换成全屏，这里只留给调试接口
+// FlockLab.resetAll() 用；平时刷新都沿用存档。
 function applyDefaults() {
   for (const key of PERSIST_KEYS) params[key] = DEFAULTS[key];
   params.paused = false;
@@ -4218,9 +4233,14 @@ window.FlockLab = {
     }
     return n;
   },
+  // 闲置自动隐藏：uiIdle 表示界面已收起；idleLeft 是距离自动收起的毫秒数（鼠标一动就回到 5000）
   get uiHidden() { return document.body.classList.contains('ui-hidden'); },
   get cursorHidden() { return document.body.classList.contains('cursor-idle'); },
-  get eyeFaded() { return uiBtn.classList.contains('faded'); },
+  get idleLeft() { return Math.max(0, Math.round(idleDeadline - performance.now())); },
+  get hudPinned() { return hudPinned; },
+  get fullscreen() { return !!fsElement(); },
+  // 调试用：立刻进入 / 退出闲置隐藏，不用等 5 秒
+  forceIdle(on) { setIdle(!!on); return true; },
   get fleeingCount() { let c = 0; for (let i = 0; i < activeCount; i++) c += fleeing[i]; return c; },
   get groupCenter() { return { x: +groupX.toFixed(2), y: +groupY.toFixed(2), z: +groupZ.toFixed(2) }; },
   get avgPredDist() {

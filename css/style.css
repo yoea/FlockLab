@@ -53,8 +53,8 @@
 
   /* 所有控制按钮统一收在「右下角」：左下角是实时状态卡，右上角完全留白。
      顺序仍按「操作频率 + 影响范围」从左到右：
-     暂停 → 重置视角 → 重新初始化 ｜ 隐藏界面 → 声音。
-     左三件改变模拟状态，右两件只改变呈现方式，中间用一条细分隔线分开。 */
+     暂停 → 重置视角 → 全屏 ｜ 声音。
+     左三件改变呈现/运行状态，右边一件管声音，中间用一条细分隔线分开。 */
   #topbar {
     position: fixed; right: 18px; bottom: 18px; z-index: 8;
     display: flex; align-items: center; gap: 8px;
@@ -93,19 +93,9 @@
   }
   #audioBtn.live .cross, #audioBtn:not(.live) .waves { display: none; }
 
-  #uiBtn { z-index: 9; }
-  #uiBtn svg { width: 18px; height: 18px; }
-  #uiBtn .eye, #uiBtn .pupil {
-    fill: none; stroke: currentColor; stroke-width: 1.7;
-    stroke-linecap: round; stroke-linejoin: round;
-  }
-  #uiBtn .pupil { fill: currentColor; stroke: none; }
-  #uiBtn .slash {
-    fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round;
-    display: none;
-  }
-  #uiBtn.off .eye, #uiBtn.off .pupil { opacity: 0.35; }
-  #uiBtn.off .slash { display: block; }
+  /* 全屏：进入后按钮高亮，图标换成「收拢」箭头；不在全屏时是「展开」箭头 */
+  #fullscreenBtn.on { border-color: rgba(99, 230, 255, 0.72); box-shadow: 0 0 16px rgba(99, 230, 255, 0.16); }
+  #fullscreenBtn .expandIcon, #fullscreenBtn .shrinkIcon { pointer-events: none; }
 
   /* 闲置数秒后隐藏光标，任何鼠标移动 / 按键 / 触摸都会立刻恢复 */
   body.cursor-idle, body.cursor-idle * { cursor: none !important; }
@@ -129,30 +119,22 @@
   }
   #toast.show { opacity: 1; transform: translate(-50%, 0); }
 
-  /* 隐藏全部界面后，小眼睛自身也会淡出；晃动鼠标或按键再显现 */
-  #uiBtn.faded { opacity: 0; pointer-events: none; }
-
-  /* 隐藏 / 显示全部界面：用 opacity + visibility 过渡，收起和展开都是 ~0.45s 淡出动画
+  /* 隐藏 / 显示界面：用 opacity + visibility 过渡，收起和展开都是 ~0.45s 淡出动画
      （display:none 无法参与过渡，会瞬间消失）。visibility 延迟到淡出结束再切断，
      展开时则立即恢复可见。 */
-  #brand, #hud, .lil-gui.root {
+  #brand, #hud, #topbar, .lil-gui.root {
     transition: opacity .45s ease, visibility 0s linear 0s;
   }
+  /* 闲置自动隐藏：5 秒无操作后控制台、状态卡、角落按钮一起淡出，只留纯画面。
+     定住的状态卡不参与（:not(.pinned)），可以边跑边盯数据；
+     任意鼠标动作 / 按键 / 触摸都会立即恢复全部界面并重新计时。 */
   body.ui-hidden #brand,
   body.ui-hidden #hud:not(.pinned),
+  body.ui-hidden #topbar,
   body.ui-hidden .lil-gui.root {
     opacity: 0; visibility: hidden; pointer-events: none;
     transition: opacity .45s ease, visibility 0s linear .45s;
   }
-
-  /* 演示模式：只保留「小眼睛」，其余界面全部淡出。
-     场景按钮与声音用 visibility 隐藏，保留占位，避免小眼睛位置跳动。 */
-  body.ui-hidden #topbar .scene-btn,
-  body.ui-hidden #topbar #audioBtn {
-    opacity: 0; visibility: hidden; pointer-events: none;
-    transition: opacity .45s ease, visibility 0s linear .45s;
-  }
-  body.ui-hidden #topbar .sep { opacity: 0; visibility: hidden; transition: opacity .45s ease, visibility 0s linear .45s; }
 
   /* 暂停时按钮改为高亮，明确当前处于冻结状态 */
   #pauseBtn.on { border-color: rgba(255, 211, 110, 0.6); box-shadow: 0 0 16px rgba(255, 211, 110, 0.16); }

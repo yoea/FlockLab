@@ -339,6 +339,20 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 
 **控制台分组**：按「看什么 → 怎么飞 → 谁吃谁 → 画面与性能」排，默认只展开「鸟群」「捕食者」。lil-gui 的 folder **默认就是展开的**，想让某组收起必须显式 `folder.close()`——只写 `fA.open()` 不管其他组，结果会是全开、面板直接拉出屏幕。
 
+### 3.9d 界面闲置自动隐藏与全屏（v1.4.9）
+
+**一套状态，两个 body 类**：`ui-hidden`（界面收起）+ `cursor-idle`（光标收起）由同一个 `setIdle(on)` 同时开关，定时器只有一个 `idleTimer`。
+
+- `IDLE_MS = 5000`。首次载入时 `wake()` 跑一次就开始计时，所以「不碰鼠标」也会在 5 秒后收起，不需要单独的启动定时器。
+- 任何输入都调 `wake()`：`mousemove / mousedown / keydown / wheel / touchstart / pointerdown`。它做两件事——把两个类去掉、把定时器重置到 5 秒后。
+- **原来那套「载入 1 秒后自动收起 + 小眼睛按钮」已经删掉**：1 秒收起太快（用户还没看清控制台），小眼睛又在闲置时自己淡出，恢复界面要靠猜。现在统一成「闲置才收起、动一下就回来」，不需要恢复按钮。
+- **定住的状态卡是唯一例外**：CSS 写成 `body.ui-hidden #hud:not(.pinned)`，所以 `#hud.pinned` 不参与淡出；定住 / 折叠按钮都在卡片内部，于是自动跟着常驻。
+- 「关于」弹窗开着时 `wake()` 直接 return（不计时、不收起），关闭时再 `wake()` 重新起算——否则用户正在读文案，背后的界面会被抽走。
+
+**全屏**只做 `requestFullscreen()` / `exitFullscreen()`（带 `webkit` 前缀回退），**不碰任何参数**。`fullscreenchange` + `webkitfullscreenchange` 两个事件都听（老内核只派发自己的），据此切换图标（展开 / 收拢箭头）与 `.on` 高亮。iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
+
+**「重新初始化」已下线**：那条按钮改成了全屏，恢复出厂参数的入口只剩调试接口 `FlockLab.resetAll()`（内部就是 `applyDefaults()`），函数本身保留。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
@@ -418,7 +432,7 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 
 **出生动画 / 背景**：`hatchPending`（还在涌出中的个体数，加载后应逐渐归 0）/ `respawn(n)`（立刻让 n 只原地重生，验证涌出动画）/ `backdrop`（背景层本体：`uniforms.uGain` 拉高可看清地貌形状，`uniforms.uGN=0` 可 A/B 对比草地避让）
 
-**UI**：`uiHidden` / `eyeFaded` / `hudPinned`
+**UI**：`uiHidden`（界面是否已闲置收起）/ `cursorHidden` / `idleLeft`（距离自动收起的毫秒数，鼠标一动回到 5000）/ `hudPinned`（状态卡是否定住）/ `fullscreen`（是否处于全屏）/ `forceIdle(on)`（立刻进入 / 退出闲置隐藏，验证用，不用等 5 秒）
 
 **个体差异**：`teleportCount`（同 `teleports`）/ `overGrass` 相关在内部
 
@@ -597,6 +611,7 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 | v1.4.6 | **视野摇晃**：模拟人扛摄影机，四通道低频叠加（横/纵漂移、倾斜、轻微缩放），每条 = 主频 + 次频、频率无理比，所以看不出周期；幅度按视口比例算，缩放后屏幕幅度不变；`viewShake` 0~2.5（默认 1，0 = 静止），暂停时相位冻结。同步改了 `screenToWorld`（否则鼠标捕食者偏十几像素）、背景余量 2.06→2.10（倾斜不露边）、视差层跟随相机实际位置。实测横向 ±12px、纵向 ±7px、倾斜 ±0.55°、缩放 ±0.86%，引擎投影往返误差 0px，见 §3.9b |
 | v1.4.7 | **信息面整理**：状态卡新增运行模式（单核 / 多核 ×N，按「这一帧真的在并行吗」判定，而不是只看开关）与 CPU / GPU 压力条（都以 60fps 的 16.7ms 为 100%；GPU 用 `EXT_disjoint_timer_query_webgl2` 实测，浏览器不给扩展时退回提交耗时并标 `~`）；卡底新增版本行（**版本 · commit · 构建时间 · 作者**，由 `tools/build-meta.mjs` 生成 `js/version.js`）；关于弹窗从 16 条压到 3 条要点；控制台由「鸟群规则 / 飞行与视野 / 捕食与逃逸 / 高级参数 / 草地」重排为「鸟群 / 飞行 / 捕食者 / 逃逸 / 草地 / 画面与性能」，参数按用途归位、默认只展开前两组。顺带修了四处：存档 120ms 防抖窗口内关页面会丢最后一次改动（`pagehide` 立即落盘）；「恢复默认参数」后多核开关显示为开但实际仍跑单核（漏了重建线程池）；v6→v7 迁移会把 `musicLevel` / `boundary` 这些已废弃的键也搬进新存档；多核首帧冷启动被 800ms 超时误杀（首帧给 4 倍宽限）。见 §3.9c |
 | v1.4.8 | **修「开声后画面定格」**：`params.master` 在 v1.4.7 被删但 `audio.js` 仍在读，`AudioParam.value = undefined` 抛 TypeError；异常发生在 `render` 的仿真段（`prepareForces → audio.sprint()`），每帧中断 → 画面定格，静音后 `canPlay()` 早退即恢复。改为常量 `MASTER_GAIN`，`connectOutput()` 内 try/catch 兜底（音频故障只能没声音，不能停鸟群），音频建图拆两段可续建。同批补回 v1.4.4 丢失的 `stamina` 恢复与 `sprintingCount` 累加——后者必须与累加同在 `frameFinish`：多核是「本帧 dispatch、下帧收尾」，在 `frameBegin` 清零会被下一帧立刻抹掉 |
+| v1.4.9 | **界面交互重做**：右下角「重新初始化」→ **全屏**（`requestFullscreen` / `exitFullscreen` 带 webkit 回退，只切全屏不动参数，`fullscreenchange` + `webkitfullscreenchange` 双事件同步图标与高亮）；**闲置 5 秒自动隐藏**控制台 / 状态卡 / 右下角按钮，光标同时隐藏，任意输入调 `wake()` 恢复并重置计时；`#hud.pinned` 靠 CSS `:not(.pinned)` 排除在隐藏之外，卡内按钮跟着常驻；「关于」弹窗打开期间不计时；删除小眼睛按钮、`autoHideUi` 的载入 1 秒收起与 `eyeTimer` 那套淡出；`applyDefaults()` 保留给调试接口 `resetAll()`。见 §3.9d |
 
 > 完整改动细节见 git 提交信息（`git log --oneline`）与各版本的 README 段落历史。
 
