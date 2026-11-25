@@ -372,6 +372,18 @@ beginQuery(ext.TIME_ELAPSED_EXT, q);  renderer.render(...);  endQuery(...)
 - `lastFs` 初值 `null`：初次 `syncFsBtn()` 只同步图标不碰界面——此时 `manualHidden` 还在 `let` 的 TDZ 里，碰了就抛。
 iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
+**F11 必须和按钮走同一个 toggle（v1.4.20）**：浏览器原生 F11 是**窗口级**全屏，不会设置
+`document.fullscreenElement`，于是按钮图标永远停在「全屏」；此时点按钮请求的是 Fullscreen API，
+而窗口早就铺满了——画面一像素不变，第二次点也只是退出 API 全屏、窗口仍是 F11 那种满屏状态。
+两边各自都「正常」，合起来就是「点全屏按钮没反应」。
+修法是在 **捕获阶段** 监听 `keydown`，`key === 'F11' || code === 'F11' || keyCode === 122` 时
+`preventDefault()` 拦掉原生窗口全屏，再调同一个 `toggleFullscreen()`；`e.repeat` 直接 return，
+避免长按连续切换。全屏状态从此只有 `document.fullscreenElement` 一个来源，图标 / 界面收起 / 退出必然一致。
+**不要退回「原生 F11 开着、按钮再叠一层 API 全屏」的双状态**。
+⚠️ 已知边界：Chrome 在**已经处于原生 F11 全屏**时会把 F11 的 `keydown` 整个吃掉（防止页面把用户
+锁在全屏里），页面既收不到事件、也无法用 API 退出那个状态。只要我们拦住了 F11 就不会进去；
+万一从浏览器菜单进入，按 F11 照样能退出。
+
 **「重新初始化」已下线**：那条按钮改成了全屏，恢复出厂参数的入口只剩调试接口 `FlockLab.resetAll()`（内部就是 `applyDefaults()`），函数本身保留。
 
 ### 3.9e 暂停 = 画面 + 音乐（v1.4.10）
@@ -447,10 +459,12 @@ iPhone 上 `requestFullscreen` 不存在，点击时给一条 toast 提示。
 
 **逃逸体力（v1.4.19，双格制）**：`stamina` 存的是 **0~2 的格数**（`STAMINA_MAX`），每段冲刺 `-= 1`。起爆要同时满足 `stamina >= 1 && time >= sprintUntil`，且满足其一：满格（`>= STAMINA_MAX-0.01`，任意距离）= **完整冲刺**（`sprintDuration` × `sprintSpeed`）；只剩 1 格时必须在 `dist < fleeRange × SECOND_WIND_R`（0.60，默认 5.7 单位）以内 = **恐慌二段**（时长 ×0.75、速度 ×0.93）。二段的速度上限写在 `sprintCap[i]`，**不进 worker**——`forces.js` 仍按全局 `sprintSpeed` 给逃逸力，真正的截断在主线程积分那一步（`topSpeed = sprinting ? (sprintCap[i] || sprintSpeed) : ...`）。恢复：`stamina < 1` 用 `sprintRecovery` 秒/格，`>= 1` 用 `1.8 ×` 秒/格，所以「完整 + 二段」烧完要 8.4 秒回满，二段是攒出来的。**改体力逻辑时必查三处**：`PRED_SCORE_TIRED` 的输入要归一化 `1 - stamina/STAMINA_MAX`（否则半格会被当成满格，索敌评分失真）；死亡、`spawnFar` 重生、面板重置要同时清 `stamina/sprintCap/sprintTier`；`sprintingFull`/`sprintingSecond` 要和 `sprintingCount` 同帧清零累加（多核下是「本帧 dispatch、下帧收尾」，放错地方会永远是 0）。`staminaState` → `{full, half, empty, secondWindTotal, avg}`，`avg` 归一化到 0~1，和 v1.4.18 的曲线可直接对比。
 
-**捕杀特效（v1.4.19）**：`spawnBurst(x, y, z, now, ix, iy)` + `killBursts` 池，一次「有方向的撞碎」。`ix/iy` 是**撞轴**（捕食者速度方向；速度≈0 时退化为「捕食者→猎物」）。每个池位一套 `InstancedMesh`（48 片三角碎屑）+ 一张 `PlaneGeometry` 白芒：
-- **碎片**：方向 = 撞轴 + 锥形偏角（`SHARD_SPREAD` = 0.95 rad ≈ ±54°），14% 走逆溅分支朝来向崩回；位置 `r = v0·(1−e^{−kt})/k` 叠加 `SHARD_PUSH × t` 的撞轴位移（这一项才是「被撞飞」而不是「原地爆炸」）；每片另有自转 `spin`、初始角 `ang0`（偏向撞轴）、起点沿撞轴垂线的偏移 `off`。颜色按 `(1−lt)^0.75 × (1 − min(0.45, r/22))` 衰减，所以锥形根部亮、外沿暗。
+**捕杀特效（v1.4.19 / v1.4.20）**：`spawnBurst(x, y, z, now, ix, iy, spd)` + `killBursts` 池，一次「有方向的撞碎」。`ix/iy` 是**撞轴**（捕食者速度方向；速度≈0 时退化为「捕食者→猎物」），`spd` 是撞击瞬间捕食者自己的速度大小。
+- **力度归一化（v1.4.20）**：`punch = clamp(spd / (predSpeed × SHARD_REF_V=0.75), 0.34, 1.70)`。0.75 就是常规追击实测均速（pursue 段 ≈18.2 / predSpeed 25 → 0.73），所以 **1.0 = 标准撞击**、0.5 = 滑翔掠过、1.5 = 俯冲砸下来。用相对值而不是绝对速度，`predSpeed` 滑杆怎么拖强度都对得上。力度同时驱动四处：碎片初速 `× punch^0.85`（低速端稍微抬一点，轻撞也看得见）、撞飞位移 `SHARD_PUSH × punch`、锥角 `SHARD_SPREAD × (1.30 − 0.30·punch)`（快撞更收束、慢撞更散）、白芒长度与亮度。**不要用相对速度**——那里面混了鸟的逃命冲刺，会让拼命逃的鸟看起来被撞得更狠。
+- **碎片**：方向 = 撞轴 + 锥形偏角（默认 0.95 rad ≈ ±54°，按力度伸缩），14% 走逆溅分支朝来向崩回；位置 `r = v0·(1−e^{−kt})/k` 叠加撞轴位移（这一项才是「被撞飞」而不是「原地爆炸」）；每片另有自转 `spin`、初始角 `ang0`（偏向撞轴）、起点沿撞轴垂线的偏移 `off`。寿命 `0.80 + 0.20·punch` 倍且压在 0.76s 内（`BURST_MS` 820ms，不能拖到下一只）。颜色按 `(1−lt)^0.75 × (1 − min(0.45, r/22))` 衰减，所以锥形根部亮、外沿暗。
 - **白芒**：长轴沿撞轴、位置沿撞轴前移 0.42 个身长（落在「撞过去的方向」而不是两侧平分），用**普通混合**而不是加法混合——加法在深色背景上只能提亮一点，看着像灰烟。
 - 撞轴直接决定一切：`0°` 与 `225°` 两次生成的碎法互为镜像，改 `SHARD_N` 调密度、`SHARD_DAMP` 调飞散距离（终值 `v0/k`）、`SHARD_PUSH` 调撞飞位移。
+- 实测（800 只 / 90s）：捕获时 `punch` 分布 0.58~1.39，中位 **0.90**；轻（<0.7）18% / 常规 64% / 重（>1.15）18%——不再每次都是满力爆炸。`FlockLab.burstState` 可读最新一次的 `{punch, push, spread, v0max, reach, age}`。
 
 **警戒圈**：`THREAT_RING_SHOWN=false` 只关绘制；`ringState` 里的 `heat`/`alpha`/`radius` 仍按 `params.fleeRange` 实时计算，`drawn` 字段标明当前是否画出来。逃逸判定在 `forces.js`，与这个 mesh 无关。
 
@@ -631,7 +645,8 @@ python -c "import struct;d=open('assets/icon-512.png','rb').read();print(struct.
 ## 8. 版本历史（要点）
 
 > v1.4.14 之后的版本（v1.4.15 猛禽飞行动力学、v1.4.16 锁定框、v1.4.17 变红加粗、
-> v1.4.18 急转与烟花、v1.4.19 双格体力与撞碎特效）只记在 `README.md` 的版本表里，
+> v1.4.18 急转与烟花、v1.4.19 双格体力与撞碎特效、v1.4.20 F11 与全屏按钮统一 /
+> 撞击力度随捕食者速度 / 进食冷却 0–15s）只记在 `README.md` 的版本表里，
 > 这里保留到 v1.4.14 的旧表不再追加。
 
 | 版本 | 要点 |

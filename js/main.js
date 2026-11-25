@@ -161,7 +161,7 @@ const PARAM_RANGE = {
   maxSpeed: [2, 18], minSpeed: [0.5, 8], arrowSize: [0.18, 0.9],
   predatorCount: [1, MAX_P], fleeWeight: [0, 6], fleeRange: [3, 24],
   predict: [0, 1.5], chaseWeight: [0, 4], predSpeed: [2, 36],
-  lockTime: [0, 5], feedCooldown: [0.3, 60],
+  lockTime: [0, 5], feedCooldown: [0, 15],
   sprintFactor: [1, 2.5], sprintDuration: [0.2, 3], sprintRecovery: [1, 12],
   viewShake: [0, 2.5]
 };
@@ -1905,9 +1905,16 @@ addEventListener('pointermove', (e) => {
 // 于是「从右往左撞」和「从下往上撞」的碎裂方式完全不同，动画本身就在讲方向。
 const SHARD_N = 48;             // 每次撞碎的碎片数
 const SHARD_DAMP = 3.2;         // 阻尼：r(t) = v0·(1−e^{−kt})/k，碎片越飞越慢
-const SHARD_PUSH = 3.6;         // 整团沿撞轴的「撞飞」位移速度（单位/秒，线性）
+const SHARD_PUSH = 3.6;         // 整团沿撞轴的「撞飞」位移速度（单位/秒，线性）× 撞击力度
 const SHARD_SPREAD = 0.95;      // 锥形半角（rad ≈ ±54°）
 const SHARD_HIT = 0.028;        // 撞击到碎裂的极短停顿：先「顶一下」再炸开
+// 撞击力度归一化：捕食者撞击瞬间的实际速度 / (predSpeed × 这个系数)。
+// 0.75 就是「常规追击」的实测均速（pursue 段 ≈ 18.2，predSpeed 25 → 0.73），
+// 于是 1.0 = 标准撞击、0.5 = 掠过式轻啄、1.5 = 俯冲砸下来。
+// 用相对值而不是绝对速度，predSpeed 滑杆无论怎么拖，画面强度都对得上。
+const SHARD_REF_V = 0.75;
+const SHARD_PUNCH_MIN = 0.34;   // 再慢也得看得见（下限保住「碎开」这个信息）
+const SHARD_PUNCH_MAX = 1.70;
 // 柔边圆贴图：给白芒做径向衰减，免得那道亮痕是个硬边矩形。
 const fwTex = (() => {
   const c = document.createElement('canvas');
@@ -1976,17 +1983,29 @@ for (let b = 0; b < 14; b++) {
     base: new Float32Array(SHARD_N * 3),  // 碎片本色（随寿命衰减后写进 instanceColor）
     ox: 1, oy: 0,                         // 撞轴的垂线（单位向量）
     off: new Float32Array(SHARD_N),       // 起点沿垂线的偏移：像一片被拍扁的薄片向两侧裂开
+    punch: 1, push: SHARD_PUSH, spread: SHARD_SPREAD,   // 力度 / 撞飞位移 / 锥角（spawnBurst 按捕食者速度写入）
     active: false, born: 0, x: 0, y: 0
   });
 }
-// spawnBurst(x, y, z, now, ix, iy)：ix/iy 是撞轴（捕食者速度方向）。
-function spawnBurst(x, y, z, now, ix, iy) {
+// spawnBurst(x, y, z, now, ix, iy, spd)：
+//   ix/iy 是撞轴（捕食者速度方向），spd 是撞击瞬间捕食者的速度大小。
+//   速度决定「撞击有多重」——滑翔着擦过去和俯冲砸下来不该是同一副画面。
+//   旧版固定满力，所以每一次捕获都像被炮弹撞了。省略 spd 时按标准撞击处理（调试用）。
+function spawnBurst(x, y, z, now, ix, iy, spd) {
   let slot = killBursts.find((b) => !b.active);
   if (!slot) slot = killBursts.reduce((a, b) => (a.born < b.born ? a : b)); // 池满则复用最老
   let ax = ix || 0, ay = iy || 0;
   const al = Math.sqrt(ax * ax + ay * ay);
   if (al < 1e-4) { ax = 1; ay = 0; } else { ax /= al; ay /= al; }
   const ang = Math.atan2(ay, ax);
+  // 力度：0.34（擦碰）~ 1.70（俯冲），1.0 是常规追击。
+  const refV = Math.max(1, params.predSpeed * SHARD_REF_V);
+  const punch = clampNum((spd === undefined ? refV : spd) / refV, SHARD_PUNCH_MIN, SHARD_PUNCH_MAX);
+  const pw = Math.pow(punch, 0.85);      // 低速端稍微抬一点，轻撞也还看得见
+  slot.punch = punch;
+  slot.push = SHARD_PUSH * punch;        // 撞飞位移 ∝ 力度
+  // 快撞更收束（一记直线冲击）、慢撞更散（松散地崩开），方向感随速度自然变化
+  slot.spread = SHARD_SPREAD * (1.30 - 0.30 * punch);
   slot.active = true; slot.born = now; slot.x = x; slot.y = y;
   slot.ax = ax; slot.ay = ay; slot.ang = ang;
   const ox = -ay, oy = ax;                // 撞轴的垂线：碎片起点沿它铺开
@@ -1994,13 +2013,14 @@ function spawnBurst(x, y, z, now, ix, iy) {
     // 14% 逆溅：被拍碎后朝来向崩回来，正前方的锥形才不会像个过于整齐的喇叭。
     const back = Math.random() < 0.14;
     // 锥形半角内取角；不压正轴，正轴留给白芒，不然整团会挤成一条线。
-    const off = (Math.random() * 2 - 1) * SHARD_SPREAD;
+    const off = (Math.random() * 2 - 1) * slot.spread;
     const a = ang + (back ? Math.PI * (0.72 + Math.random() * 0.5) : off);
     slot.dirX[s] = Math.cos(a); slot.dirY[s] = Math.sin(a);
-    // 初速偏慢（1.4 次幂）：多数碎片在近处翻落，少数甩到外圈，整团才有体积感。
-    // 场地半宽 60 单位、屏幕约 10px/单位，终值 v0/k 要落到 3~13 单位才看得出「散开」。
-    slot.v0[s] = (12 + Math.pow(Math.random(), 1.2) * 38) * (back ? 0.45 : 1);
-    slot.life[s] = 0.34 + Math.random() * 0.38;
+    // 初速偏慢（1.2 次幂）：多数碎片在近处翻落，少数甩到外圈，整团才有体积感。
+    // 终值 v0/k 再乘力度：轻撞只散开一两个身位，重撞甩到十几单位外。
+    slot.v0[s] = (12 + Math.pow(Math.random(), 1.2) * 38) * (back ? 0.45 : 1) * pw;
+    // 重撞碎得更久（飞得远才需要看得见），但压在 BURST_MS 之内，不会拖到下一只
+    slot.life[s] = Math.min(0.76, (0.34 + Math.random() * 0.38) * (0.80 + 0.20 * punch));
     const dly = Math.random() * SHARD_HIT;
     slot.dly[s] = dly;
     slot.ef0[s] = (1 - Math.exp(-SHARD_DAMP * dly)) / SHARD_DAMP;
@@ -2139,6 +2159,19 @@ pauseBtn.addEventListener('click', () => {
 });
 // 全屏：只做浏览器全屏切换，不碰模拟状态。原来的「重新初始化」已下线，
 // 恢复出厂参数仍可通过调试接口 FlockLab.resetAll() 使用。
+//
+// 按钮和 F11 必须走同一条路，否则就会出现「F11 全屏之后按钮失效」：
+// F11 是**浏览器窗口级**全屏，它不会设置 document.fullscreenElement，于是
+//   ① 按钮图标永远显示「全屏」（syncFsBtn 看不到任何变化）；
+//   ② 点按钮请求的是 Fullscreen API——窗口早就铺满了，画面一像素都不变，
+//      再点一次只是退出 API 全屏，窗口仍然停在 F11 那种满屏状态。
+// 两边表现都对，合起来就是「点了没反应」。
+// 所以这里把 F11 拦下来（preventDefault 阻止原生窗口全屏），改走同一个 toggleFullscreen，
+// 全屏状态从此只有 document.fullscreenElement 一个来源。
+//
+// 已知边界：Chrome 在**已经处于原生 F11 全屏**时会把 F11 的 keydown 整个吃掉
+//（防止页面把用户锁在全屏里），页面既收不到事件也无法用 API 退出。只要我们拦住了 F11，
+// 就不会进到那个状态；万一从浏览器菜单进了全屏，按 F11 照样能退出。
 const fsBtn = document.getElementById('fullscreenBtn');
 const fsExpand = fsBtn.querySelector('.expandIcon');
 const fsShrink = fsBtn.querySelector('.shrinkIcon');
@@ -2167,23 +2200,36 @@ function syncFsBtn() {
   idleHidden = on;
   wake();
 }
-fsBtn.addEventListener('click', () => {
+// 唯一的全屏入口：按钮点击与 F11 都调它，行为必然一致。
+function toggleFullscreen() {
   wake();
   try {
     if (fsElement()) {
       const exit = document.exitFullscreen || document.webkitExitFullscreen;
-      if (exit) exit.call(document);
-    } else {
-      const req = fsDoc.requestFullscreen || fsDoc.webkitRequestFullscreen;
-      if (!req) { toast('当前浏览器不支持全屏（iPhone 可用「添加到主屏幕」）'); return; }
-      const p = req.call(fsDoc);
-      // 被浏览器策略拒绝时别静默失败（iOS 内嵌页、iframe 里很常见）
-      if (p && typeof p.catch === 'function') p.catch(() => toast('全屏被浏览器拒绝'));
+      if (!exit) { toast('当前浏览器不支持退出全屏'); return; }
+      // 退出失败（极少见）别留下未处理的 rejection
+      const p = exit.call(document);
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+      return;
     }
+    const req = fsDoc.requestFullscreen || fsDoc.webkitRequestFullscreen;
+    if (!req) { toast('当前浏览器不支持全屏（iPhone 可用「添加到主屏幕」）'); return; }
+    const p = req.call(fsDoc);
+    // 被浏览器策略拒绝时别静默失败（iOS 内嵌页、iframe 里很常见）
+    if (p && typeof p.catch === 'function') p.catch(() => toast('全屏被浏览器拒绝'));
   } catch (e) {
     toast('全屏切换失败：' + e.message);
   }
-});
+}
+fsBtn.addEventListener('click', toggleFullscreen);
+// F11：拦掉浏览器自己的窗口级全屏，改走上面的 API 全屏。
+// 捕获阶段监听，避免被 gui 或其它控件先吃掉；e.repeat 过滤长按连发。
+addEventListener('keydown', (e) => {
+  if (e.repeat) return;
+  if (e.key !== 'F11' && e.code !== 'F11' && e.keyCode !== 122) return;
+  e.preventDefault();
+  toggleFullscreen();
+}, true);
 // webkit 前缀的旧内核只会派发自己的事件，两个都听
 for (const evName of ['fullscreenchange', 'webkitfullscreenchange']) {
   document.addEventListener(evName, syncFsBtn);
@@ -2384,8 +2430,9 @@ bindNum(fPred, 'lockTime', 0, 5, 0.1, '锁定目标(秒)',
   '锁定目标｜捕食者专注追同一只鸟的秒数。调大：不容易被鸟群晃动骗到，追击更稳定。');
 bindNum(fPred, 'predict', 0, 1.5, 0.05, '预判系数',
   '预判系数｜捕食者追的是鸟的「未来位置」而不是当前位置。调大：更难甩掉；太大像未卜先知。');
-bindNum(fPred, 'feedCooldown', 0.3, 60, 0.1, '进食冷却(秒)',
-  '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎。冷却期间它会减速随机巡游、不再追击，以保存体力。调大：捕获间隔变长。');
+bindNum(fPred, 'feedCooldown', 0, 15, 0.1, '进食冷却(秒)',
+  '进食冷却｜捕食者抓到一只鸟后多久才再次捕猎（0~15 秒）。冷却期间它会减速随机巡游、不再追击，以保存体力。' +
+  '调大：捕获间隔变长、鸟群有喘息；调到 0：吃完立刻接着抓，捕食压力拉满（整群会被吃得很凶）。');
 bindBool(fPred, 'respawnOn', '被吃后重生新鸟',
   '被吃后重生｜开启（默认）：每被吃掉一只，1 秒后在场里离捕食者最远的空处补一只，总数保持不变。关闭：死一只少一只，队伍会被慢慢吃空，状态卡左上角的数量变成「存活/设定」——适合观察捕食压力对整群的影响。再打开时，这段时间里阵亡的会一起补回来（错开几十毫秒依次出生，不会同时涌出一大团）。',
   (v) => syncRespawnQueue(v));
@@ -3335,11 +3382,14 @@ function frameFinish(F, res, dt, time) {
         // 撞轴 = 捕食者速度方向。捕食者几乎悬停时（速度≈0）退化成「从捕食者指向猎物」，
         // 总比固定朝右强——碎片的飞散方向必须对得上「刚才那一下是从哪撞过来的」。
         let ix = predVel[q], iy = predVel[q + 1];
+        // 撞击力度用「撞击瞬间捕食者自己的速度」，不是相对速度：相对速度里混进了鸟的
+        // 逃命冲刺，会让一只拼命逃的鸟反而看起来被撞得更狠。
+        const pSpd = Math.sqrt(ix * ix + iy * iy);
         if (ix * ix + iy * iy < 1e-4) {
           ix = pos[k] - predPos[q]; iy = pos[k + 1] - predPos[q + 1];
           if (ix * ix + iy * iy < 1e-8) { ix = 1; iy = 0; }
         }
-        spawnBurst(pos[k], pos[k + 1], 0, time, ix, iy);
+        spawnBurst(pos[k], pos[k + 1], 0, time, ix, iy, pSpd);
         predFeedAt[p] = time;
         predPulseAt[p] = time;
         predTarget[p] = -1;
@@ -4137,13 +4187,16 @@ function render(now) {
     // 白芒：长轴就是撞轴，靠加法混合在撞击点拉出一道亮痕——「撞上了」这一下全靠它。
     // 位置沿撞轴偏移 0.42 个身长：光痕主要落在「撞过去的方向」，而不是均匀铺在两侧。
     // 先跟相机朝向对齐（相机有 roll 时会侧倾），再在屏幕平面内转到撞角。
+    // 长度与亮度都跟撞击力度走：擦碰只有一小道白影，俯冲砸下来是整条拉满的白光。
     const fe = 1 - Math.exp(-age / 55);
-    const flen = 1.4 + 10.5 * fe, fwid = 0.35 + 0.55 * fe;
+    const fk = 0.62 + 0.38 * b.punch;
+    const flen = (1.4 + 10.5 * fe) * fk;
+    const fwid = (0.35 + 0.55 * fe) * (0.78 + 0.22 * b.punch);
     b.flash.position.set(b.x + b.ax * flen * 0.42, b.y + b.ay * flen * 0.42, 0.24);
     b.flash.quaternion.copy(camera.quaternion);
     b.flash.rotateZ(b.ang);
     b.flash.scale.set(flen, fwid, 1);
-    b.flash.material.opacity = Math.exp(-age / 190);
+    b.flash.material.opacity = Math.exp(-age / 190) * clampNum(0.45 + 0.55 * b.punch, 0, 1);
 
     const t = age / 1000;
     const efT = (1 - Math.exp(-SHARD_DAMP * t)) / SHARD_DAMP;
@@ -4163,7 +4216,8 @@ function render(now) {
       // 径向位移：阻尼公式 r = v0·(1−e^{−kt})/k；还没到起飞时刻的压在起点。
       const r = lt <= 0 ? 0 : Math.max(0, b.v0[s] * (efT - b.ef0[s]));
       // 撞飞：整团沿撞轴线性前推一段——「被撞飞」和「原地爆炸」的区别就在这一项。
-      const push = SHARD_PUSH * Math.max(0, t - b.dly[s]);
+      // 位移量按撞击力度缩放：慢速擦过只是被顶着挪一点，俯冲才是整团甩出去。
+      const push = b.push * Math.max(0, t - b.dly[s]);
       const off = b.off[s];
       _shV.set(
         b.x + b.ox * off + b.dirX[s] * r + b.ax * push,
@@ -4458,6 +4512,21 @@ window.FlockLab = {
     return c;
   },
   get activeBursts() { return killBursts.filter((b) => b.active).length; },
+  // 撞碎特效的最新一次：力度 / 撞飞位移 / 锥角 / 最远碎片半径（调参、验证力度曲线用）。
+  // reach = v0/k 是阻尼公式的终半径，不含撞飞位移；拿它对比不同 punch 就知道强度差多少。
+  get burstState() {
+    let best = null;
+    for (const b of killBursts) if (b.active && (!best || b.born > best.born)) best = b;
+    if (!best) return null;
+    let v0max = 0;
+    for (let s2 = 0; s2 < SHARD_N; s2++) if (best.v0[s2] > v0max) v0max = best.v0[s2];
+    return {
+      punch: +best.punch.toFixed(3), push: +best.push.toFixed(3),
+      spread: +best.spread.toFixed(3), v0max: +v0max.toFixed(2),
+      reach: +(v0max / SHARD_DAMP).toFixed(2),
+      age: Math.round(performance.now() - best.born)
+    };
+  },
   get sprintCount() { return sprintCount; },
   get sprintingCount() { return sprintingCount; },
   get trailCount() { return trailGeo.instanceCount; },
