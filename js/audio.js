@@ -222,11 +222,19 @@ export class FlockAudio {
       this.fxBus.gain.value = this.p.fxLevel;
       this.fxBus.connect(this.master);
 
-      // 短噪声缓冲：逃逸气流声与被吃掉的咬合声共用
-      const len = Math.floor(ctx.sampleRate * 0.25);
+      // 噪声缓冲：逃逸气流、咬合、捕食者喷射共用。
+      // 长度给到 1.35s —— 火箭喷射那层要连续响 0.4~0.5s，0.25s 的原料会在半途
+      // 直接哑掉（BufferSource 播完就静音）；顺便把尾部 60ms 做成交叉淡化，
+      // 这样任何一层想 loop 都不会在接缝处「嗒」一下。
+      const len = Math.floor(ctx.sampleRate * 1.35);
       this.noise = ctx.createBuffer(1, len, ctx.sampleRate);
       const data = this.noise.getChannelData(0);
       for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      const fade = Math.floor(ctx.sampleRate * 0.06);
+      for (let i = 0; i < fade; i++) {
+        const k = i / fade;
+        data[i] = data[i] * k + data[len - fade + i] * (1 - k);
+      }
 
       // 空间感与密度层都挂在 fxBus 之后，一起受「音效音量」与总开关控制
       this.buildReverb();
@@ -644,6 +652,53 @@ export class FlockAudio {
     g3.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
     lo.connect(g3); g3.connect(out);
     lo.start(t); lo.stop(t + 0.2);
+
+    // ④ 火箭喷射（v1.4.22 新增）：一束「点着了往前推」的燃烧嘶啦 + 托底的推力轰鸣。
+    //    必须和②的气流区分开，否则两段噪声糊成一片「呼呼」：
+    //      · 气流是「切开空气」的短唰——0.28s，中心 900→240 **往下**掉，越冲越闷；
+    //      · 喷射是「持续燃烧」——0.37~0.46s，中心 480→1400 **往上**走（喷流越喷越急），
+    //        末尾再收一点，尾巴比气流长一倍；
+    //      · 叠一个 17~27Hz 的三角波抖动（±16%）＝ 火焰不稳的粗糙感，
+    //        这是「推进器」和「风」在听感上最大的区别；纯平滑噪声只会像吹风机。
+    const jt = t + 0.012;
+    const jd = 0.34 + 0.10 * a;                 // 有效持续 0.375~0.44s
+    const jsrc = ctx.createBufferSource();
+    jsrc.buffer = this.noise;
+    const jbp = ctx.createBiquadFilter();
+    jbp.type = 'bandpass'; jbp.Q.value = 0.9;
+    const jf = 480 + Math.random() * 140;
+    jbp.frequency.setValueAtTime(jf, jt);
+    jbp.frequency.exponentialRampToValueAtTime(jf * 2.9, jt + jd * 0.62);
+    jbp.frequency.exponentialRampToValueAtTime(jf * 1.7, jt + jd);
+    const jtrem = ctx.createGain(); jtrem.gain.value = 0.84;
+    const jlfo = ctx.createOscillator();
+    jlfo.type = 'triangle'; jlfo.frequency.value = 17 + Math.random() * 10;
+    const jlfoG = ctx.createGain(); jlfoG.gain.value = 0.16;
+    jlfo.connect(jlfoG); jlfoG.connect(jtrem.gain);
+    const jg = ctx.createGain();
+    const jPeak = 0.020 + 0.013 * a;
+    jg.gain.setValueAtTime(0.0001, jt);
+    jg.gain.exponentialRampToValueAtTime(jPeak, jt + 0.045);
+    jg.gain.setValueAtTime(jPeak, jt + jd * 0.45);
+    jg.gain.exponentialRampToValueAtTime(0.0001, jt + jd);
+    jsrc.connect(jbp); jbp.connect(jtrem); jtrem.connect(jg); jg.connect(out);
+    jsrc.start(jt, Math.random() * 0.12, jd + 0.02);
+    jlfo.start(jt); jlfo.stop(jt + jd + 0.02);
+
+    // 推力层：比③更低更长（58→34Hz）。③ 是「落地」的一记顿感，这一层是
+    // 整个喷射期间持续托着的轰鸣——两者差半个八度，叠起来才是「有东西在后面推」。
+    const jo = ctx.createOscillator();
+    jo.type = 'triangle';
+    jo.frequency.setValueAtTime(58, jt);
+    jo.frequency.exponentialRampToValueAtTime(34, jt + 0.30);
+    const jlp = ctx.createBiquadFilter();
+    jlp.type = 'lowpass'; jlp.frequency.value = 190; jlp.Q.value = 0.6;
+    const jog = ctx.createGain();
+    jog.gain.setValueAtTime(0.0001, jt);
+    jog.gain.exponentialRampToValueAtTime(0.018 + 0.012 * a, jt + 0.035);
+    jog.gain.exponentialRampToValueAtTime(0.0001, jt + 0.40);
+    jo.connect(jlp); jlp.connect(jog); jog.connect(out);
+    jo.start(jt); jo.stop(jt + 0.42);
   }
 
   // 3) 新生：两声短促上行的清亮提示音，捕获后被吃的声音之后响起。
@@ -1062,7 +1117,9 @@ export class FlockMusic {
     if (Math.abs(this.smooth - this.applied) < 0.004) return;
     this.applied = this.smooth;
     const c = this.smooth, n = this.nodes, ctx = this.a.ctx, t = ctx.currentTime;
-    n.droneGain.gain.setTargetAtTime(0.0045 + 0.0105 * c, t, 0.35);
+    // drone 再压一档（−6dB）：110Hz 那层是最容易被听成「电器没关」的持续嗡声，
+    // 它只需要垫在底下，不该在没有事件的时候抢注意力。
+    n.droneGain.gain.setTargetAtTime(0.0023 + 0.0053 * c, t, 0.35);
     n.droneLp.frequency.setTargetAtTime(220 + 700 * c * c, t, 0.45);
     n.padGain.gain.setTargetAtTime(0.004 + 0.012 * c, t, 0.5);
     n.padLp.frequency.setTargetAtTime(760 + 2400 * c, t, 0.5);

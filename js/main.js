@@ -4799,6 +4799,9 @@ window.FlockLab = {
     return {
       running: music.running, c: +music.smooth.toFixed(3), tension: +music.tension.toFixed(3),
       gain: music.nodes ? +music.nodes.bus.gain.value.toFixed(4) : 0,
+      // drone 是唯一「持续低频嗡声」的层，最容易在安静段落里被注意到；
+      // 把它单独列出来，调音时不用再进 nodes 里翻。
+      drone: music.nodes ? +music.nodes.droneGain.gain.value.toFixed(5) : null,
       bassLayer: music.nodes ? {
         gate: +music.nodes.bassGate.gain.value.toFixed(3),
         gain: +music.nodes.bassGain.gain.value.toFixed(5)
@@ -4830,6 +4833,13 @@ window.FlockLab = {
   },
   // 世界坐标 → 声像，用来核对「左边的鸟在不在左边」。
   panAt(x) { return +audio.panAt(x).toFixed(3); },
+  // 调音用：立刻让「捕食者加速」响一次（不必等真的扑击）。
+  // 声源放在视野中心偏左一点，四层成分（锐鸣 / 气流 / 落地 / 喷射）会叠在一起响，
+  // 适合反复听层次与电平：FlockLab.dashTest(0.85)
+  dashTest(amp = 0.85) {
+    audio.predDash(amp, audio.view.x - 3, audio.view.y);
+    return true;
+  },
   // 限流诊断：try=调用次数、gap=被最小间隔拒、cap=被每秒上限拒、pass=放行、b0..b3=各桶命中。
   // 「声音太少」时先看这里，能立刻分出「没事件」还是「全被闸门丢了」。
   get audioLimits() { return audio.limits; },
