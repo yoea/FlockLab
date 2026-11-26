@@ -521,6 +521,38 @@ kick 峰值 0.026 是 pad（0.0024）的 11 倍，而设计意图是「kick 略�
 以及 `musicState.beat`（kick / 贝斯两条总线，验「有没有压到预期刻度」）。
 够了——以后再有「哪一层在响」的问题，先看这些数再谈推断。
 
+### 3.9j 输入事件的开销：按需挂载监听器（v1.4.28）
+
+**症状**：鼠标晃动时帧率从 180 掉到 60，不动就恢复。
+
+**先排除的**（都量过，不是原因）：单次 `mousemove` 同步处理 5.1µs、`pointermove` 1.4µs；
+派发 1000 个 mousemove 只触发 1 次布局重算；页内每帧派发 8 次事件，帧率恒定 180。
+**回调本身不是瓶颈。**
+
+**真正的三处**，共同点是「乘以输入频率」：
+
+1. **`screenToWorld()` 里的 `getBoundingClientRect()`**——它在 pointermove 路径上（化身捕食者时），
+   而 layout 一旦被 HUD 等写入弄脏，每次调用都要先重排整页。canvas 是 `#scene { position: fixed; inset: 0 }`，
+   矩形恒等于视口，所以这次调用**永远是白算**。改用 `innerWidth/innerHeight`（浏览器缓存的视口尺寸），
+   用投影矩阵交叉校验：5 个采样点误差 **0.00 px**。
+2. **常驻的 pointermove 监听器**。Chrome 只要发现 pointermove 上有监听器，就会把每次指针移动派发到主线程；
+   一个都没有时整条路径被跳过。原来是两个常驻的（判拖拽、跟光标），现在都按需挂：
+   判拖拽的只在 pointerdown→pointerup 之间挂，跟光标的只在 `mouseHunter` 期间挂。
+   **空闲态 `pointermove` 监听器数 = 0**，这是这次改动里最有效的一刀。
+   别忘了 `pointercancel` 与 `window.blur` 也要摘——按下后失焦就收不到 pointerup 了。
+3. **每次 mousemove 都跑 `wake()`**：它写 `title` + `aria-label`（后者会重建可访问性子树），
+   还 `clearTimeout` + `setTimeout` 重建定时器。「别自动收起界面」120ms 精度就够，所以改走节流入口；
+   闲置计时搬到主循环（`checkIdle(now)`，它本来就在跑），彻底去掉定时器重建。
+   `applyHidden()` 加状态缓存键（`manualHidden|hidden` 两位），状态没变就一次 DOM 都不碰——
+   否则每次移动都在 toggle class 与写属性。
+
+**验证要按「监听器数」验，不是按「耗时」验**：`DOMDebugger.getEventListeners` 查 window，
+空闲态应只有 `mousemove:1`（节流版）、`pointermove:0`；开捕食者 +1、按下 +1、抬起归位。
+测耗时容易被 CDP 往返污染（本次就出现过「静止 73 FPS」的假读数，实际是两次 evaluate 夹住了采样窗口）。
+
+**一个反直觉的点**：把回调写便宜收益很小（µs 级），把监听器摘掉收益很大（Chrome 整条路径跳过）。
+遇到「输入期间掉帧」，先数监听器，再优化回调。
+
 ### 3.10 PWA：缓存策略与部署
 
 - `sw.js` 的缓存名带版本号（`flocklab-v1`），**改了缓存内容必须改 `VER`**，否则旧缓存会一直命中。`install` 里 `skipWaiting`、`activate` 里清旧缓存 + `clients.claim()`。
