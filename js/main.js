@@ -452,6 +452,7 @@ let mouseSlot = -1;                 // 它当前占用的槽位（AI 数量或�
 const mouseTgt = { x: 0, y: 0 };    // 光标对应的世界坐标
 let mouseDirX = 1, mouseDirY = 0;   // 最后一次有效移动方向：静止时用它保持箭头朝向
 let lastCX = 0, lastCY = 0;         // 最近一次光标屏幕坐标（双击开场时用来定位）
+let mouseDirty = false;             // 光标移动过、世界坐标待重算（主循环每帧消费一次）
 
 // 本帧参与物理与渲染的 AI 捕食者数量（鼠标捕食者另加 1，见 predCountNow）。
 function predBaseCount() { return params.predatorOn ? activeP : 0; }
@@ -1794,11 +1795,15 @@ let lockIdxN = 0;
 // 相机现在会随风摇（SHAKE），反投影必须把「瞬时缩放 / 平移 / 倾斜」一起算进去，
 // 否则双击开启的鼠标捕食者会比光标偏十几像素，而且光标不动时看起来在漂。
 function screenToWorld(cx, cy) {
-  const rect = cv.getBoundingClientRect();
+  // canvas 是 `#scene { position: fixed; inset: 0 }`，矩形恒等于视口——不需要
+  // getBoundingClientRect()。这行原来每调一次就向浏览器要一次同步布局（layout 一脏
+  // 就得先重算），而它在 pointermove 路径上：指针报告率 1000Hz 时每秒上千次。
+  // innerWidth/Height 是浏览器缓存的视口尺寸，零成本，且自动跟随窗口变化。
+  const vw = innerWidth || 1, vh = innerHeight || 1;
   const halfH = view2DFitHalfH() / Math.max(0.05, view2D.zoom * SHAKE.zoom);
-  const scale = (2 * halfH) / Math.max(1, rect.height);
-  const dx = (cx - (rect.left + rect.width * 0.5)) * scale;
-  const dy = -(cy - (rect.top + rect.height * 0.5)) * scale;
+  const scale = (2 * halfH) / Math.max(1, vh);
+  const dx = (cx - vw * 0.5) * scale;
+  const dy = -(cy - vh * 0.5) * scale;
   // 相机绕视线轴转过了 roll，屏幕向量要转回世界方向（乘 R(+roll)）
   const cr = Math.cos(SHAKE.roll), sr = Math.sin(SHAKE.roll);
   return {
@@ -1844,6 +1849,7 @@ function setMouseHunter(on) {
     toast('已恢复常规箭头');
   }
   syncPredDraw();
+  syncHuntMove();
 }
 
 // 双击画布开启。这里自己判定双击，不监听 dblclick——
@@ -1852,6 +1858,37 @@ function setMouseHunter(on) {
 // 于是「双击状态卡」会误开捕食者。所以要求连续两次「干净点击」都落在画布上。
 let tapAt = 0, tapX = 0, tapY = 0, tapMoved = 0, tapDownAt = 0, tapOnCanvas = false;
 let tapLastX = 0, tapLastY = 0;
+// 两个 pointermove 监听器都是「按需挂载」（v1.4.28）：
+// Chrome 只要发现 pointermove 上有监听器，就会把每一次指针移动都派发到主线程；
+// 一个都没有时，整条路径会被跳过。所以真正的解法不是「把回调写便宜点」，
+// 而是「不需要时根本不挂」——鼠标 1000Hz 报告率下，这比省几微秒重要得多。
+let tapMoveBound = false;
+const onTapMove = (e) => {
+  tapMoved = Math.max(tapMoved, Math.abs(e.clientX - tapX) + Math.abs(e.clientY - tapY));
+};
+function bindTapMove() {
+  if (!tapMoveBound) { addEventListener('pointermove', onTapMove, true); tapMoveBound = true; }
+}
+function unbindTapMove() {
+  if (tapMoveBound) { removeEventListener('pointermove', onTapMove, true); tapMoveBound = false; }
+}
+
+let huntMoveBound = false;
+const onHuntMove = (e) => {
+  lastCX = e.clientX; lastCY = e.clientY;
+  mouseDirty = true;
+};
+// 只在化身捕食者期间挂：那时才需要持续跟踪光标。
+function syncHuntMove() {
+  if (mouseHunter && !huntMoveBound) {
+    addEventListener('pointermove', onHuntMove, { passive: true });
+    huntMoveBound = true;
+  } else if (!mouseHunter && huntMoveBound) {
+    removeEventListener('pointermove', onHuntMove);
+    huntMoveBound = false;
+  }
+}
+
 addEventListener('pointerdown', (e) => {
   lastCX = e.clientX; lastCY = e.clientY;
   if (e.pointerType === 'touch') return;          // 触屏不参与，避免和双击缩放冲突
@@ -1863,13 +1900,12 @@ addEventListener('pointerdown', (e) => {
   tapDownAt = performance.now(); tapMoved = 0;
   tapX = e.clientX; tapY = e.clientY;
   tapOnCanvas = e.target === cv;
-}, true);
-addEventListener('pointermove', (e) => {
-  if (!tapDownAt) return;
-  tapMoved = Math.max(tapMoved, Math.abs(e.clientX - tapX) + Math.abs(e.clientY - tapY));
+  bindTapMove();                                   // 按下期间才需要判「有没有拖动」
 }, true);
 addEventListener('pointerup', (e) => {
-  if (e.button !== 0 || !tapDownAt) return;
+  if (!tapDownAt) return;
+  unbindTapMove();
+  if (e.button !== 0) { tapDownAt = 0; return; }
   const clean = tapMoved < 8 && performance.now() - tapDownAt < 320;   // 拖拽平移不算点击
   const onCanvas = tapOnCanvas;
   tapDownAt = 0;
@@ -1882,19 +1918,14 @@ addEventListener('pointerup', (e) => {
     lastCX = e.clientX; lastCY = e.clientY;
     const w = screenToWorld(e.clientX, e.clientY);
     mouseTgt.x = w.x; mouseTgt.y = w.y;
-    setMouseHunter(true);
+    setMouseHunter(true);          // 这里会挂上 onHuntMove
   } else {
     tapAt = now; tapLastX = e.clientX; tapLastY = e.clientY;
   }
 }, true);
-// 光标移动：只更新目标点。绑在 window 上，所以移出窗口再回来依然跟着走
-//（在 UI 面板上方移动时也照样跟随，捕食者不会卡在半路）。
-addEventListener('pointermove', (e) => {
-  lastCX = e.clientX; lastCY = e.clientY;
-  if (!mouseHunter) return;
-  const w = screenToWorld(e.clientX, e.clientY);
-  mouseTgt.x = w.x; mouseTgt.y = w.y;
-}, { passive: true });
+addEventListener('pointercancel', () => { unbindTapMove(); tapDownAt = 0; }, true);
+// 按下后窗口失焦就收不到 pointerup 了：顺手摘掉，别留一个高频监听器常驻。
+addEventListener('blur', () => { unbindTapMove(); tapDownAt = 0; });
 
 // 捕杀特效：撞击撞碎（v1.4.19）。
 // 烟花是各向同性的——不管捕食者从哪个方向撞上来，炸出来的都是一朵圆花，俯视图里
@@ -2248,7 +2279,7 @@ function openAbout() {
   about.classList.add('open');
   about.setAttribute('aria-hidden', 'false');
   setIdle(false);          // 读关于页时界面别自己淡出
-  clearTimeout(idleTimer);
+  idleDeadline = 0;        // 不再计时（原来这里是 clearTimeout）
 }
 function closeAbout() {
   about.classList.remove('open');
@@ -2268,15 +2299,23 @@ addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAbout(); });
 // 例外：状态卡点了「定住」就不参与隐藏（CSS 用 #hud:not(.pinned) 排除），
 // 卡片里的按钮（定住 / 折叠）跟着常驻，可以边跑边盯数据。
 const IDLE_MS = 5000;
-let idleTimer = 0;
-let idleDeadline = 0;      // 只在调试接口里读，用来报「还有多少毫秒收起」
+let idleDeadline = 0;      // performance.now() 之后该收起；0 = 不打算收起（关于页开着时）
+let idleCursorOn = false;  // cursor-idle / faded 是否已加上（避免每帧重复写 class）
 let idleHidden = false;    // 闲置自动隐藏（可被鼠标动作解除）
 let manualHidden = false;  // 手动锁定隐藏（只能点眼睛解除）
 
 const uiBtn = document.getElementById('uiBtn');
 
+// 状态组合的缓存键：-1 = 还没写过。**这是 v1.4.28 的掉帧修复核心**——
+// 这个函数由 wake() 调用，而 wake() 绑在 mousemove 上。原来每次都写 title 与
+// aria-label（后者会让浏览器重建可访问性子树），指针 1000Hz 就是每秒上千次
+// DOM 属性变更。状态没变就一次都别碰。
+let hiddenKey = -1;
 function applyHidden() {
   const hidden = manualHidden || idleHidden;
+  const key = (manualHidden ? 1 : 0) | (hidden ? 2 : 0);
+  if (key === hiddenKey) return;
+  hiddenKey = key;
   document.body.classList.toggle('ui-hidden', hidden);
   document.body.classList.toggle('manual-hidden', manualHidden);
   uiBtn.classList.toggle('off', hidden);
@@ -2289,26 +2328,38 @@ function applyHidden() {
 function setIdle(on) {
   idleHidden = !!on;
   applyHidden();
-  if (!idleHidden) document.body.classList.remove('cursor-idle');
+  if (!idleHidden && idleCursorOn) {
+    document.body.classList.remove('cursor-idle');
+    uiBtn.classList.remove('faded');
+    idleCursorOn = false;
+  }
 }
 
+// 每次输入调用（含 1000Hz 的 mousemove）。现在只写一个 deadline + 一次状态比对，
+// 不再 clearTimeout/setTimeout —— 那个开销乘上输入频率后并不便宜。
 function wake() {
-  clearTimeout(idleTimer);
-  idleDeadline = 0;
-  document.body.classList.remove('cursor-idle');
-  uiBtn.classList.remove('faded');
+  if (idleCursorOn) {
+    document.body.classList.remove('cursor-idle');
+    uiBtn.classList.remove('faded');
+    idleCursorOn = false;
+  }
   // 锁定隐藏时不解除——这正是「误触鼠标」场景要的：动鼠标只会让眼睛回来，界面不动
   if (!manualHidden) idleHidden = false;
   applyHidden();
   // 「关于」开着不算闲置：用户正在读，别把背后的界面抽走
-  if (about.classList.contains('open')) return;
+  if (about.classList.contains('open')) { idleDeadline = 0; return; }
   idleDeadline = performance.now() + IDLE_MS;
-  idleTimer = setTimeout(() => {
-    idleHidden = true;
-    applyHidden();
-    document.body.classList.add('cursor-idle');   // 闲置时连光标一起藏
-    uiBtn.classList.add('faded');                 // 眼睛自身也淡出，鼠标一动就回来
-  }, IDLE_MS);
+}
+
+// 主循环每帧调用：到点才收起，且只执行一次。
+function checkIdle(now) {
+  if (!idleDeadline || now < idleDeadline) return;
+  idleDeadline = 0;
+  idleHidden = true;
+  applyHidden();
+  document.body.classList.add('cursor-idle');   // 闲置时连光标一起藏
+  uiBtn.classList.add('faded');                 // 眼睛自身也淡出，鼠标一动就回来
+  idleCursorOn = true;
 }
 
 // 眼睛：切换锁定隐藏。收起时立刻生效（不等 5 秒），展开时立刻恢复。
@@ -2319,9 +2370,18 @@ uiBtn.addEventListener('click', () => {
   if (manualHidden) toast('已隐藏界面，点击右下角图标恢复');
 });
 
-// 每种输入都算「有操作」；pointerdown / mousedown / touchstart 与 mousemove 可能同时到，
-// 重复调用 wake() 只是重置同一个定时器，没有副作用。
-for (const ev of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart', 'pointerdown']) {
+// 每种输入都算「有操作」。鼠标移动单独走一个节流入口（v1.4.28）：
+// 「别自动收起界面」这件事 120ms 的精度完全够，而它原来每次都跑一遍 wake()
+// （写 class + reset 计时）。低频事件仍然一次不落。
+let wakeAt = 0;
+function wakeThrottled() {
+  const t = performance.now();
+  if (t - wakeAt < 120) return;
+  wakeAt = t;
+  wake();
+}
+addEventListener('mousemove', wakeThrottled, { passive: true });
+for (const ev of ['mousedown', 'keydown', 'wheel', 'touchstart', 'pointerdown']) {
   addEventListener(ev, wake, { passive: true });
 }
 applyHidden();
@@ -3979,6 +4039,18 @@ function render(now) {
   const dt = Math.min(rawDt, 0.035);
   fpsAcc += rawDt; fpsFrames++;
   if (fpsAcc > 0.5) { fps = fpsFrames / fpsAcc; fpsAcc = 0; fpsFrames = 0; }
+
+  // 光标 → 世界坐标：每帧最多算一次（v1.4.28）。事件回调只写坐标，这里统一换算。
+  if (mouseDirty) {
+    mouseDirty = false;
+    if (mouseHunter) {
+      const w = screenToWorld(lastCX, lastCY);
+      mouseTgt.x = w.x; mouseTgt.y = w.y;
+    }
+  }
+  // 闲置自动收起：同样从定时器搬到主循环。它本来就在跑，多一次比较不花钱；
+  // 而 setTimeout 绑在 mousemove 上时，指针 1000Hz 就等于每秒重建上千个定时器。
+  checkIdle(now);
 
   // ---- 仿真推进 ----
   // 多核：一帧 dispatch、下一帧收齐再积分。dt 用累积的真实时间，
