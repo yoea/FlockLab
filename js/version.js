@@ -1,6 +1,6 @@
 // 构建元数据 —— 由 tools/build-meta.mjs 生成，请勿手改。
 // 发布前跑一次：node tools/build-meta.mjs
 export const VERSION = "v1.4.28";
-export const COMMIT = "416e8f0*";
+export const COMMIT = "83343ca";
 export const BUILD_TIME = "2026-11-26 11:27";
 export const AUTHOR = "yoea";
